@@ -117,8 +117,8 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     let first = db.execute(sql, &parameters(&query)).unwrap();
     let initial = first.trace.vector_search.as_ref().unwrap().partition_hnsw[0].clone();
     assert_eq!(
-        initial.hnsw_ef_search, 201,
-        "residual cardinality does not choose graph effort"
+        initial.hnsw_ef_search, 100,
+        "the compatibility profile resolves graph breadth from k, independent of the 201-row physical population"
     );
     for result in [first, bounded_query(&db, sql, &query)] {
         let disclosure = result.trace.vector_search.unwrap();
@@ -815,28 +815,26 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                 assert_eq!(ids(&expected), vec![2, 1], "the stable row is truly nearer");
                 db.vector_store_for_test().evict_reloadable_raw_partitions();
                 let activity_before = db.__vector_passive_activity_counters_for_test();
-                for mode in ["AUTO", "INDEXED"] {
-                    for limit in [1, 2] {
-                        let sql = format!(
-                            "SELECT id, score FROM items ORDER BY embedding <=> $query \
-                             USE VECTOR {mode} LIMIT {limit}"
-                        );
-                        db.__reset_last_query_vector_trace_for_test();
-                        let ordinary = db.execute(&sql, &parameters(&query)).unwrap();
-                        let trace = db.__take_last_query_vector_trace_for_test().unwrap();
-                        assert!(trace.used_hnsw);
-                        assert_eq!(trace.supplemented_row_count, 0);
-                        assert_eq!(ordinary.rows, expected.rows[..limit]);
-                        db.__reset_last_query_vector_trace_for_test();
-                        let bounded = bounded_query(&db, &sql, &query);
-                        let trace = db.__take_last_query_vector_trace_for_test().unwrap();
-                        assert!(trace.used_hnsw);
-                        assert_eq!(trace.supplemented_row_count, 0);
-                        assert_eq!(
-                            bounded.rows, ordinary.rows,
-                            "{quantization}, partitioned={partitioned}, restart={restart}"
-                        );
-                    }
+                for limit in [1, 2] {
+                    let sql = format!(
+                        "SELECT id, score FROM items ORDER BY embedding <=> $query \
+                         USE VECTOR INDEXED LIMIT {limit}"
+                    );
+                    db.__reset_last_query_vector_trace_for_test();
+                    let ordinary = db.execute(&sql, &parameters(&query)).unwrap();
+                    let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                    assert!(trace.used_hnsw);
+                    assert_eq!(trace.supplemented_row_count, 0);
+                    assert_eq!(ordinary.rows, expected.rows[..limit]);
+                    db.__reset_last_query_vector_trace_for_test();
+                    let bounded = bounded_query(&db, &sql, &query);
+                    let trace = db.__take_last_query_vector_trace_for_test().unwrap();
+                    assert!(trace.used_hnsw);
+                    assert_eq!(trace.supplemented_row_count, 0);
+                    assert_eq!(
+                        bounded.rows, ordinary.rows,
+                        "{quantization}, partitioned={partitioned}, restart={restart}"
+                    );
                 }
                 let activity_after = db.__vector_passive_activity_counters_for_test();
                 assert_eq!(
@@ -1000,13 +998,17 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                 end - 100
             );
             let trace = db.__take_last_query_vector_trace_for_test().unwrap();
-            assert!(trace.used_hnsw);
+            assert_eq!(trace.used_hnsw, mode == "INDEXED");
             assert_eq!(trace.supplemented_row_count, 0);
-            assert!(distances.0.load(Ordering::SeqCst) > 0);
-            assert!(
-                distances.0.load(Ordering::SeqCst) < 256,
-                "current membership bounds graph distance work"
-            );
+            if mode == "INDEXED" {
+                assert!(distances.0.load(Ordering::SeqCst) > 0);
+                assert!(
+                    distances.0.load(Ordering::SeqCst) < 256,
+                    "current membership bounds graph distance work"
+                );
+            } else {
+                assert_eq!(distances.0.load(Ordering::SeqCst), 0);
+            }
             let request = bounded::BoundedReadRequest::new(
                 &sql,
                 parameters(&query),
@@ -1020,7 +1022,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
             let bounded = bounded::execute(&db, &request).unwrap();
             assert_eq!(bounded.result.rows, exact.rows);
             let trace = db.__take_last_query_vector_trace_for_test().unwrap();
-            assert!(trace.used_hnsw);
+            assert_eq!(trace.used_hnsw, mode == "INDEXED");
             assert_eq!(trace.supplemented_row_count, 0);
             assert_eq!(
                 bounded

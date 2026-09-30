@@ -30,7 +30,7 @@ CREATE TABLE documents (
 ) IMMUTABLE
 ```
 
-See [Table Options](#table-options) for IMMUTABLE, STATE MACHINE, DAG, RETAIN, HISTORY, SYNC, and PROPAGATE.
+See [Table Options](#table-options) for IMMUTABLE, STATE MACHINE, DAG, RETAIN, HISTORY, MAINTAIN COUNT, SYNC, and PROPAGATE.
 
 `CREATE TABLE` never redefines a table that already exists. A second
 `CREATE TABLE documents (...)` is refused, naming the table, and the existing
@@ -76,6 +76,7 @@ ALTER TABLE t DROP RETAIN
 ALTER TABLE t SET HISTORY ALL | CURRENT ONLY
 ALTER TABLE t SET SYNC OFF | SYNC PUSH ONLY | SYNC PULL ONLY | SYNC TWO WAY
 ALTER TABLE t SET SYNC CONFLICT KEEP FIRST | KEEP LATEST
+ALTER TABLE t SET MAINTAIN COUNT (col [ASC|DESC], ...), (...) | ALL PREFIXES | NONE | DEFAULT
 ALTER TABLE t ALTER COLUMN vector_col SET MAX_PARTITIONS positive_integer
 ALTER TABLE t ALTER COLUMN vector_col SET SEARCH_MODE AUTO | EXACT | INDEXED
 ALTER TABLE t ALTER COLUMN vector_col SET AUTO_INDEX_AT positive_integer | DEFAULT
@@ -108,18 +109,46 @@ DROP TRIGGER document_seen;
 ```
 
 `CREATE TRIGGER` declares a host-callback Trigger. The callback is
-registered through the Rust API with `Database::register_trigger_callback` and
+registered through the Rust API with
+`Database::register_transactional_trigger_callback` (the older
+`register_trigger_callback` name registers the same kind of handler) and
 activated by `Database::complete_initialization`. Triggers are for
 transactional observation and cascade writes; they are not validation triggers.
 Use `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` for engine-enforced
 invariants.
+
+A trigger handler only prepares database work inside the firing transaction.
+It runs before the engine's final validation of the complete write set, so it
+may insert a row that the triggering write depends on, such as a referenced
+parent. If final validation, a plugin, or the durable commit then refuses the
+transaction, nothing the handler wrote becomes visible and no delivery is
+queued. A handler must not send notifications or perform other irreversible
+external work. For that, route an event to a sink registered with
+`Database::register_sink`: a routed row written in the transaction queues a
+pending delivery in the same commit, and the sink runs only after that commit is
+durable, retrying with the same `SinkEvent::action_id` after a failure or
+restart.
+<!-- enforced by: tests/integration/transactional_callback_delivery.rs::callback_created_dependency_commits_with_observation_and_pending_delivery, tests/integration/transactional_callback_delivery.rs::final_commit_validation_failure_discards_callback_records_delivery_and_event, tests/integration/transactional_callback_delivery.rs::late_plugin_refusal_after_preparation_publishes_no_records_delivery_or_event, tests/integration/transactional_callback_delivery.rs::restart_after_commit_recovers_pending_action_and_delivers_committed_records -->
+
+`DROP TRIGGER` requires an administrative handle and is refused inside a trigger callback,
+including its transaction-bound handle, with `Error::TriggerRequiresAdmin`. The refusal
+preserves the active trigger.
+<!-- enforced by: tests/acceptance/trigger.rs::t3_reg_introspection_and_delete_event_rejection -->
 
 By default, a trigger fires only for local writes. `INCLUDING SYNC` also fires
 an `INSERT` or `UPDATE` trigger for authenticated sync rows that this database
 accepts. `DELETE` triggers, with or without `INCLUDING SYNC`, are refused at
 declaration time with `TriggerEventUnsupported`. The incoming row,
 callback writes, and callback outcome share one transaction: either all commit,
-or callback failure rolls all of them back. On this received-sync path the
+or callback failure rolls all of them back. The private sync image initially
+stages only the received unit's affected tables and their dependencies. When a
+callback accesses another existing table, the engine discards the incomplete
+private attempt, stages that table and its dependencies under the same memory
+budget, and retries. This discovery also runs when the callback catches
+`TableNotFound`; the final commit still includes its related write. A genuinely
+absent table retains its ordinary lookup error. Callbacks can run more than
+once during this private preparation, so they must keep their work inside the
+transaction. On this received-sync path the
 callback may only append relational `INSERT` rows (plus engine-owned lineage
 sidecars). Relational updates/deletes, graph or vector mutations, DDL, and
 non-engine configuration are refused with a typed trigger-effect error and the
@@ -290,6 +319,11 @@ COMMIT;
 -- or
 ROLLBACK;
 ```
+
+One transaction may declare a complete schema in authored order, including
+tables, indexes, vector/rank/DAG table shapes, event types, triggers, sinks,
+and routes. Commit publishes the declarations together; rollback publishes
+none. A transaction containing schema declarations may not also write rows.
 
 ### Configuration
 
@@ -825,6 +859,14 @@ CREATE TABLE device_status (
 ) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST
 ```
 
+`HISTORY ALL` keeps each superseded version's change-log, commit-index and vector-directory
+metadata in writer memory. On a mutable table that republishes rows often, such as a search
+projection that re-embeds passages or a status table, each version grows writer residency until
+the finite `MEMORY_LIMIT` refuses writes. Declare `HISTORY CURRENT ONLY` for these tables so the
+maintenance cycle can reclaim superseded versions and their metadata. Unchanged raw vector bodies
+share memory across scalar updates, but that sharing does not remove the metadata ceiling.
+<!-- enforced by: crates/contextdb-engine/tests/vector/vector_memory_ownership_reconciliation_contract.rs::retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_write -->
+
 Also settable with `ALTER TABLE`:
 
 ```sql
@@ -852,6 +894,96 @@ Two ways out: declare `SYNC CONFLICT KEEP LATEST` (the table carries current tru
 `IMMUTABLE` and `HISTORY CURRENT ONLY` are refused together at parse time: an immutable table never supersedes a row, so it has no version history to reclaim.
 
 **What changes and when.** `ALTER TABLE t SET HISTORY CURRENT ONLY` on a table that has already accumulated versions is a declaration change, not an immediate data operation — the accumulated versions are reclaimed on the next maintenance cycle, not synchronously within the statement. Setting `HISTORY ALL` stops reclaiming versions from that point on; it does not restore versions already reclaimed under `HISTORY CURRENT ONLY` — the clause is not a time machine. A `STATE MACHINE` table that also declares `HISTORY CURRENT ONLY` keeps its current state and its transition constraint (enforcement is evaluated at write time against the current version), but loses the ability to read back the sequence of past states.
+
+### MAINTAIN COUNT
+
+Which index-prefix counts the engine keeps current on every write to this
+table. A count is keyed by an ordered column list and the values under it — not
+by an index — so two indexes that share leading columns name one count, and it
+is maintained once.
+
+A table that declares nothing maintains **no** prefix count. `COUNT(*)` still
+answers exactly: the query opens the exact prefix range on the index and counts
+the live postings, charging one index-entry touch per posting, inside the
+statement's own work, memory and time budget. Declaring the column list a hot
+`COUNT(*)` uses turns that read into a single stored number, and costs one
+authenticated write per matching index write.
+
+```sql
+CREATE TABLE events (
+  id UUID PRIMARY KEY,
+  context_id UUID NOT NULL,
+  connector_id TEXT NOT NULL,
+  source_instance_ref TEXT NOT NULL,
+  UNIQUE (context_id, id),
+  UNIQUE (context_id, connector_id, source_instance_ref, id)
+) MAINTAIN COUNT (context_id), (context_id, connector_id, source_instance_ref)
+```
+
+Each list is a parenthesised column list with the same optional per-column
+`ASC`/`DESC` that `CREATE INDEX` accepts, defaulting to `ASC`. One statement
+replaces the whole declared set:
+
+```sql
+ALTER TABLE events SET MAINTAIN COUNT (context_id);
+ALTER TABLE events SET MAINTAIN COUNT ALL PREFIXES;
+ALTER TABLE events SET MAINTAIN COUNT NONE;
+ALTER TABLE events SET MAINTAIN COUNT DEFAULT;
+```
+
+`ALL PREFIXES` maintains every prefix length of every index the table carries,
+including the ones the engine derives for foreign keys and unique constraints.
+`NONE` is the default spelled out. `DEFAULT` clears the declaration and returns
+the table to silence; it is accepted only on `ALTER TABLE`, because a fresh
+`CREATE TABLE` has nothing to clear.
+
+Changing the declaration on a table that already holds rows is online and
+atomic: the counts the new declaration names are recomputed, and the ones it
+drops are removed, in the same transaction that installs the declaration. The
+allocation is admitted by the memory accountant first, so a recompute that
+cannot fit is the ordinary typed budget refusal with nothing installed.
+
+**Which route a `COUNT(*)` took.** `.explain` says so in one of three states,
+and names the statement that would change it when a statement would.
+
+A stored count is reachable only from a store read as a committed image — the
+direct-file read route. A writable handle and the owner read route count the
+live postings over the same exact prefix range instead. Every one of the three
+answers is exact; only the first is O(1):
+
+```
+IndexScan { index: events_by_context }
+  predicates_pushed: [context_id]
+  maintained count: used (context_id)
+```
+
+```
+IndexScan { index: events_by_context }
+  predicates_pushed: [context_id]
+  maintained count: declared (context_id), counted from the index range on this read route
+```
+
+```
+IndexScan { index: events_by_context }
+  predicates_pushed: [context_id, connector_id]
+  maintained count: not declared — ALTER TABLE events SET MAINTAIN COUNT (context_id), (context_id, connector_id) makes this O(1)
+```
+
+The middle line is not a declaration problem and no DDL changes it: the table
+maintains that count and every write keeps it current, but this read route
+counted postings. Only the third line names a statement, and that statement is
+runnable as printed. Because `SET MAINTAIN COUNT`
+replaces the whole declared set, the advice carries the lists the table already
+declares alongside the missing one — following it never drops a count you
+already asked for.
+
+**The refusals.** A list no index leads with is refused, naming the list and
+the indexes considered — a count nothing can read is not a thing to maintain.
+A list a primary key or unique constraint already bounds at 0 or 1 is refused
+too: an exact-key range over the index reads at most one posting and gives the
+same answer, so the count would store a number nobody can disagree with. That
+rule is not policy — `ALL PREFIXES` does not maintain such a count either. A
+duplicate list, a repeated column and an unknown column are refused by name.
 
 ### SYNC
 
@@ -1322,12 +1454,22 @@ percentage is explicit, and `none` for explicit `CONSOLIDATION NONE`; effective 
 
 On `CREATE TABLE`, omitting either clause preserves the compatibility profile and `.schema`
 renders that silence. Its current defaults are: F32 uses `(M, EF_CONSTRUCTION, profile
-EF_SEARCH)` of `(16, 200, max(200,n))` through 5,000 live vectors, `(24, 400, 400)` from 5,001
-through 50,000, and `(16, 200, 200)` above 50,000; SQ8/SQ4 use `(8, 32,
+EF_SEARCH)` of `(16, 200, 10)` through 2,500 live vectors, `(16, 200, 20)` from 2,501 through
+5,000, `(24, 400, 400)` from 5,001 through 50,000, and `(16, 200, 200)` above 50,000;
+SQ8/SQ4 use `(8, 32,
 min(96,max(32,n)))` through 5,000 and `(12, 64, 128)` above 5,000. The undeclared
 `AUTO_INDEX_AT` defaults are 1,000 for F32 and 5,001 for SQ8/SQ4. An undeclared `EF_SEARCH` uses
 at least its profile and the existing `10 * k` query default; an explicit value is raised only to
 reach `k`.
+
+**The F32 search breadth default is now narrower for small layouts.** An F32 vector column that
+does not declare `EF_SEARCH` now searches a layout of up to 2,500 live vectors with a profile
+breadth of 10, and a layout of 2,501 through 5,000 with 20. The query default of `10 * k`
+still applies, so a top-10 query searches at least 100
+candidates. `M` and `EF_CONSTRUCTION` for these bands are unchanged, and the bands above 5,000 are
+unchanged. A column that declares `EF_SEARCH` keeps exactly its declared breadth; declare one, for
+example `ALTER TABLE t ALTER COLUMN embedding SET HNSW (EF_SEARCH = 200)`, to search more widely.
+<!-- enforced by: crates/contextdb-vector/src/store.rs::compatibility_profile_edges_and_partial_policy_validation_agree -->
 
 Change the policy online with the `ALTER` forms above. `DEFAULT` on `AUTO_INDEX_AT` clears that
 declaration; `SET HNSW DEFAULT` clears the whole group, while `DEFAULT` for a named HNSW member
@@ -1367,16 +1509,19 @@ column creates the corresponding local vector index.
 - `AUTO` decides by count: it compares the aggregate allowed count for the whole requested answer
   against the column's effective `AUTO_INDEX_AT`. Below that count, the answer is exact when the
   active limits can pay for it and a typed refusal when they cannot; memory never silently picks
-  the indexed route on `AUTO`'s behalf. At or above that count, the maintained indexed route serves
-  the request, using whatever memory is free. For F32 the automatic switch is at 1,000 allowed
-  vectors; for SQ8/SQ4 it is at 5,001. These counts apply to the whole requested answer, not
-  separately to each partition.
+  the indexed route on `AUTO`'s behalf. At or above that count, `AUTO` admits indexed planning for
+  the whole answer, then chooses work per Context: a Context whose live vector count is at or below
+  its resolved `EF_SEARCH` is compared exactly, while a larger Context traverses its maintained
+  graph. ContextDB merges both kinds of candidates into the same global answer. For F32 the
+  automatic switch is at 1,000 allowed vectors; for SQ8/SQ4 it is at 5,001. These counts apply to
+  the whole requested answer, not separately to each partition.
 - `EXACT` compares every allowed stored vector, or returns a typed budget refusal. It never quietly
   substitutes an indexed answer. Exact means exact over the stored column values; SQ8 and SQ4 stay
   quantized by design.
 - `INDEXED` requires a maintained bounded route, including for a small non-empty layout. If that
-  route is not ready, it returns a typed unavailable-route refusal instead of a full scan.
-  <!-- enforced by: vector_search_mode_bounded_contract::auto_uses_the_aggregate_selected_scope_not_each_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible, vector_policy_resolver_contract::default_crossovers_execute_both_sides_without_a_normal_write_availability_gap -->
+  route is not ready, it returns a typed unavailable-route refusal instead of a full scan. It
+  traverses the graph even when `AUTO` would exact-compare that same small Context.
+  <!-- enforced by: vector_search_mode_bounded_contract::auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible, vector_policy_resolver_contract::default_crossovers_execute_both_sides_without_a_normal_write_availability_gap -->
 
 Override the declaration for one vector-nearest-neighbour query after vector ordering and before
 `USE RANK` or `LIMIT`:
@@ -1402,6 +1547,12 @@ While a required indexed route is unavailable, `INDEXED` refuses and `AUTO` may 
 inside its existing budget. Ordinary relational/graph reads and admitted writes remain usable.
 <!-- enforced by: vector_maintained_lifecycle_contract::caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance, vector_maintained_lifecycle_contract::engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopened_reader, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors -->
 
+For an exhaustive `AUTO` query over dormant raw partitions, a refused whole-partition load can
+fall back to reading one stored vector at a time, preserving the exact answer without installing
+a resident partition. For the same unrestricted search, a writable handle explicitly requesting
+`EXACT` retains whole-partition admission and can be refused at that load under the same ceiling.
+<!-- enforced by: vector_lazy_raw_residency_contract::auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition -->
+
 ### Partition scope, filters, and one answer
 
 Equality on every key component selects one layout. A finite `IN` or equivalent `OR` selects a
@@ -1424,9 +1575,9 @@ behind indexed search.
 ### Explain
 
 `.explain` reports the requested and resolved mode, declared partition key, whether the query
-selects one, several, or all authorized layouts, each route, the global candidate merge, and any
-safe fallback or refusal reason. It redacts unauthorized keys and counts. A constrained
-handle's explanation omits per-partition HNSW numbers, whose adaptive values could reveal
+selects one, several, or all authorized layouts, the route used by each Context, the global
+candidate merge, and any safe fallback or refusal reason. It redacts unauthorized keys and counts.
+A constrained handle's explanation omits per-partition HNSW numbers, whose adaptive values could reveal
 the hidden population. For an unrestricted caller, disclosed `M`, `EF_CONSTRUCTION`, and policy
 revision describe the snapshot's serving graph; `EF_SEARCH` describes the current query policy at
 its requested `k`. A query-only policy change therefore applies immediately even while the serving

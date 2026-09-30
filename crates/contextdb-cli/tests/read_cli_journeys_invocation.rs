@@ -235,9 +235,7 @@ fn operational_commands_are_visible_in_ordinary_help_and_repair_is_gone() {
     let outcome = run(&["--help"], "");
     let help = format!("{}{}", outcome.stdout, outcome.stderr);
 
-    for command in [
-        "migrate", "reset", "diagnose", "snapshot", "inspect", "purge",
-    ] {
+    for command in ["reset", "diagnose", "snapshot", "inspect", "purge"] {
         assert!(
             help.contains(command),
             "`{command}` is part of the one command tree and must appear in ordinary --help.\n{help}"

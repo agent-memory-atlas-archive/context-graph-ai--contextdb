@@ -1098,3 +1098,316 @@ fn a_report_from_a_finished_request_is_never_attributed_to_the_next_request_on_t
         );
     }
 }
+
+/// The fourth clock read after entering cursor-page authorization is made
+/// after the commit-lock attempt failed and its first cancellable wait ended.
+/// Count only the authorizing thread, since the carrier also uses this clock.
+#[cfg(unix)]
+struct PublicationCommitWaitClock {
+    armed: AtomicBool,
+    reads: std::sync::atomic::AtomicUsize,
+    authorizing_thread: Mutex<Option<std::thread::ThreadId>>,
+    waiting: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(unix)]
+impl DeadlineClock for PublicationCommitWaitClock {
+    fn now_ms(&self) -> u64 {
+        if self.armed.load(Ordering::SeqCst)
+            && *self.authorizing_thread.lock().expect("authorizing thread")
+                == Some(std::thread::current().id())
+            && self.reads.fetch_add(1, Ordering::SeqCst) == 3
+        {
+            self.waiting
+                .send(())
+                .expect("observe publication commit wait");
+        }
+        0
+    }
+
+    fn wait_until(&self, _deadline_ms: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[cfg(unix)]
+struct WriterContendedPublicationObserver {
+    boundary: std::sync::mpsc::SyncSender<()>,
+    resume: Barrier,
+    clock: Arc<PublicationCommitWaitClock>,
+    published: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+impl OwnerServicePublicationObserver for WriterContendedPublicationObserver {
+    fn before_cursor_page_publication(&self, _request_ordinal: u64) {
+        // Only the first fetch waits; a cancelled page is replayed by the
+        // same cursor after the writer is released.
+        if !self.clock.armed.load(Ordering::SeqCst) {
+            self.boundary
+                .send(())
+                .expect("observe private completed page");
+            self.resume.wait();
+            *self
+                .clock
+                .authorizing_thread
+                .lock()
+                .expect("authorizing thread") = Some(std::thread::current().id());
+            self.clock.armed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn cancellation_received(&self, _request_ordinal: u64) {}
+
+    fn cursor_page_published(&self, _request_ordinal: u64) {
+        self.published.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+fn owner_cursor_publication_behind_writer(cancel: bool) {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    let directory = tempfile::TempDir::new().expect("task-scoped publication-wait directory");
+    let path = directory.path().join("publication-wait.db");
+    let runtime = secure_runtime_root(&directory, "publication-wait-runtime");
+    let database = Arc::new(
+        Database::open_with_options(
+            &path,
+            DatabaseOpenOptions {
+                owner_reads: OwnerReadConfig {
+                    enabled: false,
+                    ..OwnerReadConfig::default()
+                },
+                ..DatabaseOpenOptions::default()
+            },
+        )
+        .expect("open fixture without automatic owner service"),
+    );
+    database
+        .execute(
+            "CREATE TABLE publication_wait_rows (id INTEGER PRIMARY KEY)",
+            &HashMap::new(),
+        )
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO publication_wait_rows VALUES (1), (2), (3)",
+            &HashMap::new(),
+        )
+        .unwrap();
+    let (waiting, waiting_rx) = sync_channel(1);
+    let clock = Arc::new(PublicationCommitWaitClock {
+        armed: AtomicBool::new(false),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+        authorizing_thread: Mutex::new(None),
+        waiting,
+    });
+    let (boundary, boundary_rx) = sync_channel(1);
+    let observer = Arc::new(WriterContendedPublicationObserver {
+        boundary,
+        resume: Barrier::new(2),
+        clock: clock.clone(),
+        published: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let user = LocalUserIdentity(nix::unistd::Uid::effective().as_raw() as u64);
+    let handshake = LocalHandshake::current(
+        DatabaseIdentity([0x63; 16]),
+        WriterRunNumber([0x74; 16]),
+        user,
+    );
+    let listener = ValidatedOwnerListener::new(ChannelPathFacts {
+        path: runtime.join("owner.sock"),
+        runtime_directory: runtime.clone(),
+        is_socket: true,
+        owner: user,
+        mode: 0o700,
+    });
+    let service = OwnerReadService::start(
+        OwnerServiceSpec::new(
+            database.clone(),
+            listener,
+            handshake.clone(),
+            OwnerReadStatus {
+                state: OwnerServingState::Serving,
+                reason: None,
+            },
+            roomy_owner_options(runtime).owner_reads,
+            LocalConfigurationSource::Override,
+            clock.clone(),
+        )
+        .with_publication_observer_for_test(observer.clone()),
+    )
+    .unwrap();
+    let mut client = block_on(OwnerClient::connect(
+        service.channel_path(),
+        handshake,
+        ReadClientTimeouts {
+            connect_ms: 60_000,
+            routing_retry_ms: 60_000,
+            response_ms: 60_000,
+        },
+        clock,
+    ))
+    .unwrap();
+    let limits = one_row_page_reader_options().limits;
+    let opened = block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::CursorOpen {
+            statement: "SELECT id FROM publication_wait_rows ORDER BY id".to_owned(),
+            params: BTreeMap::new(),
+        },
+    }))
+    .unwrap();
+    let [LocalResponse::CursorOpened { opened }] = opened.as_slice() else {
+        panic!("one cursor-open response");
+    };
+    assert_eq!(
+        one_page_id(&decode_cursor_page(&opened.payload).unwrap()),
+        1
+    );
+    let cursor_id = opened.cursor_id;
+    let cancellation = OwnerReadCancellation::new();
+    let fetch_cancellation = cancellation.clone();
+    let (answered, answered_rx) = sync_channel(1);
+    let fetch = std::thread::spawn(move || {
+        let result = block_on(client.request_watching(
+            LocalRequestEnvelope {
+                limits,
+                request: LocalRequest::CursorFetch {
+                    cursor_id,
+                    rows: None,
+                },
+            },
+            None,
+            Some(&fetch_cancellation),
+        ));
+        answered
+            .send((client, result))
+            .expect("receive cursor fetch outcome");
+    });
+    boundary_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("fetch completed before publication");
+    let pause = database.pause_after_relational_apply_for_test();
+    let writer_database = database.clone();
+    let writer = std::thread::spawn(move || {
+        writer_database
+            .execute(
+                "INSERT INTO publication_wait_rows VALUES (4)",
+                &HashMap::new(),
+            )
+            .unwrap()
+    });
+    assert!(
+        pause.wait_until_reached(Duration::from_secs(5)),
+        "writer pauses while holding commit lock"
+    );
+    observer.resume.wait();
+    waiting_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cursor authorization actually waits behind writer");
+    let (mut client, result) = if cancel {
+        cancellation.cancel();
+        // Receive the typed refusal while the writer still owns its lock.
+        let answer = answered_rx.recv_timeout(Duration::from_secs(5));
+        pause.release();
+        let answer = answer.expect("owner cancellation refuses before writer release");
+        assert!(
+            matches!(
+                answer.1,
+                Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))
+            ),
+            "typed cancellation refusal: {:?}",
+            answer.1
+        );
+        assert_eq!(observer.published.load(Ordering::SeqCst), 0);
+        answer
+    } else {
+        pause.release();
+        answered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publication resumes with writer release")
+    };
+    fetch.join().unwrap();
+    writer.join().unwrap();
+    if cancel {
+        assert!(result.is_err());
+    } else {
+        let responses = result.expect("uncancelled publication succeeds");
+        let [LocalResponse::CursorPage { page }] = responses.as_slice() else {
+            panic!("exactly one successful page: {responses:?}");
+        };
+        assert_eq!(one_page_id(&decode_cursor_page(&page.payload).unwrap()), 2);
+    }
+    // A status exchange is an ordering fence after page publication and guard
+    // release. The cancelled page must replay; the successful one advances.
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::OwnerStatus,
+    }))
+    .unwrap();
+    assert_eq!(
+        observer.published.load(Ordering::SeqCst),
+        usize::from(!cancel)
+    );
+    assert_eq!(service.resources().active_cancellations, 0);
+    let next = block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::CursorFetch {
+            cursor_id,
+            rows: None,
+        },
+    }))
+    .unwrap();
+    let [LocalResponse::CursorPage { page }] = next.as_slice() else {
+        panic!("one continuation page");
+    };
+    let next_page = decode_cursor_page(&page.payload).unwrap();
+    assert_eq!(one_page_id(&next_page), if cancel { 2 } else { 3 });
+    assert_eq!(
+        next_page.has_more, cancel,
+        "the opened snapshot excludes the writer's later row"
+    );
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::OwnerStatus,
+    }))
+    .unwrap();
+    assert_eq!(
+        observer.published.load(Ordering::SeqCst),
+        usize::from(!cancel) + 1
+    );
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::CursorClose { cursor_id },
+    }))
+    .unwrap();
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::OwnerStatus,
+    }))
+    .unwrap();
+    let released = service.resources();
+    assert_eq!(released.active_slots, 0);
+    assert_eq!(released.cursor_count, 0);
+    assert_eq!(released.cursor_retained_bytes, 0);
+    assert_eq!(released.buffered_bytes, 0);
+    assert_eq!(released.active_cancellations, 0);
+    drop(client);
+    service.shutdown_and_drain().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_channel_cancellation_reaches_cursor_publication_while_writer_is_paused() {
+    owner_cursor_publication_behind_writer(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_channel_cursor_publication_after_writer_release_completes_exactly_once() {
+    owner_cursor_publication_behind_writer(false);
+}

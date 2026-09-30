@@ -2234,7 +2234,12 @@ fn nv_memory_budget_exceeded_carries_index_tag_in_operation_string() {
     // the offending (table, column) so an operator hitting OOM on a Jetson can attribute the cost.
     // `MemoryAccountant::with_budget(usize)` exists today; `open_memory_with_accountant` accepts an
     // `Arc<MemoryAccountant>` and returns `Self`.
-    let accountant = Arc::new(MemoryAccountant::with_budget(4096));
+    // 4096 over the schema: the single-column PRIMARY KEY allocates a fixed
+    // 64 KiB exact-probe bitmap for the life of the index, which it always did
+    // and which the accountant now sees.
+    let accountant = Arc::new(MemoryAccountant::with_budget(
+        contextdb_core::EXACT_PROBE_FILTER_BYTES + 4096,
+    ));
     let db = Database::open_memory_with_accountant(accountant);
     db.execute(
         "CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(1024))",

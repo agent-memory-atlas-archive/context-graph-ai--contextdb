@@ -5,9 +5,9 @@ description: Run the operator lifecycle on a contextdb store — enforce RETAIN 
 
 # Operating a store
 
-The recovery/maintenance verbs (`diagnose`, `migrate`, `reset --force`) and the destructive-op
+The recovery/maintenance verbs (`diagnose`, `reset --force`) and the destructive-op
 confirmation rule already live in
-[`AGENTS.md`'s destructive-op table and migration rehearsal](../../AGENTS.md#destructive-commands-need-explicit-confirmation) —
+[`AGENTS.md`'s destructive-op table](../../AGENTS.md#destructive-commands-need-explicit-confirmation) —
 read that first; this skill does not repeat it. What this skill covers instead: driving `RETAIN`
 expiry on demand, permanently erasing rows with `purge`, backing up before any destructive op, and
 telling a healthy-but-slow sync pull apart from a genuinely stuck one.
@@ -23,11 +23,11 @@ telling a healthy-but-slow sync pull apart from a genuinely stuck one.
 2. **Erase rows permanently** → `contextdb purge <path> --table <t> --force`, recipe 2. **Only
    legal on a store that has never connected to a sync hub** — read the honest caveat in recipe 2
    before you reach for this on a synced edge.
-3. **Take a backup before ANY destructive op** (`reset`, `migrate`, `purge`) → `contextdb snapshot
+3. **Take a backup before ANY destructive op** (`reset`, `purge`) → `contextdb snapshot
    export <path> <dest>`, recipe 3. This is the safe prerequisite AGENTS.md's table already points
    at; the worked example here is the copy-paste form.
 4. **Tell a healthy long-running pull apart from a stuck one** → recipe 4, `pull_pages_read`.
-5. **If you need `diagnose`/`migrate`/`reset`**, go straight to
+5. **If you need `diagnose`/`reset`**, go straight to
    [AGENTS.md's destructive-op table](../../AGENTS.md#destructive-commands-need-explicit-confirmation)
    — this skill doesn't re-derive those, it composes with them (recipe 3 is the backup step you take
    before using them).
@@ -70,8 +70,8 @@ printf '.maintenance run\nSELECT COUNT(*) AS n FROM pings;\n' | contextdb ./life
 The CLI starts engine-owned maintenance by default. A writable file-backed session
 spawns the worker when the store has something to maintain (a `RETAIN` table, a
 currency table, a durable trigger audit, or a declared vector index). Use
-`--maintenance caller-driven` for a predictable, synchronous-only session that
-never spawns the worker and leaves scheduling to `.maintenance run`.
+`--maintenance caller-driven` <!-- enforced by: crates/contextdb-cli/tests/read_cli_journeys_invocation.rs::maintenance_flags_require_write_and_configure_the_writer --> for a predictable, synchronous-only session that
+never spawns the worker <!-- enforced by: tests/integration/maintenance_ownership_tests.rs::caller_driven_spawns_no_thread_however_much_is_declared --> and leaves scheduling to `.maintenance run`.
 
 ```bash
 printf '.maintenance status\n' | contextdb ./life.db --write --json
@@ -122,15 +122,15 @@ at all — that's a sign to go back to step 1, not a broken maintenance loop.
 ## Recipe 2 — `purge`: permanent erasure, and the honest limits on it
 
 1. Run `contextdb purge <path> --table <t> --force`. There is **no `WHERE` support at this door** —
-   it erases every row of the named table. For a narrower selection, use the engine's `PURGE FROM
+   it erases every row of the named table. <!-- enforced by: crates/contextdb-cli/tests/purge_cli_verb_tests.rs::purge_with_force_erases_rows_and_the_erasure_survives_a_restart --> For a narrower selection, use the engine's `PURGE FROM
    <table> WHERE ...` SQL statement directly instead of the CLI verb.
-2. **`--force` is mandatory.** Omitting it refuses with a usage error (exit `2`) that names the
+2. **`--force` is mandatory.** Omitting it refuses with a usage error (exit `2`) <!-- enforced by: crates/contextdb-cli/tests/purge_cli_verb_tests.rs::purge_without_force_refuses_and_leaves_data_untouched --> that names the
    exact command to rerun — this is deliberate friction, not a bug to route around.
 3. Validate: re-read the table's row count; also `contextdb purge` itself prints how many rows it
    erased.
 4. **The honest limit: `purge` only runs on a store that has never connected to a sync hub.** A
    store that has EVER had a `--sync-endpoint` configured refuses purge with `PURGE must originate
-   at authoritative hub <hub-node-id>; run PURGE there` — purge must run at the hub, not on an
+   at authoritative hub <hub-node-id>; run PURGE there` <!-- enforced by: crates/contextdb-server/tests/durable_deletion_and_purge_tests.rs::configured_edge_refuses_purge_before_first_connection_and_after_restart --> — purge must run at the hub, not on an
    edge, so that a purge is never invisible to peers that still hold the row. **If you hit that
    refusal on an edge, go run purge against the hub's own database file directly** (with the hub
    process stopped, or via whatever administrative path the hub operator uses) — there is no edge
@@ -208,7 +208,7 @@ every current and future peer converges on the erasure.
 
 ## Recipe 3 — back up before any destructive op
 
-1. `contextdb snapshot export <path> <dest>` before `migrate`, `reset --force`, or `purge`.
+1. `contextdb snapshot export <path> <dest>` before `reset --force` or `purge`.
 2. Validate: the command's own output line states the row/edge/vector counts and byte size it
    captured — compare that against what you expect before proceeding to the destructive step.
 
@@ -227,7 +227,7 @@ snapshot exported to './snap-backup' at LSN 2 (1 rows, 0 edges, 0 vectors, 11059
 ```
 
 `1 rows` matches the one row inserted — that's the validation. **If the row count in the export
-line doesn't match what you expect, stop before running `migrate`/`reset`/`purge`** — the backup
+line doesn't match what you expect, stop before running `reset`/`purge`** — the backup
 itself may be incomplete (a concurrent writer, a wrong path), and a destructive op after a bad
 backup has no recovery path.
 
@@ -239,7 +239,7 @@ backup has no recovery path.
 2. In a **scripted/piped** session, or from your own Rust code driving a `SyncClient` directly, the
    counter is exposed as `pull_pages_read` — cumulative pages this client process has read across
    every pull it has issued, reset only when the process restarts. Read it from `.sync status` in a
-   `--json` session after a pull completes, or poll it from your own code on a background thread
+   `--json` session after a pull completes, <!-- enforced by: crates/contextdb-cli/tests/sync_pull_progress_counter_tests.rs::sync_status_json_carries_a_monotonically_advancing_pull_pages_read_field --> or poll it from your own code on a background thread
    the way the CLI's own interactive printer does (`client.pull_pages_read()` before and after a
    delay while a pull runs on another thread) — **a genuinely live two-shell-process poll won't
    work**. A second process can certainly read the store while the puller holds it (that read is
@@ -263,7 +263,7 @@ printf '.sync status\n' | contextdb ./edge-a.db --write --tenant-id p --sync-end
 
 `pull_pages_read:0` here is correct and not a bug — this edge has only ever pushed, never pulled.
 `pull_in_progress` is a live cross-thread signal, not a durable fact — it turns `true` only while a
-pull sharing this exact `SyncClient` handle is actively running, so a one-shot CLI process (which
+pull sharing this exact `SyncClient` handle is actively running, <!-- enforced by: crates/contextdb-server/tests/sync_pull_in_progress_tests.rs::pull_in_progress_is_true_only_while_a_pull_is_running --> so a one-shot CLI process (which
 blocks until its own pull returns) always reports `false` here regardless of history.
 
 ### Worked example 2 — after a real pull, human output
@@ -305,7 +305,7 @@ hang — a `0`-page pull with `applied:0` is often just "already converged," not
 
 ## Next
 
-- The destructive-op table, migration rehearsal, and the safe-reading-by-default contract this skill builds on → [`AGENTS.md`](../../AGENTS.md)
+- The destructive-op table and the safe-reading-by-default contract this skill builds on → [`AGENTS.md`](../../AGENTS.md)
 - Open a database, run SQL, read `--json`, branch on exit codes → [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md)
 - Push/pull, watermarks, the delete-durability recipe → [`skills/sync/SKILL.md`](../sync/SKILL.md)
 - Wire up sinks/routes/schedules so there's something to observe here → [`skills/running-triggers-and-schedules/SKILL.md`](../running-triggers-and-schedules/SKILL.md)

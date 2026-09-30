@@ -6,8 +6,9 @@ use crate::custody_types::{
 };
 use crate::protocol::{
     DependencyCompletePullResponse, MessageType, PROTOCOL_VERSION, PullRequest, PullResponse,
-    PushRequest, PushResponse, SchemaRecoveryRequest, SyncStatusResponse, WireChangeSet,
-    WirePurgeChange, WirePushError, decode_for_version, encode_for_version, row_payload_bytes,
+    PushRequest, PushResponse, RefusedSchemaUnitOutcome, SchemaRecoveryRequest, SyncStatusResponse,
+    WireChangeSet, WirePurgeChange, WirePushError, decode_for_version, encode_for_version,
+    row_payload_bytes,
 };
 use crate::subjects::{pull_subject, push_subject, status_subject};
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
@@ -35,9 +36,8 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 // sync operation ceiling so the client does not reset an accepted stream and
 // manufacture an unconfirmed outcome while the hub is still committing it.
 const PUSH_REQUEST_TIMEOUT: Duration = SYNC_TIMEOUT;
-/// Bound on the sync-status probe. No responder / timeout / malformed
-/// reply all degrade to "no status" and the sync proceeds exactly as before
-/// the probe existed (contract item 5: never hang against an old server).
+/// Bound on each sync-status attempt. Required probes retry transient
+/// transport misses; invalid responses remain terminal.
 const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const PULL_PAGE_SIZE: u32 = 500;
 const MAX_BATCH_BYTES: usize = 800 * 1024;
@@ -55,6 +55,26 @@ struct PreparedPushBatch {
     arrivals: HashMap<Lsn, Option<Lsn>>,
     lineages: HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage>,
     ddl_provenance: Vec<crate::protocol::WireDdlProvenance>,
+}
+
+/// Exact authored unit identity, including the signed member digest.
+#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+struct AuthoredSchemaUnitKey {
+    node_id: String,
+    incarnation: Incarnation,
+    source_ddl_lsn: Lsn,
+    digest: [u8; 32],
+}
+
+impl From<&RefusedSchemaUnitOutcome> for AuthoredSchemaUnitKey {
+    fn from(outcome: &RefusedSchemaUnitOutcome) -> Self {
+        Self {
+            node_id: outcome.author_node_id.clone(),
+            incarnation: outcome.author_incarnation,
+            source_ddl_lsn: outcome.source_ddl_lsn,
+            digest: outcome.unit_digest,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +110,7 @@ pub struct SyncClient {
     endpoint: String,
     tenant_id: TenantId,
     push_watermark: AtomicLsn,
+    refused_schema_units: Mutex<Vec<RefusedSchemaUnitOutcome>>,
     /// A confirmed hub push whose exact ordering still needs a pull. This is
     /// in memory for memory databases and persisted for file-backed ones.
     pending_push_confirmation: AtomicLsn,
@@ -175,8 +196,6 @@ struct AppliedPullPage {
     suppressed_live_replay_only: bool,
     has_deliverable_changes: bool,
     awaits_trigger_callback_registration: bool,
-    received_items: u64,
-    received_payload_bytes: u64,
 }
 
 /// Whether a served page declares a trigger this node has no callback for.
@@ -219,15 +238,16 @@ fn take_validated_ordinary_purges(
         malformed_purge_page("a nonempty purge page omitted its consumed frontier cursor")
     })?;
     let mut previous_frontier = None;
-    let mut seen = Vec::<WirePurgeChange>::with_capacity(purges.len());
+    let mut seen = Vec::<(WirePurgeChange, Option<String>)>::with_capacity(purges.len());
     let mut validated = Vec::with_capacity(purges.len());
     for (ordinal, purge) in purges.into_iter().enumerate() {
         if purge.table.is_empty() {
             return Err(malformed_purge_page("purge table is empty"));
         }
         // Local predicates carry their own durable instruction identity.
-        if let Some(bytes) = &purge.node_local_predicate {
-            crate::database::purge_predicate::NodeLocalPredicate::decode(bytes)?;
+        let predicate_receipt = if let Some(bytes) = &purge.node_local_predicate {
+            let receipt =
+                crate::database::purge_predicate::NodeLocalPredicate::decode(bytes)?.receipt_key();
             if purge.table_generation != 0
                 || !purge.purged_lineage_roots.is_empty()
                 || !purge.natural_key.column.is_empty()
@@ -236,6 +256,7 @@ fn take_validated_ordinary_purges(
                     "node-local instruction mixed with row-key evidence",
                 ));
             }
+            Some(receipt)
         } else {
             if purge.table_generation == 0 {
                 return Err(malformed_purge_page(format!(
@@ -290,7 +311,8 @@ fn take_validated_ordinary_purges(
                     purge.table
                 )));
             }
-        }
+            None
+        };
         if purge.purge_frontier == Lsn(0) {
             return Err(malformed_purge_page(format!(
                 "purge table {} has frontier zero",
@@ -309,13 +331,24 @@ fn take_validated_ordinary_purges(
                 purge.purge_frontier.0
             )));
         }
-        if seen.iter().any(|previous| {
+        if seen.iter().any(|(previous, previous_receipt)| {
             previous.table == purge.table
-                && previous.table_generation == purge.table_generation
-                && previous.natural_key == purge.natural_key
+                && match (&predicate_receipt, previous_receipt) {
+                    (Some(receipt), Some(previous_receipt)) => receipt == previous_receipt,
+                    (None, None) => {
+                        previous.table_generation == purge.table_generation
+                            && previous.natural_key == purge.natural_key
+                            && (previous.purge_frontier == purge.purge_frontier
+                                || previous
+                                    .purged_lineage_roots
+                                    .iter()
+                                    .any(|root| purge.purged_lineage_roots.contains(root)))
+                    }
+                    _ => false,
+                }
         }) {
             return Err(malformed_purge_page(format!(
-                "purge table {} repeats a natural-key target",
+                "purge table {} repeats a delivery item",
                 purge.table
             )));
         }
@@ -331,9 +364,94 @@ fn take_validated_ordinary_purges(
             purged_lineage_roots: purge.purged_lineage_roots.clone(),
             node_local_predicate: purge.node_local_predicate.clone(),
         });
-        seen.push(purge);
+        seen.push((purge, predicate_receipt));
     }
     Ok(validated)
+}
+
+#[cfg(test)]
+mod purge_page_identity_tests {
+    use super::*;
+    use crate::protocol::WireNaturalKey;
+    use contextdb_core::Value;
+
+    #[test]
+    fn separate_key_lives_are_valid_but_repeated_delivery_items_are_refused() {
+        let first = WirePurgeChange {
+            table: "notes".into(),
+            table_generation: 1,
+            natural_key: WireNaturalKey {
+                column: "id".into(),
+                value: Value::Int64(7),
+                rest: Vec::new(),
+            },
+            purged_lineage_roots: vec!["first-life".into()],
+            purge_frontier: Lsn(1),
+            node_local_predicate: None,
+        };
+        let second = WirePurgeChange {
+            purged_lineage_roots: vec!["second-life".into()],
+            purge_frontier: Lsn(2),
+            ..first.clone()
+        };
+        let mut distinct = WireChangeSet {
+            purges: vec![first.clone(), second],
+            ..WireChangeSet::default()
+        };
+        assert_eq!(
+            take_validated_ordinary_purges(&mut distinct, Lsn(0), Some(Lsn(2)))
+                .expect("separate purges of separate lives share a page")
+                .len(),
+            2
+        );
+
+        let mut duplicate = WireChangeSet {
+            purges: vec![first.clone(), first.clone()],
+            ..WireChangeSet::default()
+        };
+        assert!(matches!(
+            take_validated_ordinary_purges(&mut duplicate, Lsn(0), Some(Lsn(2))),
+            Err(Error::SyncError(message)) if message.contains("repeats a delivery item")
+        ));
+
+        let mut repeated_life = WireChangeSet {
+            purges: vec![
+                first.clone(),
+                WirePurgeChange {
+                    purge_frontier: Lsn(2),
+                    ..first
+                },
+            ],
+            ..WireChangeSet::default()
+        };
+        assert!(matches!(
+            take_validated_ordinary_purges(&mut repeated_life, Lsn(0), Some(Lsn(2))),
+            Err(Error::SyncError(message)) if message.contains("repeats a delivery item")
+        ));
+    }
+
+    #[test]
+    fn repeated_node_local_instruction_is_refused_by_its_receipt() {
+        let predicate =
+            crate::database::purge_predicate::NodeLocalPredicate::capture(None, &HashMap::new())
+                .expect("encode a node-local instruction");
+        let item = WirePurgeChange {
+            table: "record_extracts".into(),
+            table_generation: 0,
+            natural_key: WireNaturalKey::default(),
+            purged_lineage_roots: Vec::new(),
+            purge_frontier: Lsn(1),
+            node_local_predicate: Some(predicate),
+        };
+        let mut duplicate = WireChangeSet {
+            purges: vec![item.clone(), item],
+            ..WireChangeSet::default()
+        };
+        assert!(matches!(
+            take_validated_ordinary_purges(&mut duplicate, Lsn(0), Some(Lsn(1))),
+            Err(Error::SyncError(message)) if message.contains("repeats a delivery item")
+        ));
+    }
 }
 
 impl std::fmt::Debug for SyncClient {
@@ -919,11 +1037,9 @@ impl SyncClient {
                 tracing::warn!(%tenant_id, error = %err, "failed to load persisted sync watermarks");
                 (Lsn(0), Lsn(0))
         });
-        // Only the SOURCE half loads here — the lsn half of the persisted
-        // pair is not consulted at construction so an edge upgrading from a
-        // build with no combined-cursor record yet keeps resuming from its
-        // existing `pull_watermark` unchanged; the first pull after upgrade
-        // simply starts recording source identity going forward.
+        // Only the source half loads here. Construction resumes from the
+        // persisted `pull_watermark`, independently of the combined cursor's
+        // LSN. If no combined cursor exists, the next pull records its source.
         let pull_source = db
             .persisted_sync_pull_cursor(&tenant_id)
             .unwrap_or_else(|err| {
@@ -978,6 +1094,7 @@ impl SyncClient {
             endpoint,
             tenant_id,
             push_watermark: AtomicLsn::new(push_watermark),
+            refused_schema_units: Mutex::new(Vec::new()),
             pending_push_confirmation: AtomicLsn::new(pending_push_confirmation),
             pull_watermark: AtomicLsn::new(pull_watermark),
             pages_discarded_for_source_mismatch: AtomicUsize::new(0),
@@ -1172,6 +1289,7 @@ impl SyncClient {
             capabilities: state.capabilities.clone(),
             through: state.compatible_through,
             held_through: state.held_through,
+            memory_held_tables: Default::default(),
         });
         self.db.with_authoritative_hub_reply(hub_node_id, |db| {
             db.persist_outbound_schema_sync_holdback_while_authoritative(
@@ -1242,6 +1360,7 @@ impl SyncClient {
             &ddl_provenance_source,
             reupload_epoch.map(|(through, _)| through),
         )?;
+        let changes = crate::sync_server::without_hub_local_bookkeeping(changes);
         let changes = match reupload_epoch {
             Some((through, _)) => self
                 .db
@@ -1267,22 +1386,63 @@ impl SyncClient {
             .destination_reupload_epoch(&self.tenant_id, &hub_node_id)
     }
 
+    /// Retry only transport misses; callers validate a received response once.
+    async fn request_sync_status_reply(
+        &self,
+        encoded: Vec<u8>,
+        require_reply: bool,
+    ) -> Result<Vec<u8>, TransportError> {
+        let mut attempt = 0u32;
+        loop {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            }
+            match self
+                .transport
+                .request_single_reply(
+                    &status_subject(self.tenant_id.as_str()),
+                    encoded.clone(),
+                    STATUS_REQUEST_TIMEOUT,
+                )
+                .await
+            {
+                Ok(reply) => return Ok(reply),
+                Err(
+                    TransportError::NoResponder
+                    | TransportError::Status(_)
+                    | TransportError::Timeout,
+                ) if require_reply && attempt < 4 => {
+                    tracing::debug!(attempt, "required sync status transport miss, retrying");
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Authenticated restore verification in one bounded
     /// status exchange. Failure to verify held receipts is an error, never credit.
-    /// An ordinary unbound peer without custody retains its best-effort status probe.
+    /// Even an empty exact query requires acknowledgment before it can authorize a push.
     async fn fetch_sync_status(
         &self,
         incarnation: Incarnation,
+        require_reply: bool,
     ) -> Result<Option<SyncStatusResponse>, Error> {
+        // Suppression is scoped to a successfully authenticated status image.
+        // If status is unavailable, stale knowledge of a prior hub life cannot
+        // retire work belonging to the current destination.
+        self.refused_schema_units
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let Some(hub) = self.hub_node_id() else {
             return Ok(None);
         };
         let edge = self.transport.local_node_id();
-        let probe = if let Some(edge) = &edge {
+        let mut probe = if let Some(edge) = &edge {
             crate::custody::incarnation::probe(&self.db, &self.tenant_id, &hub, edge, incarnation)?
         } else {
-            // Ordinary unidentified transports keep lost-ack
-            // status reconciliation; a bound custody edge must identify itself.
+            // A bound custody edge must identify itself before requesting status.
             if self.db.custody_authority()?.iter().any(|record| {
                 matches!(record,
                     crate::custody::records::Record::Binding(binding)
@@ -1297,23 +1457,22 @@ impl SyncClient {
             crate::custody::incarnation::StatusProbe {
                 incarnation,
                 checkpoint: None,
+                refused_schema_unit_digests: Vec::new(),
             }
         };
+        probe.refused_schema_unit_digests.clear();
         let verification_required = probe.checkpoint.is_some();
         let requests = probe
             .pages()?
             .into_iter()
             .map(|encoded| (PROTOCOL_VERSION, encoded));
-        let mut last = None;
-        for (version, encoded) in requests {
+        let mut requests = requests.collect::<std::collections::VecDeque<_>>();
+        let mut last: Option<SyncStatusResponse> = None;
+        let refused = Vec::new();
+        while let Some((version, encoded)) = requests.pop_front() {
             let exchange = async {
                 let reply = self
-                    .transport
-                    .request_single_reply(
-                        &status_subject(self.tenant_id.as_str()),
-                        encoded,
-                        STATUS_REQUEST_TIMEOUT,
-                    )
+                    .request_sync_status_reply(encoded, verification_required || require_reply)
                     .await
                     .map_err(|error| {
                         Error::SyncError(format!("restore status exchange failed: {error}"))
@@ -1331,9 +1490,19 @@ impl SyncClient {
             .await;
             let status = match exchange {
                 Ok(status) => status,
-                Err(error) if verification_required => return Err(error),
+                Err(error) if verification_required || require_reply => return Err(error),
                 Err(_) => return Ok(None),
             };
+            if status.refused_schema_unit_digests_ack.as_deref() != Some(&[]) {
+                return Err(Error::SyncError(
+                    "hub did not acknowledge exact refused schema lookup".into(),
+                ));
+            }
+            if !status.refused_schema_units.is_empty() {
+                return Err(Error::SyncError(
+                    "empty refused schema lookup returned an unrelated outcome".into(),
+                ));
+            }
             if verification_required && status.hub_incarnation.is_none() {
                 return Err(Error::SyncError(
                     "restore status omitted hub incarnation".into(),
@@ -1362,9 +1531,417 @@ impl SyncClient {
                     self.bind_application_table_policy(expectation).await?;
                 }
             }
+            self.validate_refused_schema_units(
+                &status.refused_schema_units,
+                status.hub_incarnation,
+            )?;
+            if let Some(previous) = last.as_ref()
+                && previous.hub_incarnation != status.hub_incarnation
+            {
+                return Err(Error::SyncError(
+                    "hub incarnation changed during refusal status paging".into(),
+                ));
+            }
             last = Some(status);
         }
+        if let Some(status) = last.as_mut() {
+            status.refused_schema_units = refused.clone();
+            *self
+                .refused_schema_units
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = refused;
+        }
         Ok(last)
+    }
+
+    /// Query authored units one prepared batch at a time. The durable position
+    /// names a unit in this deterministic traversal; neither audit history nor
+    /// all candidate keys are materialized for a push.
+    async fn fetch_candidate_refusals(
+        &self,
+        incarnation: Incarnation,
+        prepared_batches: &[PreparedPushBatch],
+        initial_status: Option<&SyncStatusResponse>,
+    ) -> Result<Incarnation, Error> {
+        let hub = self.hub_node_id().ok_or_else(|| {
+            Error::SyncError("refused schema lookup requires authenticated hub identity".into())
+        })?;
+        let edge = self.transport.local_node_id().ok_or_else(|| {
+            Error::SyncError("refused schema lookup requires authenticated edge identity".into())
+        })?;
+        let status = match initial_status {
+            Some(status) => status.clone(),
+            None => self
+                .fetch_sync_status(incarnation, true)
+                .await
+                // A lost reply here is exactly the interrupted-push case:
+                // the schema-refusal probe couldn't confirm what the hub
+                // holds, so the push's outcome is indeterminate, never a
+                // bare transport error — the operator gets the distinct
+                // unconfirmed code and the reconcile guidance regardless of
+                // whether the push carried schema changes.
+                .map_err(|status_err| Error::SyncPushUnconfirmed {
+                    detail: format!(
+                        "the hub did not acknowledge the push (candidate-refusal status probe \
+                         failed: {status_err}); the data may or may not have committed — run \
+                         the push again to reconcile"
+                    ),
+                })?
+                .ok_or_else(|| {
+                    Error::SyncError("refused schema lookup requires authenticated status".into())
+                })?,
+        };
+        let hub_incarnation = status.hub_incarnation.ok_or_else(|| {
+            Error::SyncError("refused schema lookup requires hub incarnation".into())
+        })?;
+        let mut hasher = blake3::Hasher::new();
+        let mut candidate_count = 0usize;
+        let mut prepared_index = 0usize;
+        let mut pending = std::collections::VecDeque::new();
+        while let Some(batch) =
+            Self::next_authored_unit_batch(prepared_batches, &mut prepared_index, &mut pending)?
+        {
+            for key in batch {
+                let encoded =
+                    rmp_serde::to_vec(&key).map_err(|e| Error::SyncError(e.to_string()))?;
+                hasher.update(&(encoded.len() as u64).to_le_bytes());
+                hasher.update(&encoded);
+                candidate_count = candidate_count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::SyncError("too many authored schema units".into()))?;
+            }
+        }
+        let candidate_fingerprint = *hasher.finalize().as_bytes();
+        let saved =
+            self.db
+                .refused_schema_lookup_checkpoint(&self.tenant_id, &edge, incarnation, &hub)?;
+        let mut checkpoint = saved
+            .filter(|saved| {
+                saved.candidate_fingerprint == candidate_fingerprint
+                    && saved.hub_incarnation == hub_incarnation
+                    && saved.next_index <= candidate_count
+            })
+            .unwrap_or(crate::protocol::RefusedSchemaLookupCheckpoint {
+                candidate_fingerprint,
+                hub_incarnation,
+                next_index: 0,
+            });
+        #[cfg(feature = "test-seams")]
+        let mut confirmed = Vec::new();
+        let mut position = 0usize;
+        let mut prepared_index = 0usize;
+        let mut pending = std::collections::VecDeque::new();
+        while let Some(batch) =
+            Self::next_authored_unit_batch(prepared_batches, &mut prepared_index, &mut pending)?
+        {
+            let end = position + batch.len();
+            if end <= checkpoint.next_index {
+                // Only the test observation seam reconstructs already-confirmed
+                // outcomes. The production pass skips these batches by position.
+                #[cfg(feature = "test-seams")]
+                {
+                    let digests = batch.iter().map(|key| key.digest).collect::<Vec<_>>();
+                    let (local, _lease) = self.db.refused_schema_local_facts(
+                        &self.tenant_id,
+                        &edge,
+                        incarnation,
+                        &hub,
+                        hub_incarnation,
+                        &digests,
+                    )?;
+                    self.validate_refused_schema_units(&local, Some(hub_incarnation))?;
+                    if local
+                        .iter()
+                        .any(|outcome| !batch.contains(&AuthoredSchemaUnitKey::from(outcome)))
+                    {
+                        return Err(Error::SyncError(
+                            "local refused schema fact names another unit".into(),
+                        ));
+                    }
+                    confirmed.extend(local);
+                }
+                position = end;
+                continue;
+            }
+            if position < checkpoint.next_index {
+                return Err(Error::SyncError(
+                    "refusal checkpoint is not at a batch boundary".into(),
+                ));
+            }
+            let digests = batch.iter().map(|key| key.digest).collect::<Vec<_>>();
+            let (local, _lease) = self.db.refused_schema_local_facts(
+                &self.tenant_id,
+                &edge,
+                incarnation,
+                &hub,
+                hub_incarnation,
+                &digests,
+            )?;
+            self.validate_refused_schema_units(&local, Some(hub_incarnation))?;
+            if local
+                .iter()
+                .any(|outcome| !batch.contains(&AuthoredSchemaUnitKey::from(outcome)))
+            {
+                return Err(Error::SyncError(
+                    "local refused schema fact names another unit".into(),
+                ));
+            }
+            let known = local
+                .iter()
+                .map(|outcome| outcome.unit_digest)
+                .collect::<HashSet<_>>();
+            let requested = digests
+                .into_iter()
+                .filter(|digest| !known.contains(digest))
+                .collect::<Vec<_>>();
+            if requested.is_empty() {
+                #[cfg(feature = "test-seams")]
+                confirmed.extend(local);
+                checkpoint.next_index = end;
+                self.db.with_authoritative_hub_reply(&hub, |db| {
+                    db.persist_refused_schema_lookup_batch(
+                        &self.tenant_id,
+                        &edge,
+                        incarnation,
+                        &hub,
+                        &checkpoint,
+                        &[],
+                    )
+                })?;
+                position = end;
+                continue;
+            }
+            #[cfg(feature = "test-seams")]
+            confirmed.extend(local);
+            #[cfg(not(feature = "test-seams"))]
+            drop(local);
+            drop(_lease);
+            let mut probe = crate::custody::incarnation::probe(
+                &self.db,
+                &self.tenant_id,
+                &hub,
+                &edge,
+                incarnation,
+            )?;
+            probe.refused_schema_unit_digests = requested.clone();
+            let encoded = probe.pages()?.pop().ok_or_else(|| {
+                Error::SyncError("refused schema lookup did not encode a request".into())
+            })?;
+            let reply = self
+                .request_sync_status_reply(encoded, true)
+                .await
+                .map_err(|e| Error::SyncError(format!("refused schema lookup failed: {e}")))?;
+            let envelope = decode_for_version(&reply, PROTOCOL_VERSION)
+                .map_err(|e| Error::SyncError(e.to_string()))?;
+            if !matches!(envelope.message_type, MessageType::StatusResponse) {
+                return Err(Error::SyncError(
+                    "unexpected refused schema lookup response".into(),
+                ));
+            }
+            let status: SyncStatusResponse = rmp_serde::from_slice(&envelope.payload)
+                .map_err(|e| Error::SyncError(e.to_string()))?;
+            if status.refused_schema_unit_digests_ack.as_ref() != Some(&requested) {
+                return Err(Error::SyncError(
+                    "hub did not acknowledge exact refused schema lookup".into(),
+                ));
+            }
+            if status.hub_incarnation != Some(hub_incarnation) {
+                return Err(Error::SyncError(
+                    "hub incarnation changed during refused schema lookup".into(),
+                ));
+            }
+            self.validate_refused_schema_units(
+                &status.refused_schema_units,
+                Some(hub_incarnation),
+            )?;
+            if status.refused_schema_units.iter().any(|outcome| {
+                !requested.contains(&outcome.unit_digest)
+                    || !batch.contains(&AuthoredSchemaUnitKey::from(outcome))
+            }) {
+                return Err(Error::SyncError(
+                    "refused schema lookup returned an unrelated outcome".into(),
+                ));
+            }
+            #[cfg(feature = "test-seams")]
+            {
+                confirmed.extend(status.refused_schema_units.iter().cloned());
+            }
+            checkpoint.next_index = end;
+            self.db.with_authoritative_hub_reply(&hub, |db| {
+                db.persist_refused_schema_lookup_batch(
+                    &self.tenant_id,
+                    &edge,
+                    incarnation,
+                    &hub,
+                    &checkpoint,
+                    &status.refused_schema_units,
+                )
+            })?;
+            position = end;
+        }
+        self.db.with_authoritative_hub_reply(&hub, |db| {
+            db.persist_refused_schema_lookup_checkpoint(
+                &self.tenant_id,
+                &edge,
+                incarnation,
+                &hub,
+                None,
+            )
+        })?;
+        #[cfg(feature = "test-seams")]
+        {
+            *self
+                .refused_schema_units
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = confirmed;
+        }
+        Ok(hub_incarnation)
+    }
+
+    fn authored_unit_keys(
+        provenance: &[crate::protocol::WireDdlProvenance],
+    ) -> Result<Vec<AuthoredSchemaUnitKey>, Error> {
+        let mut keys = Self::authored_ddl_units(provenance)?
+            .into_keys()
+            .collect::<Vec<_>>();
+        keys.sort();
+        Ok(keys)
+    }
+
+    fn next_authored_unit_batch(
+        prepared_batches: &[PreparedPushBatch],
+        prepared_index: &mut usize,
+        pending: &mut std::collections::VecDeque<AuthoredSchemaUnitKey>,
+    ) -> Result<Option<Vec<AuthoredSchemaUnitKey>>, Error> {
+        let mut batch = Vec::with_capacity(128);
+        while batch.len() < 128 {
+            if let Some(key) = pending.pop_front() {
+                batch.push(key);
+                continue;
+            }
+            if *prepared_index == prepared_batches.len() {
+                break;
+            }
+            pending.extend(Self::authored_unit_keys(
+                &prepared_batches[*prepared_index].ddl_provenance,
+            )?);
+            *prepared_index += 1;
+        }
+        Ok((!batch.is_empty()).then_some(batch))
+    }
+
+    fn validate_refused_schema_units(
+        &self,
+        outcomes: &[RefusedSchemaUnitOutcome],
+        hub_incarnation: Option<Incarnation>,
+    ) -> Result<(), Error> {
+        let incarnation = self.db.sync_incarnation(&self.tenant_id)?;
+        let hub = self.hub_node_id();
+        let edge = self.transport.local_node_id();
+        if outcomes.iter().any(|outcome| {
+            outcome.tenant_id != self.tenant_id
+                || Some(outcome.pushing_node_id.as_str()) != edge.as_deref()
+                || outcome.pushing_incarnation != incarnation
+                || Some(outcome.hub_node_id.as_str()) != hub.as_deref()
+                || Some(outcome.hub_incarnation) != hub_incarnation
+        }) {
+            return Err(Error::SyncError(
+                "refused schema outcome names another peer or store life".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn authored_ddl_units(
+        provenance: &[crate::protocol::WireDdlProvenance],
+    ) -> Result<HashMap<AuthoredSchemaUnitKey, Vec<usize>>, Error> {
+        let mut groups = BTreeMap::new();
+        for (index, entry) in provenance.iter().enumerate() {
+            if let Some(author) = entry.author.as_ref() {
+                groups
+                    .entry((
+                        author.node_id.clone(),
+                        author.incarnation,
+                        author.source_ddl_lsn,
+                    ))
+                    .or_insert_with(Vec::new)
+                    .push((index, author));
+            }
+        }
+        let mut units = HashMap::new();
+        for ((node_id, incarnation, source_ddl_lsn), members) in groups {
+            let authors = members
+                .iter()
+                .map(|(_, author)| *author)
+                .collect::<Vec<_>>();
+            let digest = crate::protocol::authored_schema_unit_digest(&authors)
+                .map_err(|error| Error::SyncError(error.to_string()))?;
+            units.insert(
+                AuthoredSchemaUnitKey {
+                    node_id,
+                    incarnation,
+                    source_ddl_lsn,
+                    digest,
+                },
+                members.into_iter().map(|(index, _)| index).collect(),
+            );
+        }
+        Ok(units)
+    }
+
+    fn refused_ddl_indexes(
+        &self,
+        provenance: &[crate::protocol::WireDdlProvenance],
+        hub_incarnation: Option<Incarnation>,
+    ) -> Result<HashSet<usize>, Error> {
+        let mut units = Self::authored_ddl_units(provenance)?;
+        let mut refused = HashSet::new();
+        if units.is_empty() {
+            return Ok(refused);
+        }
+        let hub_life = hub_incarnation.ok_or_else(|| {
+            Error::SyncError("refusal suppression requires the confirmed hub life".into())
+        })?;
+        let hub = self
+            .hub_node_id()
+            .ok_or_else(|| Error::SyncError("missing hub identity".into()))?;
+        let edge = self
+            .transport
+            .local_node_id()
+            .ok_or_else(|| Error::SyncError("missing edge identity".into()))?;
+        let incarnation = self.db.sync_incarnation(&self.tenant_id)?;
+        let keys = units.keys().cloned().collect::<Vec<_>>();
+        for batch in keys.chunks(128) {
+            let digests = batch.iter().map(|key| key.digest).collect::<Vec<_>>();
+            let (outcomes, _lease) = self.db.refused_schema_local_facts(
+                &self.tenant_id,
+                &edge,
+                incarnation,
+                &hub,
+                hub_life,
+                &digests,
+            )?;
+            self.validate_refused_schema_units(&outcomes, Some(hub_life))?;
+            for outcome in &outcomes {
+                if let Some(indexes) = units.remove(&AuthoredSchemaUnitKey::from(outcome)) {
+                    refused.extend(indexes);
+                } else {
+                    return Err(Error::SyncError(
+                        "local refused schema fact names another unit".into(),
+                    ));
+                }
+            }
+        }
+        Ok(refused)
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn refused_schema_units_for_test(&self) -> Vec<RefusedSchemaUnitOutcome> {
+        self.refused_schema_units
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn decode_push_reply(
@@ -1376,6 +1953,56 @@ impl SyncClient {
             .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
         let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
             .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
+        self.validate_refused_schema_units(
+            &response.refused_schema_units,
+            response.hub_incarnation,
+        )
+        .map_err(PushReplyError::Terminal)?;
+        if !response.refused_schema_units.is_empty() {
+            let hub = self.hub_node_id().ok_or_else(|| {
+                PushReplyError::Terminal(Error::SyncError(
+                    "refused reply lacks authenticated hub".into(),
+                ))
+            })?;
+            let edge = self.transport.local_node_id().ok_or_else(|| {
+                PushReplyError::Terminal(Error::SyncError(
+                    "refused reply lacks authenticated edge".into(),
+                ))
+            })?;
+            let incarnation = self
+                .db
+                .sync_incarnation(&self.tenant_id)
+                .map_err(PushReplyError::Terminal)?;
+            let hub_life = response
+                .hub_incarnation
+                .expect("validated refused reply has a hub life");
+            for batch in response.refused_schema_units.chunks(128) {
+                self.db
+                    .with_authoritative_hub_reply(&hub, |db| {
+                        db.persist_refused_schema_local_facts(
+                            &self.tenant_id,
+                            &edge,
+                            incarnation,
+                            &hub,
+                            hub_life,
+                            batch,
+                        )
+                    })
+                    .map_err(PushReplyError::Terminal)?;
+            }
+        }
+        #[cfg(feature = "test-seams")]
+        {
+            let mut outcomes = self
+                .refused_schema_units
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for outcome in &response.refused_schema_units {
+                if !outcomes.contains(outcome) {
+                    outcomes.push(outcome.clone());
+                }
+            }
+        }
         // An ordinary reply carries no custody admission obligation.
         if !response.outcomes.is_empty() {
             let hub = self
@@ -1521,18 +2148,12 @@ impl SyncClient {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
             }
-            let timeout = if attempt < 2 {
-                Duration::from_secs(2)
-            } else {
-                SYNC_TIMEOUT
-            };
-
             match self
                 .transport
                 .request(
                     &pull_subject(self.tenant_id.as_str()),
                     encoded.clone(),
-                    timeout,
+                    SYNC_TIMEOUT,
                 )
                 .await
             {
@@ -1540,8 +2161,8 @@ impl SyncClient {
                     first_attempt_response = Some(reply);
                     break;
                 }
-                Err(TransportError::Timeout) if attempt < 4 => {
-                    tracing::debug!(attempt, "pull timed out, retrying");
+                Err(TransportError::Timeout | TransportError::Unreachable(_)) if attempt < 4 => {
+                    tracing::debug!(attempt, "pull transport failed, retrying");
                     continue;
                 }
                 Err(TransportError::IncompleteReply(detail)) => {
@@ -1617,9 +2238,9 @@ impl SyncClient {
         // a stale artifact and silently lost acked commits; regress the local
         // push watermark so the changeset recomputation re-pushes them.
         let mut local = self.push_watermark.load(Ordering::SeqCst);
-        let pre_push_server_watermark = self
-            .fetch_sync_status(incarnation)
-            .await?
+        let pre_push_status = self.fetch_sync_status(incarnation, false).await?;
+        let pre_push_server_watermark = pre_push_status
+            .as_ref()
             .and_then(|status| status.applied_push_watermark);
         if let Some(server_applied) = pre_push_server_watermark
             && server_applied < local
@@ -1744,6 +2365,7 @@ impl SyncClient {
             &ddl_provenance_source,
             destination_reupload_epoch.map(|(through, _)| through),
         )?;
+        let changeset = crate::sync_server::without_hub_local_bookkeeping(changeset);
         let changeset = match destination_reupload_epoch {
             Some((through, _)) => self
                 .db
@@ -1785,9 +2407,22 @@ impl SyncClient {
                 .as_ref()
                 .map(|state| state.capabilities.keys().cloned().collect::<HashSet<_>>())
                 .unwrap_or_default();
+            let recoverable_groups = changeset.ddl_lsn_groups_for_tables(&recoverable_tables);
+            let mut recoverable_migration_tables =
+                changeset.tables_in_ddl_lsn_groups(&recoverable_groups);
+            recoverable_migration_tables.extend(recoverable_tables.iter().cloned());
+            let still_held_groups = changeset.ddl_lsn_groups_for_tables(&still_held);
+            let mut still_held_migration_tables =
+                changeset.tables_in_ddl_lsn_groups(&still_held_groups);
+            still_held_migration_tables.extend(still_held);
             changeset
-                .for_schema_recovery(&recoverable_tables, state.compatible_through)
-                .without_tables(&still_held)
+                .for_schema_recovery_with_ddl_groups(
+                    &recoverable_migration_tables,
+                    &recoverable_groups,
+                    state.compatible_through,
+                )
+                .without_lsn_groups(&still_held_groups)
+                .without_tables(&still_held_migration_tables)
         } else if !capabilities.supports_all() {
             let mut state = next_schema_holdback.clone().unwrap_or_default();
             for (table, capabilities) in
@@ -1806,11 +2441,21 @@ impl SyncClient {
                 next_schema_holdback = None;
                 changeset
             } else {
-                let held_tables = state.capabilities.keys().cloned().collect::<HashSet<_>>();
-                if let Some(frontier) = changeset.only_tables(&held_tables).max_lsn() {
+                let capability_tables = state.capabilities.keys().cloned().collect::<HashSet<_>>();
+                let held_groups = changeset.ddl_lsn_groups_for_tables(&capability_tables);
+                let mut held_tables = changeset.tables_in_ddl_lsn_groups(&held_groups);
+                held_tables.extend(capability_tables);
+                if let Some(frontier) = changeset
+                    .only_tables(&held_tables)
+                    .max_lsn()
+                    .into_iter()
+                    .chain(held_groups.iter().copied())
+                    .max()
+                {
                     state.held_through = state.held_through.max(frontier);
                 }
                 let compatible = changeset
+                    .without_lsn_groups(&held_groups)
                     .without_tables(&held_tables)
                     .after_lsn(state.compatible_through);
                 next_schema_holdback = Some(state);
@@ -1987,9 +2632,33 @@ impl SyncClient {
                     incarnation,
                 )?;
             }
-            let ddl_provenance = self
-                .db
-                .outbound_ddl_provenance(&batch, &ddl_provenance_source)?;
+            let ddl_provenance = if batch.ddl.is_empty() {
+                Vec::new()
+            } else {
+                // Schema this edge authored is signed here with the edge's own
+                // key, so every peer downstream of whoever takes it can check
+                // authorship rather than trust the session it arrived on.
+                let node_id = self.transport.local_node_id().ok_or_else(|| {
+                    Error::SyncError(
+                        "authenticated schema push requires the stable authenticated edge identity"
+                            .to_string(),
+                    )
+                })?;
+                let signer = self.lineage_signer.as_ref().ok_or_else(|| {
+                    Error::SyncError(
+                        "authenticated schema push requires the transport's creator signer"
+                            .to_string(),
+                    )
+                })?;
+                self.db.outbound_ddl_provenance(
+                    &batch,
+                    &ddl_provenance_source,
+                    &self.tenant_id,
+                    &node_id,
+                    incarnation,
+                    signer.as_ref(),
+                )?
+            };
             prepared_batches.push(PreparedPushBatch {
                 batch,
                 dependency_complete,
@@ -2002,6 +2671,29 @@ impl SyncClient {
         // Every database-derived fact is now retained beside its raw batch;
         // release the schema read before encoding or waiting on transport.
         drop(schema_read);
+        // Query only units in the prepared outbound batches. Each batch is
+        // traversed in a stable order, so a stopped pass resumes at its next
+        // unconfirmed unit without retaining all candidate keys.
+        let has_candidates = prepared_batches.iter().any(|prepared| {
+            prepared
+                .ddl_provenance
+                .iter()
+                .any(|entry| entry.author.is_some())
+        });
+        let refusal_hub_life = if !has_candidates {
+            pre_push_status
+                .as_ref()
+                .and_then(|status| status.hub_incarnation)
+        } else {
+            Some(
+                self.fetch_candidate_refusals(
+                    incarnation,
+                    &prepared_batches,
+                    pre_push_status.as_ref(),
+                )
+                .await?,
+            )
+        };
         // Record the held table before any compatible request can leave this
         // process. A crash after a reply can then replay safe idempotent work,
         // but it can never forget which table still needs the newer protocol.
@@ -2019,6 +2711,32 @@ impl SyncClient {
             ddl_provenance,
         } in prepared_batches
         {
+            let refused = self.refused_ddl_indexes(&ddl_provenance, refusal_hub_life)?;
+            let mut batch = batch;
+            let mut ddl_provenance = ddl_provenance;
+            if !refused.is_empty() {
+                batch.ddl = batch
+                    .ddl
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, ddl)| (!refused.contains(&i)).then_some(ddl))
+                    .collect();
+                batch.ddl_lsn = batch
+                    .ddl_lsn
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, lsn)| (!refused.contains(&i)).then_some(lsn))
+                    .collect();
+                ddl_provenance = ddl_provenance
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, entry)| (!refused.contains(&i)).then_some(entry))
+                    .collect();
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            let batch_max_lsn = batch.max_lsn().unwrap_or(batch_max_lsn);
             let mut request = PushRequest {
                 changeset:
                     crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
@@ -2069,7 +2787,7 @@ impl SyncClient {
                             !capabilities.supports_all() && next_schema_holdback.is_some(),
                         )
                         .await?;
-                        last_successful_lsn = batch_max_lsn;
+                        last_successful_lsn = last_successful_lsn.max(batch_max_lsn);
                         continue;
                     };
                     recovered_reply = true;
@@ -2084,6 +2802,59 @@ impl SyncClient {
                     .await?
                 }
             };
+            let policy_refused = !self
+                .refused_ddl_indexes(&request.changeset.ddl_provenance, refusal_hub_life)?
+                .is_empty();
+            let policy_held = result.conflicts.iter().any(|conflict| {
+                conflict
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("held back"))
+            });
+            if policy_refused || policy_held {
+                // Neither a durable REFUSED outcome nor retained pending data
+                // authorizes accepted row lineage or an applied source frontier.
+                total.applied_rows += result.applied_rows;
+                total.skipped_rows += result.skipped_rows;
+                total.conflicts.extend(result.conflicts);
+                total.new_lsn = result.new_lsn;
+                self.receipts.record(
+                    hub.as_deref(),
+                    TransferPlane::Sync,
+                    TransferDirection::Sent,
+                    batch.rows.len() as u64,
+                    row_payload_bytes(&batch.rows),
+                );
+                continue;
+            }
+            if result.conflicts.is_empty() {
+                // Keep source order: an older row may have been held earlier
+                // in this push. A correction reply arrives only after the hub
+                // has replayed released payloads. Retire that transient table
+                // diagnostic, without inventing a receipt for the earlier row.
+                let corrected = batch
+                    .ddl
+                    .iter()
+                    .filter_map(|ddl| match ddl {
+                        crate::sync_types::DdlChange::CreateTable { name, .. }
+                        | crate::sync_types::DdlChange::AlterTable { name, .. } => Some(name),
+                        _ => None,
+                    })
+                    .map(|name| {
+                        crate::sync_types::NaturalKey::single(
+                            "table".into(),
+                            contextdb_core::Value::Text(name.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                total.conflicts.retain(|conflict| {
+                    !(conflict
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("held back"))
+                        && corrected.contains(&conflict.natural_key))
+                });
+            }
             // `new_lsn` is the accepting hub's committed position for this
             // acknowledged batch. Record it on the author before advancing its
             // push watermark: a later pull can now distinguish this accepted
@@ -2245,7 +3016,7 @@ impl SyncClient {
             // landing it correctly would have helped: keeping it would
             // instead wedge every push against a hub legitimately refusing
             // under `ServerWins`.
-            last_successful_lsn = batch_max_lsn;
+            last_successful_lsn = last_successful_lsn.max(batch_max_lsn);
             total.applied_rows += result.applied_rows;
             total.skipped_rows += result.skipped_rows;
             total.conflicts.extend(result.conflicts);
@@ -2341,16 +3112,15 @@ impl SyncClient {
         encoded: Vec<u8>,
         protocol_version: u8,
     ) -> Result<ApplyResult, Error> {
-        let status = self
-            .fetch_sync_status(incarnation)
-            .await
-            .map_err(|verification_err| Error::SyncPushUnconfirmed {
+        let status = self.fetch_sync_status(incarnation, false).await.map_err(
+            |verification_err| Error::SyncPushUnconfirmed {
                 detail: format!(
                     "the hub did not acknowledge the push ({transport_err}); status verification \
                      failed ({verification_err}); the data may or may not have committed — run \
                      the push again to reconcile"
                 ),
-            })?;
+            },
+        )?;
         if !status.as_ref().is_some_and(|status| {
             interrupted_push_status_confirms(status, batch_max_lsn, transmitted_ceiling)
         }) {
@@ -2409,7 +3179,7 @@ impl SyncClient {
         // re-uploads — never opening the SYNC SAFE deletion gate on rows the hub
         // never received.
         let status = self
-            .fetch_sync_status(incarnation)
+            .fetch_sync_status(incarnation, false)
             .await
             // Failed verification cannot confirm a transmitted
             // batch, and must preserve the existing indeterminate-push contract.
@@ -2594,7 +3364,7 @@ impl SyncClient {
             .sync_incarnation(&self.tenant_id)
             .map_err(|err| Error::SyncError(err.to_string()))?;
         if probe_status
-            && let Some(status) = self.fetch_sync_status(incarnation).await?
+            && let Some(status) = self.fetch_sync_status(incarnation, false).await?
             && let Some(server_lsn) = status.server_current_lsn
             && server_lsn < local
         {
@@ -2704,6 +3474,28 @@ impl SyncClient {
                 ordinary: mut response,
                 dependency_units,
             } = self.request_pull(request).await?;
+            // Count the decoded reply once, before a source mismatch or a failed
+            // apply can discard it. Both figures describe the same wire rows.
+            let received_rows = std::iter::once(&response.changeset)
+                .chain(dependency_units.iter())
+                .flat_map(|changes| changes.rows.iter());
+            let (received_items, received_payload_bytes) =
+                received_rows.fold((0u64, 0u64), |(items, payload_bytes), row| {
+                    let row_bytes = rmp_serde::to_vec(&row.values)
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0);
+                    (
+                        items.saturating_add(1),
+                        payload_bytes.saturating_add(row_bytes),
+                    )
+                });
+            self.receipts.record(
+                hub.as_deref(),
+                TransferPlane::Sync,
+                TransferDirection::Received,
+                received_items,
+                received_payload_bytes,
+            );
             // A caught-up client's page request still round-trips (the
             // loop needs at least one response to learn "nothing new"), but
             // that probe carries no actual catch-up work -- counting it
@@ -2849,7 +3641,7 @@ impl SyncClient {
                         .expect("authenticated hub was required before pull"),
                     source_incarnation,
                 )
-                .map_err(|err| Error::SyncError(err.to_string()))?
+                .map_err(crate::protocol::received_ddl_error)?
             } else {
                 None
             };
@@ -2881,7 +3673,7 @@ impl SyncClient {
                                 .expect("authenticated hub was required before pull"),
                             source_incarnation,
                         )
-                        .map_err(|err| Error::SyncError(err.to_string()))?
+                        .map_err(crate::protocol::received_ddl_error)?
                     } else {
                         None
                     };
@@ -2898,12 +3690,26 @@ impl SyncClient {
             let mut directions = db.latest_declared_table_directions();
             let mut table_generations = HashMap::new();
             let mut prepared_dependency_units = Vec::new();
+            let mut policy_projection = contextdb_engine::database::PullPolicyProjection::default();
+            // Data held behind a transaction this node refused names a table
+            // it either does not have or holds at a schema the author never
+            // had accepted here: its provenance is not checked against that
+            // table and it never installs. The typed holds join the page's
+            // result.
             for (unit_index, changes, arrivals, lineages, unit_ddl_context) in dependency_units {
+                let (changes, projected_ddl, mut policy) = db.preflight_pull_unit_policy(
+                    changes,
+                    unit_ddl_context.as_ref(),
+                    &authenticated_hub,
+                    served_source.map(|life| (&self.tenant_id, life)),
+                    true,
+                    &mut policy_projection,
+                )?;
                 db.advance_authenticated_pull_schema_projection(
                     &mut table_generations,
                     &mut directions,
                     &changes,
-                    unit_ddl_context.as_ref(),
+                    projected_ddl.as_ref(),
                 )?;
                 let carries_ddl = !changes.ddl.is_empty();
                 let row_count = changes.rows.len();
@@ -2930,24 +3736,36 @@ impl SyncClient {
                         &lineages,
                         &table_generations,
                     )?;
-                if !suppression.changes.is_empty() {
+                let held = std::mem::take(&mut policy.conflicts);
+                let changes = policy.restore_for_apply(suppression.changes);
+                if !changes.is_empty() || !held.is_empty() {
                     prepared_dependency_units.push((
                         unit_index,
-                        suppression.changes,
+                        changes,
                         arrivals,
                         lineages,
                         unit_ddl_context,
+                        held,
                     ));
                 }
             }
+            let (changes, projected_ddl, mut ordinary_policy) = db.preflight_pull_unit_policy(
+                changes,
+                ddl_context.as_ref(),
+                &authenticated_hub,
+                served_source.map(|life| (&self.tenant_id, life)),
+                false,
+                &mut policy_projection,
+            )?;
             db.advance_authenticated_pull_schema_projection(
                 &mut table_generations,
                 &mut directions,
                 &changes,
-                ddl_context.as_ref(),
+                projected_ddl.as_ref(),
             )?;
             let ordinary = changes
                 .filter_by_direction(&directions, &[SyncDirection::Pull, SyncDirection::Both]);
+            let ordinary_held = std::mem::take(&mut ordinary_policy.conflicts);
             db
                 .validate_received_row_lineages_against_generation_projection(
                     &self.tenant_id,
@@ -2969,12 +3787,12 @@ impl SyncClient {
                     &table_generations,
                 )?;
             let ordinary_suppressed_only = ordinary_suppression.suppressed_live_replay
-                && ordinary_suppression.changes.is_empty();
-            let ordinary = ordinary_suppression.changes;
+                && ordinary_suppression.changes.is_empty()
+                && ordinary_held.is_empty()
+                && prepared_dependency_units.iter().all(|(_, _, _, _, _, held)| held.is_empty());
+            let ordinary = ordinary_policy.restore_for_apply(ordinary_suppression.changes);
             let ordinary_has_authoritative_purges = !authoritative_purges.is_empty();
             let ordinary_has_deliverable_changes = !ordinary.is_empty();
-            let ordinary_received_items = ordinary.rows.len() as u64;
-            let ordinary_payload_bytes = row_payload_bytes(&ordinary.rows);
             let ordinary_awaits_trigger_callback =
                 page_awaits_trigger_callback_registration(db, &ordinary);
             let pending_refresh_rows = if adoption == SyncAdoption::ConfirmedPendingReconciliation {
@@ -2983,18 +3801,12 @@ impl SyncClient {
                 None
             };
             let dependency_units = prepared_dependency_units;
-            let dependency_received_items = dependency_units
-                .iter()
-                .map(|(_, unit, _, _, _)| unit.rows.len() as u64)
-                .sum::<u64>();
-            let dependency_payload_bytes = dependency_units
-                .iter()
-                .map(|(_, unit, _, _, _)| row_payload_bytes(&unit.rows))
-                .sum::<u64>();
             let dependency_awaits_trigger_callback = dependency_units
                 .iter()
-                .any(|(_, unit, _, _, _)| page_awaits_trigger_callback_registration(db, unit));
-            let dependency_has_deliverable_changes = !dependency_units.is_empty();
+                .any(|(_, unit, _, _, _, _)| page_awaits_trigger_callback_registration(db, unit));
+            let dependency_has_deliverable_changes = dependency_units
+                .iter()
+                .any(|(_, unit, _, _, _, _)| !unit.is_empty());
             db.preflight_incoming_authoritative_purge_batch_while_authoritative(
                 &authoritative_purges,
             )?;
@@ -3004,9 +3816,13 @@ impl SyncClient {
                         conflicts: Vec::new(),
                         new_lsn: db.current_lsn(),
                     };
-                    for (unit_index, unit, unit_arrivals, unit_lineages, unit_ddl_context) in
+                    for (unit_index, unit, unit_arrivals, unit_lineages, unit_ddl_context, held) in
                         dependency_units
                     {
+                        result.conflicts.extend(held);
+                        if unit.is_empty() {
+                            continue;
+                        }
                         let carries_ddl = !unit.ddl.is_empty();
                         let row_count = unit.rows.len();
                         let pending_unit_rows = if adoption
@@ -3041,6 +3857,7 @@ impl SyncClient {
                             db.refresh_confirmed_pending_rows(&rows, &unit_arrivals)?;
                         }
                     }
+                    result.conflicts.extend(ordinary_held);
                     if !ordinary.is_empty() {
                         let ordinary_result = db
                             .apply_authenticated_received_changes_with_lineages_while_schema_publication_held(
@@ -3086,27 +3903,12 @@ impl SyncClient {
                             || dependency_has_deliverable_changes,
                         awaits_trigger_callback_registration: ordinary_awaits_trigger_callback
                             || dependency_awaits_trigger_callback,
-                        received_items: ordinary_received_items + dependency_received_items,
-                        received_payload_bytes: ordinary_payload_bytes
-                            + dependency_payload_bytes,
                     })
                 })?;
             saw_deliverable_changes |=
                 applied_page.suppressed_live_replay_only || applied_page.has_deliverable_changes;
             let stop_for_trigger_bootstrap =
                 has_more && applied_page.awaits_trigger_callback_registration;
-            // Counted from the SAME row set the bytes are counted from: what
-            // this end took off the wire. Using the applied count here instead
-            // would pair an items figure with a payload figure drawn from two
-            // different sets, so a pull with skipped rows would report bytes for
-            // rows its own item count denied.
-            self.receipts.record(
-                hub.as_deref(),
-                TransferPlane::Sync,
-                TransferDirection::Received,
-                applied_page.received_items,
-                applied_page.received_payload_bytes,
-            );
             total.applied_rows += applied_page.result.applied_rows;
             total.skipped_rows += applied_page.result.skipped_rows;
             total.conflicts.extend(applied_page.result.conflicts);
@@ -3712,6 +4514,7 @@ fn split_complete_lsn_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::TransportFuture;
     use contextdb_core::{RowId, Value};
     use contextdb_engine::Database;
     use contextdb_engine::sync_types::{
@@ -3720,12 +4523,72 @@ mod tests {
     };
     use uuid::Uuid;
 
+    struct InterruptedPullTransport {
+        requests: Mutex<Vec<(String, Vec<u8>, Duration)>>,
+        response: Vec<u8>,
+    }
+
+    impl ClientTransport for InterruptedPullTransport {
+        fn request<'a>(
+            &'a self,
+            subject: &'a str,
+            request_bytes: Vec<u8>,
+            timeout: Duration,
+        ) -> TransportFuture<'a, Vec<u8>> {
+            Box::pin(async move {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push((subject.to_string(), request_bytes, timeout));
+                if requests.len() == 1 {
+                    Err(TransportError::Unreachable("connection interrupted".into()))
+                } else {
+                    Ok(self.response.clone())
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupted_pull_retries_the_same_request_with_the_full_sync_timeout() {
+        let response = PullResponse::default();
+        let transport = Arc::new(InterruptedPullTransport {
+            requests: Mutex::new(Vec::new()),
+            response: encode_for_version(PROTOCOL_VERSION, MessageType::PullResponse, &response)
+                .unwrap(),
+        });
+        let client = SyncClient::build(
+            Arc::new(Database::open_memory()),
+            transport.clone(),
+            None,
+            "test-hub".to_string(),
+            TenantId::from("test-tenant"),
+        );
+        let request = PullRequest {
+            since_lsn: Lsn(7),
+            max_entries: Some(PULL_PAGE_SIZE),
+            schema_recovery: None,
+        };
+
+        let page = client.request_pull(request).await.unwrap();
+        assert_eq!(page.ordinary, response);
+        assert!(page.dependency_units.is_empty());
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, pull_subject("test-tenant"));
+        assert_eq!(requests[0].0, requests[1].0);
+        assert_eq!(requests[0].1, requests[1].1);
+        assert_eq!(requests[0].2, SYNC_TIMEOUT);
+        assert_eq!(requests[1].2, SYNC_TIMEOUT);
+    }
+
     #[test]
     fn interrupted_push_watermark_is_bounded_and_cannot_confirm_previously_held_work() {
         let status = SyncStatusResponse {
             applied_push_watermark: Some(Lsn(9)),
             server_current_lsn: Some(Lsn(30)),
             hub_incarnation: None,
+            refused_schema_units: Vec::new(),
+            refused_schema_unit_digests_ack: None,
         };
         assert!(interrupted_push_status_confirms(&status, Lsn(7), Lsn(9)));
         assert!(!interrupted_push_status_confirms(&status, Lsn(10), Lsn(11)));
@@ -4233,10 +5096,10 @@ mod tests {
         );
     }
 
-    // A19: split_changeset with DDL-only changeset must not return vec![]
+    // A DDL-only changeset must retain its DDL when split into batches.
     // Column names are padded to force estimated size > MAX_BATCH_BYTES
     #[test]
-    fn a19_split_changeset_ddl_only_not_dropped() {
+    fn split_changeset_ddl_only_not_dropped() {
         use contextdb_engine::sync_types::DdlChange;
 
         let mut ddl = Vec::new();

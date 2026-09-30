@@ -34,11 +34,11 @@
 //!   Every `AlterTable` / `CreateTable`-adopt emitter bakes a table's FULL
 //!   current shape into the wire, whether or not a given axis actually
 //!   changed, so a half-healed peer's own in-progress multi-step reconcile
-//!   (or a dropped clause from an unguarded/older binary) must interoperate
+//!   (or a dropped clause from a sender without these guards) must interoperate
 //!   rather than being read as an implicit clear; an axis the arriving shape
 //!   DOES restate is, by the time this merge runs, guaranteed to already
-//!   equal canonical, and adopting it verbatim is what heals a legacy
-//!   pre-declaration root through a peer's push exactly like a local
+//!   equal canonical, and adopting it verbatim is what reconciles an undeclared table
+//!   through a peer's push exactly like a local
 //!   reconcile `ALTER` heals it.
 //!
 //! FIVE MORE reserved names join the shape door above: the hub-refereed
@@ -68,7 +68,7 @@
 //! ALL` / `SET SYNC CONFLICT KEEP FIRST` and that operator's own rows being
 //! silently deleted the next time a fabric-consumer process opened the
 //! database -- the reconcile arm cannot tell "an operator just opted out" apart
-//! from "this root predates the declaration," and silently re-applied the
+//! from "this table lacks the declaration," and silently re-applied the
 //! engine's declaration either way. Shutting that door is what makes that
 //! silent reversion structurally impossible for a LOCAL `ALTER`. The sync
 //! side had its own version of the same gap until the preflight+merge pair
@@ -726,7 +726,7 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_still_applies() {
     assert_eq!(meta.sync_direction, Some(SyncDirection::Both));
 }
 
-/// Green guard: a CreateTable-adopt against a LEGACY pre-declaration
+/// Green guard: a CreateTable-adopt against an undeclared
 /// `work_capabilities` (created before the four tables declared their own
 /// policy, so it carries no HISTORY / SYNC CONFLICT at all) that restates the
 /// canonical shape HEALS it, exactly as a local reconcile ALTER would --
@@ -751,11 +751,11 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root() {
         .expect("work_capabilities exists");
     assert_eq!(
         meta.history_policy, None,
-        "premise: legacy root is undeclared"
+        "premise: undeclared table is undeclared"
     );
     assert_eq!(
         meta.conflict_policy, None,
-        "premise: legacy root is undeclared"
+        "premise: undeclared table is undeclared"
     );
 
     let healed_peer_create = DdlChange::CreateTable {
@@ -771,7 +771,7 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root() {
         composite_unique: Vec::new(),
     };
     apply_single_ddl(&db, healed_peer_create)
-        .expect("a healed peer's canonical CreateTable-adopt must heal a legacy root");
+        .expect("a healed peer's canonical CreateTable-adopt must heal an undeclared table");
 
     let healed = db
         .table_meta("work_capabilities")
@@ -784,12 +784,8 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root() {
     assert_eq!(healed.sync_direction, Some(SyncDirection::Both));
 }
 
-/// An older binary
-/// that does not know `ALTER TABLE ADD COLUMN` (or any column change) so it
-/// emits `DropTable` + `CreateTable` instead of an `AlterTable`, and its
-/// `CreateTable` restates the shape it has always known -- the OLD,
-/// undeclared one (no HISTORY / SYNC CONFLICT clause), because that binary
-/// predates the policy declaration entirely.
+/// A received DropTable + CreateTable batch recreates the canonical columns
+/// without HISTORY or SYNC CONFLICT declarations.
 ///
 /// Stated explicitly, this is what the fixed semantics actually produce:
 /// `CreateTable` is refused by neither door here, because a `DropTable`
@@ -797,10 +793,8 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root() {
 /// preflight's projection before the `CreateTable` is judged -- so it is
 /// judged as a FRESH create, not an adopt (fresh creation of one of the four
 /// names stays the owning installer's domain, not this door's. The
-/// batch applies, and the recreated table lands undeclared -- exactly the
-/// legacy pre-declaration shape a fresh install of that older binary would
-/// have produced -- until the next `install_work_ledger_schema` call
-/// reconciles it, exactly like any other legacy root.
+/// batch applies, and the recreated table lands undeclared until the next
+/// `install_work_ledger_schema` call reconciles its policy.
 #[test]
 fn drop_then_recreate_from_older_binary_lands_undeclared_pending_next_reconcile() {
     let db = Database::open_memory();
@@ -812,7 +806,7 @@ fn drop_then_recreate_from_older_binary_lands_undeclared_pending_next_reconcile(
     let recreate_undeclared = DdlChange::CreateTable {
         name: "work_capabilities".to_string(),
         columns: work_capabilities_columns(),
-        constraints: Vec::new(), // the older binary's own shape: no HISTORY / SYNC CONFLICT
+        constraints: Vec::new(), // no HISTORY / SYNC CONFLICT declaration
         foreign_keys: Vec::new(),
         composite_foreign_keys: Vec::new(),
         composite_unique: Vec::new(),
@@ -837,17 +831,17 @@ fn drop_then_recreate_from_older_binary_lands_undeclared_pending_next_reconcile(
         .expect("work_capabilities exists after recreate");
     assert_eq!(
         meta.history_policy, None,
-        "the recreated table lands undeclared, exactly like a legacy pre-declaration root, \
+        "the recreated table lands undeclared, exactly like an undeclared table, \
          until the next install_work_ledger_schema call reconciles it"
     );
     assert_eq!(
         meta.conflict_policy, None,
-        "the recreated table lands undeclared, exactly like a legacy pre-declaration root, \
+        "the recreated table lands undeclared, exactly like an undeclared table, \
          until the next install_work_ledger_schema call reconciles it"
     );
 
-    // The next installer call reconciles it, exactly like any other legacy
-    // root -- proving the recreated table is not stuck undeclared forever.
+    // The next installer call reconciles it, exactly like any other undeclared
+    // table -- proving the recreated table is not stuck undeclared forever.
     install_work_ledger_schema(&db).expect("reconcile the recreated table");
     let reconciled = db
         .table_meta("work_capabilities")
@@ -911,7 +905,7 @@ fn set_sync_off_on_a_user_table_still_works() {
 
 /// Green guard: `work_node_contacts` declares `SYNC OFF` itself, so restating
 /// it verbatim via a local `ALTER TABLE` -- exactly what
-/// `install_node_contacts_schema`'s own reconcile issues on a legacy root --
+/// `install_node_contacts_schema`'s own reconcile issues on an undeclared table --
 /// must not refuse.
 #[test]
 fn restating_sync_off_on_work_node_contacts_is_not_refused() {
@@ -1064,7 +1058,7 @@ fn installer_fresh_create_still_works_under_the_reserved_name_door() {
 /// Green guard: the column-shape half tolerates silence on policy -- a local
 /// CREATE restating `work_capabilities`' exact canonical columns but no
 /// HISTORY / SYNC CONFLICT clause at all is exactly the shape a
-/// pre-declaration legacy root has (see
+/// undeclared table has (see
 /// `arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root`
 /// and `builtin_schema_reconcile_tests.rs`, which construct this same shape
 /// through this same local path), and must keep working.
@@ -1084,7 +1078,7 @@ fn create_table_work_capabilities_with_canonical_columns_silent_on_policy_still_
     )
     .expect(
         "canonical columns with no policy clause at all must still create -- \
-         the pre-declaration legacy shape",
+         the undeclared shape",
     );
 
     let meta = db.table_meta("work_capabilities").expect("exists");
@@ -1330,7 +1324,7 @@ fn drop_then_recreate_work_capabilities_with_wrong_explicit_policy_over_sync_ref
 /// Green guard: an arriving sync batch with DROP work_capabilities +
 /// CREATE work_capabilities with canonical columns and silent policy
 /// must still succeed, landing undeclared pending the next reconcile.
-/// This is the innocent older-binary path that must keep working.
+/// Fresh creation is judged independently of the dropped table.
 #[test]
 fn drop_then_recreate_work_capabilities_with_canonical_columns_silent_policy_still_succeeds_over_sync()
  {
@@ -1369,11 +1363,11 @@ fn drop_then_recreate_work_capabilities_with_canonical_columns_silent_policy_sti
         .expect("work_capabilities exists after recreate");
     assert_eq!(
         meta.history_policy, None,
-        "recreated table lands undeclared, exactly like a legacy pre-declaration root"
+        "recreated table lands undeclared, exactly like an undeclared table"
     );
     assert_eq!(
         meta.conflict_policy, None,
-        "recreated table lands undeclared, exactly like a legacy pre-declaration root"
+        "recreated table lands undeclared, exactly like an undeclared table"
     );
 }
 
@@ -1566,7 +1560,7 @@ fn local_create_of_each_hub_refereed_table_with_wrong_explicit_conflict_refuses(
 }
 
 /// GREEN contrast pin: canonical columns with NO policy clause at all must
-/// still create -- the pre-declaration legacy shape, mirroring
+/// still create -- the undeclared shape, mirroring
 /// `create_table_work_capabilities_with_canonical_columns_silent_on_policy_still_works`
 /// for all five hub-refereed names.
 #[test]
@@ -2956,7 +2950,7 @@ fn shape_refusal_names_the_offending_column_not_just_name_type_primary_key() {
 /// immutable table never supersedes a row, so it has no version history to
 /// reclaim), a genuine, unrelated semantic rule that fires before this
 /// door's own question is ever asked. `refuse_engine_owned_policy_axes`
-/// already tolerates silence on `HISTORY` (a legacy pre-declaration shape),
+/// already tolerates silence on `HISTORY` (an undeclared shape),
 /// so omitting it here isolates the table-level-IMMUTABLE question this RED
 /// pins -- matching the exact DDL the live repro used.
 #[test]
@@ -3081,19 +3075,12 @@ fn arriving_fresh_create_table_of_peer_directory_with_a_table_level_immutable_op
 }
 
 // ---------------------------------------------------------------------
-// A cold review widened the table-level-options
-// finding with live probes: the gap is not IMMUTABLE-only, and not
-// peer_directory-only -- STATE_MACHINE and DAG are the SAME uncompared
-// `CreateTablePlan` fields (`state_machine` / `dag_edge_types`), confirmed
-// accepted today on other reserved names. Table choice matters here: some
-// reserved names are shielded from an IMMUTABLE probe by an UNRELATED
-// parser rule (peer_directory / work_capabilities / work_node_contacts
-// refuse `IMMUTABLE` + their own declared `HISTORY CURRENT ONLY` as
-// mutually exclusive; `work_inputs` refuses `IMMUTABLE` + its declared
-// `RETAIN` the same way) -- so the IMMUTABLE axis is pinned on `work_jobs`
-// / `work_claims` (genuinely exposed, no such shield), while DAG -- which
-// carries no such conflict with HISTORY -- is pinned on `peer_directory`
-// (proving the shield is specific to IMMUTABLE, not a defense of the door).
+// Reserved tables must refuse mismatching IMMUTABLE, STATE_MACHINE, and DAG
+// options in `CreateTablePlan` (`immutable` / `state_machine` / `dag_edge_types`).
+// Some reserved names also have parser rules that refuse IMMUTABLE together
+// with HISTORY CURRENT ONLY or RETAIN. The IMMUTABLE cases use `work_jobs`
+// and `work_claims`, which have neither restriction; the DAG case uses
+// `peer_directory`, whose HISTORY declaration does not conflict with DAG.
 // ---------------------------------------------------------------------
 
 /// RED, sibling table: the identical table-level `IMMUTABLE` mismatch on

@@ -425,7 +425,14 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
         schema_incarnation,
     );
     let schema_provenance = schema_source
-        .outbound_ddl_provenance(&schema_changes, &schema_ddl_source)
+        .outbound_ddl_provenance(
+            &schema_changes,
+            &schema_ddl_source,
+            &tenant,
+            &author.node_id(),
+            schema_incarnation,
+            &|bytes| Ok(author.sign_lineage(bytes)),
+        )
         .expect("authenticated schema provenance");
     let received = crate::protocol::ReceivedDdlContext {
         tenant_id: tenant.clone(),
@@ -439,6 +446,7 @@ fn received_memory_rows_keep_creator_lineage_through_relay_and_schema_apply() {
                 table: provenance.table.clone(),
                 table_generation: provenance.table_generation,
                 digest: provenance.digest.clone(),
+                author: provenance.author.clone(),
             })
             .collect(),
     };
@@ -489,7 +497,14 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
         .expect("source incarnation");
     let source_lineages = lineages(&source, &changes, &tenant, &author, source_incarnation);
     let source_provenance = source
-        .outbound_ddl_provenance(&changes, &source_ddl_source)
+        .outbound_ddl_provenance(
+            &changes,
+            &source_ddl_source,
+            &tenant,
+            &author.node_id(),
+            source_incarnation,
+            &|bytes| Ok(author.sign_lineage(bytes)),
+        )
         .expect("source schema provenance");
     let received = crate::protocol::ReceivedDdlContext {
         tenant_id: tenant.clone(),
@@ -503,6 +518,7 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
                 table: provenance.table.clone(),
                 table_generation: provenance.table_generation,
                 digest: provenance.digest.clone(),
+                author: provenance.author.clone(),
             })
             .collect(),
     };
@@ -554,7 +570,14 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
         forwarded_incarnation,
     ));
     let forwarded_provenance = relay
-        .outbound_ddl_provenance(&forwarded, &relay_ddl_source)
+        .outbound_ddl_provenance(
+            &forwarded,
+            &relay_ddl_source,
+            &tenant,
+            &relay_author.node_id(),
+            forwarded_incarnation,
+            &|bytes| Ok(relay_author.sign_lineage(bytes)),
+        )
         .expect("accepted table generation has outbound provenance");
     assert_eq!(
         forwarded_lineage,
@@ -565,9 +588,27 @@ fn received_memory_schema_then_row_relay_forwards_creator_generation() {
         forwarded_lineage.table_generation, 1,
         "the forwarded row retains the accepted first table generation"
     );
+    // The relay forwards the author's own account of each schema record, and
+    // names the author -- not itself -- as the record's author.
+    let expected_provenance = source_provenance
+        .iter()
+        .zip(&received.entries)
+        .map(|(provenance, entry)| crate::protocol::WireDdlProvenance {
+            author: Some(received.author_of(entry)),
+            ..provenance.clone()
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        forwarded_provenance, source_provenance,
-        "the schema-less relay forwards the accepted authoritative schema provenance"
+        expected_provenance
+            .iter()
+            .map(|provenance| provenance.author.as_ref().unwrap().node_id.clone())
+            .collect::<Vec<_>>(),
+        vec![author.node_id(); expected_provenance.len()],
+    );
+    assert_eq!(
+        forwarded_provenance, expected_provenance,
+        "the schema-less relay forwards the accepted authoritative schema provenance under the \
+         author's identity"
     );
     assert_eq!(
         forwarded_provenance
@@ -828,6 +869,7 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
                 incarnation: source_incarnation,
                 source_lsn: insert_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("receiver-hub"),
             &inserted_entries,
@@ -845,6 +887,7 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
                 incarnation: source_incarnation,
                 source_lsn: delete_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("receiver-hub"),
             &deleted_entries,
@@ -872,6 +915,7 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
                 incarnation: source_incarnation,
                 source_lsn: insert_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("receiver-hub"),
             &inserted_entries,
@@ -889,6 +933,7 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
                 incarnation: Incarnation(777),
                 source_lsn: delete_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("receiver-hub"),
             &deleted_entries,
@@ -921,6 +966,7 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
                 incarnation: source_incarnation,
                 source_lsn: insert_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("receiver-hub"),
             &inserted_entries,
@@ -938,6 +984,7 @@ fn authenticated_fresh_creator_delete_is_the_only_keep_first_delete_continuation
                 incarnation: source_incarnation,
                 source_lsn: delete_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("receiver-hub"),
             &deleted_entries,
@@ -1006,6 +1053,7 @@ fn authenticated_fresh_creator_delete_does_not_override_server_wins() {
                 incarnation: source_incarnation,
                 source_lsn: insert_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("receiver-hub"),
             &inserted_entries,
@@ -1023,6 +1071,7 @@ fn authenticated_fresh_creator_delete_does_not_override_server_wins() {
                 incarnation: source_incarnation,
                 source_lsn: delete_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("receiver-hub"),
             &deleted_entries,
@@ -1096,7 +1145,14 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
         source_node_id: creator.node_id(),
         source_incarnation,
         entries: source
-            .outbound_ddl_provenance(&mixed, &ddl_source)
+            .outbound_ddl_provenance(
+                &mixed,
+                &ddl_source,
+                &tenant,
+                &creator.node_id(),
+                source_incarnation,
+                &|bytes| Ok(creator.sign_lineage(bytes)),
+            )
             .expect("authenticated ALTER provenance")
             .into_iter()
             .map(|provenance| crate::protocol::ReceivedDdlEntry {
@@ -1105,6 +1161,7 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
                 table: provenance.table,
                 table_generation: provenance.table_generation,
                 digest: provenance.digest,
+                author: provenance.author,
             })
             .collect(),
     };
@@ -1119,6 +1176,7 @@ fn received_alter_and_fresh_creator_delete_share_the_same_keep_first_decision() 
                 incarnation: source_incarnation,
                 source_lsn: delete_lsn,
                 dependency_complete: true,
+                hub_contact_ms: None,
             },
             None,
             &mixed_entries,
@@ -1212,6 +1270,7 @@ fn fresh_creator_delete_race_errors_without_advancing_its_receipt() {
                     incarnation: source_incarnation,
                     source_lsn: delete_lsn,
                     dependency_complete: false,
+                    hub_contact_ms: None,
                 },
                 None,
                 &applying_entries,
@@ -1637,6 +1696,7 @@ fn ordinary_push_outcome_survives_hub_reopen_and_newer_edits() {
             incarnation,
             source_lsn: changes.max_lsn().unwrap(),
             dependency_complete: false,
+            hub_contact_ms: None,
         };
         let path = root.path().join("hub.db");
         let hub = Database::open(&path).unwrap();
@@ -1747,6 +1807,7 @@ fn ordinary_push_outcomes_keep_only_the_latest_retry_reachable_request_per_edge(
                 incarnation,
                 source_lsn: since,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("hub-author"),
             &entries,
@@ -1836,6 +1897,7 @@ fn purge_leaves_no_natural_key_in_retry_storage_and_exact_refusal_still_replays(
         incarnation,
         source_lsn: changes.max_lsn().unwrap(),
         dependency_complete: false,
+        hub_contact_ms: None,
     };
 
     let path = root.path().join("purge-retry-hub.db");
@@ -1968,6 +2030,7 @@ fn failed_ordinary_apply_never_publishes_an_outcome_or_consumed_progress() {
                 incarnation,
                 source_lsn: changes.max_lsn().unwrap(),
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
             Some("hub-author"),
             &entries,

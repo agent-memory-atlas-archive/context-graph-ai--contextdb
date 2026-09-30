@@ -1,10 +1,14 @@
 use contextdb_core::read_contract::{
-    OwnerReadCancellation, OwnerReadLimits, OwnerReadStatus, OwnerServingReason, OwnerServingState,
+    DeadlineClock, OwnerReadCancellation, OwnerReadLimits, OwnerServingReason, OwnerServingState,
     ReadFailureDetail, ReadFailureKind, ReadLimits,
 };
 use contextdb_core::{Error, Result};
 use contextdb_engine::local_transport::ManualDeadlineClock;
-use contextdb_engine::read_session::ReadRouteResourceSnapshot;
+use contextdb_engine::owner_read::{OwnerServicePublicationObserver, OwnerServiceSpec};
+use contextdb_engine::read_session::{
+    ReadKernelCancellationEvent, ReadKernelSourceEvent, ReadKernelTestObserver,
+    ReadRouteResourceSnapshot, ReadSessionOperation,
+};
 use contextdb_engine::{
     Database, DatabaseOpenOptions, DatabasePlugin, OwnerReadConfig, OwnerReadTestHooks,
     OwnerRequestHandler, ReadSession, ReadSessionOptions,
@@ -14,6 +18,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -27,21 +32,18 @@ fn secure_runtime_root(directory: &tempfile::TempDir, name: &str) -> std::path::
     root
 }
 
-fn draining_status() -> OwnerReadStatus {
-    OwnerReadStatus {
-        state: OwnerServingState::NotServing,
-        reason: Some(OwnerServingReason::ShutdownDraining),
-    }
-}
+// Shorter than the lane nextest timeout. A missing lifecycle event names the
+// stage that failed instead of consuming the whole test allocation.
+const LIFECYCLE_WATCHDOG: Duration = Duration::from_secs(10);
 
-fn assert_bound_draining_listener(path: &std::path::Path, runtime_root: &std::path::Path) {
-    assert_eq!(
-        ReadSession::with_runtime_directory_for_test(runtime_root, || {
-            ReadSession::probe_owner_status_for_test(path, ReadSessionOptions::default())
-        })
-        .expect("status request reaches the still-owned listener"),
-        draining_status(),
-    );
+fn assert_quiescent_direct_reader(path: &std::path::Path, runtime_root: &std::path::Path) {
+    let reader =
+        ReadSession::with_runtime_directory_for_test(runtime_root, || ReadSession::open(path))
+            .expect("the quiescent owner exposes its committed file");
+    assert!(matches!(
+        reader.request_owner("lifecycle", b"probe"),
+        Err(Error::ReadFailure(failure)) if failure.kind() == ReadFailureKind::OwnerNotRunning
+    ));
 }
 
 fn assert_owner_listener_released(path: &std::path::Path, runtime_root: &std::path::Path) {
@@ -70,7 +72,14 @@ impl GatedHandler {
         let (lock, changed) = &*self.gate;
         let mut state = lock.lock().expect("handler gate lock");
         while !state.entered {
-            state = changed.wait(state).expect("handler gate wait");
+            let (next, timed_out) = changed
+                .wait_timeout(state, LIFECYCLE_WATCHDOG)
+                .expect("handler gate wait");
+            state = next;
+            assert!(
+                !timed_out.timed_out() || state.entered,
+                "authenticated owner request did not reach the gated execution seam within {LIFECYCLE_WATCHDOG:?}"
+            );
         }
     }
 
@@ -110,6 +119,234 @@ impl OwnerRequestHandler for GatedHandler {
         state.cancellation_observed = cancellation.is_cancelled();
         changed.notify_all();
         Ok(request.to_vec())
+    }
+}
+
+#[derive(Default)]
+struct CursorRegistryPublicationState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+/// A passive barrier immediately before the owner publishes a prepared cursor
+/// into its registry. It never holds a service lock, advances a deadline, or
+/// chooses the request outcome.
+#[derive(Clone, Default)]
+struct CursorRegistryPublicationGate {
+    state: Arc<(Mutex<CursorRegistryPublicationState>, Condvar)>,
+}
+
+impl CursorRegistryPublicationGate {
+    fn arm(&self) {
+        let (lock, _changed) = &*self.state;
+        let mut state = lock.lock().expect("cursor publication gate lock");
+        assert!(!state.armed, "cursor publication gate is armed once");
+        state.armed = true;
+    }
+
+    fn wait_until_entered(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("cursor publication gate lock");
+        while !state.entered {
+            let (next, timed_out) = changed
+                .wait_timeout(state, LIFECYCLE_WATCHDOG)
+                .expect("cursor publication gate wait");
+            state = next;
+            assert!(
+                !timed_out.timed_out() || state.entered,
+                "owner request did not reach cursor registry publication within {LIFECYCLE_WATCHDOG:?}"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("cursor publication gate lock");
+        assert!(
+            state.entered,
+            "cursor publication must enter before release"
+        );
+        state.released = true;
+        changed.notify_all();
+    }
+}
+
+impl OwnerServicePublicationObserver for CursorRegistryPublicationGate {
+    fn before_cursor_registry_publication(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("cursor publication gate lock");
+        if !state.armed {
+            return;
+        }
+        state.entered = true;
+        changed.notify_all();
+        while !state.released {
+            state = changed.wait(state).expect("cursor publication gate wait");
+        }
+    }
+
+    fn before_cursor_page_publication(&self, _request_ordinal: u64) {}
+
+    fn cancellation_received(&self, _request_ordinal: u64) {}
+
+    fn cursor_page_published(&self, _request_ordinal: u64) {}
+}
+
+#[derive(Default)]
+struct CursorPagePublicationState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+/// A passive barrier after a completed cursor page has returned to the owner
+/// registry and before its first carrier frame is delivered. It keeps the
+/// shutdown test on the real delivery lookup without changing service state.
+#[derive(Clone, Default)]
+struct CursorPagePublicationGate {
+    state: Arc<(Mutex<CursorPagePublicationState>, Condvar)>,
+}
+
+impl CursorPagePublicationGate {
+    fn arm(&self) {
+        let (lock, _changed) = &*self.state;
+        let mut state = lock.lock().expect("cursor page publication gate lock");
+        assert!(!state.armed, "cursor page publication gate is armed once");
+        state.armed = true;
+    }
+
+    fn wait_until_entered(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("cursor page publication gate lock");
+        while !state.entered {
+            let (next, timed_out) = changed
+                .wait_timeout(state, LIFECYCLE_WATCHDOG)
+                .expect("cursor page publication gate wait");
+            state = next;
+            assert!(
+                !timed_out.timed_out() || state.entered,
+                "owner request did not reach cursor page delivery within {LIFECYCLE_WATCHDOG:?}"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("cursor page publication gate lock");
+        assert!(
+            state.entered,
+            "cursor page delivery must enter before release"
+        );
+        state.released = true;
+        changed.notify_all();
+    }
+}
+
+impl OwnerServicePublicationObserver for CursorPagePublicationGate {
+    fn before_cursor_page_publication(&self, _request_ordinal: u64) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("cursor page publication gate lock");
+        if !state.armed {
+            return;
+        }
+        state.entered = true;
+        changed.notify_all();
+        while !state.released {
+            state = changed
+                .wait(state)
+                .expect("cursor page publication gate wait");
+        }
+    }
+
+    fn cancellation_received(&self, _request_ordinal: u64) {}
+
+    fn cursor_page_published(&self, _request_ordinal: u64) {}
+}
+
+#[derive(Default)]
+struct ShutdownCancelledFetchState {
+    entered: bool,
+    released: bool,
+    cancellation_observed: bool,
+}
+
+/// Holds a real owner cursor fetch inside its bounded source loop until the
+/// test releases it across a graceful owner close.
+#[derive(Clone, Default)]
+struct GracefulFetchGate {
+    state: Arc<(Mutex<ShutdownCancelledFetchState>, Condvar)>,
+}
+
+impl GracefulFetchGate {
+    fn wait_for(&self, reached: impl Fn(&ShutdownCancelledFetchState) -> bool, stage: &str) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("shutdown-cancelled fetch gate lock");
+        while !reached(&state) {
+            let (next, timed_out) = changed
+                .wait_timeout(state, LIFECYCLE_WATCHDOG)
+                .expect("shutdown-cancelled fetch gate wait");
+            state = next;
+            assert!(
+                !timed_out.timed_out() || reached(&state),
+                "owner cursor fetch did not reach {stage} within {LIFECYCLE_WATCHDOG:?}"
+            );
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        self.wait_for(|state| state.entered, "bounded source execution");
+    }
+
+    fn release(&self) {
+        let (lock, changed) = &*self.state;
+        lock.lock().expect("graceful fetch gate lock").released = true;
+        changed.notify_all();
+    }
+
+    fn cancellation_observed(&self) -> bool {
+        self.state
+            .0
+            .lock()
+            .expect("graceful fetch gate lock")
+            .cancellation_observed
+    }
+}
+
+impl ReadKernelTestObserver for GracefulFetchGate {
+    fn before_source_touch(
+        &self,
+        event: ReadKernelSourceEvent,
+        _cancellation: OwnerReadCancellation,
+    ) {
+        if event.operation != ReadSessionOperation::CursorFetch {
+            return;
+        }
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().expect("shutdown-cancelled fetch gate lock");
+        if state.entered {
+            return;
+        }
+        state.entered = true;
+        changed.notify_all();
+        while !state.released {
+            state = changed
+                .wait(state)
+                .expect("shutdown-cancelled fetch gate wait");
+        }
+    }
+
+    fn cancellation_observed(
+        &self,
+        event: ReadKernelCancellationEvent,
+        _cancellation: OwnerReadCancellation,
+    ) {
+        assert_eq!(event.operation, ReadSessionOperation::CursorFetch);
+        let (lock, changed) = &*self.state;
+        lock.lock()
+            .expect("shutdown-cancelled fetch gate lock")
+            .cancellation_observed = true;
+        changed.notify_all();
     }
 }
 
@@ -192,6 +429,11 @@ fn owner_options(
             test_hooks: Some(OwnerReadTestHooks {
                 clock: Arc::new(clock),
                 drain_started,
+                active_request_registered: None,
+                accept_thread_exited: None,
+                accept_thread_joined: None,
+                service_dropped: None,
+                quiescent_stop: None,
             }),
             ..OwnerReadConfig::default()
         },
@@ -430,7 +672,7 @@ fn drain_timeout_preserves_database_resources_until_a_retry_finishes_close() {
     drain_started_at
         .recv()
         .expect("owner close announces draining before its configured deadline");
-    assert_bound_draining_listener(&path, &runtime_root);
+    assert_quiescent_direct_reader(&path, &runtime_root);
     assert_child_writer_sees_existing_owner(&path);
     assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
     clock.advance_to(
@@ -448,14 +690,12 @@ fn drain_timeout_preserves_database_resources_until_a_retry_finishes_close() {
             reason: Some(OwnerServingReason::ShutdownDraining),
         }
     );
-    assert!(matches!(
-        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path)),
-        Err(Error::ReadFailure(failure)) if failure.kind() == ReadFailureKind::OwnerNotServing
-    ));
-    assert_bound_draining_listener(&path, &runtime_root);
-    database
-        .execute("SELECT id, payload FROM lifecycle_rows", &HashMap::new())
-        .expect("ordinary database work remains available while owner reads drain");
+    assert_quiescent_direct_reader(&path, &runtime_root);
+    assert!(
+        database
+            .execute("SELECT id, payload FROM lifecycle_rows", &HashMap::new())
+            .is_err()
+    );
     assert!(matches!(
         Database::open(&path),
         Err(Error::DatabaseLocked { .. })
@@ -475,28 +715,12 @@ fn drain_timeout_preserves_database_resources_until_a_retry_finishes_close() {
     assert_database_resources_owned(retained_after_timeout);
     assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
 
-    let committed_id = i64::try_from(ReadLimits::default().result_rows.saturating_add(1))
-        .expect("declared row limit fits the SQL integer fixture");
-    let committed_payload = format!("committed-after-drain-timeout-{committed_id}");
-    database
-        .execute(
-            "INSERT INTO lifecycle_rows (id, payload) VALUES ($id, $payload)",
-            &HashMap::from([
-                ("id".to_owned(), contextdb_core::Value::Int64(committed_id)),
-                (
-                    "payload".to_owned(),
-                    contextdb_core::Value::Text(committed_payload.clone()),
-                ),
-            ]),
-        )
-        .expect("the still-open owner commits a real file-backed write after timeout");
-
     handler.release();
     request
         .join()
         .expect("held request joins after release")
         .expect("the handler receives its completed request");
-    assert!(handler.cancellation_observed());
+    assert!(!handler.cancellation_observed());
     assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
     database
         .close()
@@ -508,12 +732,271 @@ fn drain_timeout_preserves_database_resources_until_a_retry_finishes_close() {
     let persisted = reopened
         .execute(
             "SELECT payload FROM lifecycle_rows WHERE id = $id",
-            &HashMap::from([("id".to_owned(), contextdb_core::Value::Int64(committed_id))]),
+            &HashMap::from([("id".to_owned(), contextdb_core::Value::Int64(1))]),
         )
-        .expect("read the write committed after drain timeout");
+        .expect("read the committed fixture after drain timeout");
     assert_eq!(
         persisted.rows,
-        vec![vec![contextdb_core::Value::Text(committed_payload)]]
+        vec![vec![contextdb_core::Value::Text(
+            "ordinary operations survive draining".to_owned()
+        )]]
+    );
+    reopened.close().expect("close final verification reopen");
+}
+
+#[test]
+fn cleanup_error_survives_owner_read_timeout_and_retry() {
+    let handler = GatedHandler::default();
+    let plugin = CountingPlugin::new();
+    let clock = ManualDeadlineClock::default();
+    let (drain_started, drain_started_at) = std::sync::mpsc::channel();
+    let (directory, runtime_root, database) = create_owner_database(
+        handler.clone(),
+        plugin.clone(),
+        clock.clone(),
+        drain_started,
+    );
+    let path = directory.path().join("owner-read-lifecycle.db");
+
+    database
+        .execute(
+            "INSERT INTO lifecycle_rows (id, payload) VALUES (2, 'seed')",
+            &HashMap::new(),
+        )
+        .expect("seed cleanup churn row");
+    let cleanup_session = database
+        .read_session(ReadLimits {
+            cursor_page_rows: 1,
+            ..ReadLimits::default()
+        })
+        .expect("open cleanup snapshot");
+    let cleanup_cursor = cleanup_session
+        .open_cursor("SELECT id FROM lifecycle_rows ORDER BY id", &HashMap::new())
+        .expect("hold cleanup snapshot");
+    assert!(cleanup_cursor.first_page().has_more);
+    for generation in 0..70 {
+        database
+            .execute(
+                "UPDATE lifecycle_rows SET payload = $payload WHERE id = 2",
+                &HashMap::from([(
+                    "payload".to_owned(),
+                    contextdb_core::Value::Text(format!("{generation}:{}", "x".repeat(8192))),
+                )]),
+            )
+            .expect("create deferred frees");
+    }
+    drop(cleanup_cursor);
+    drop(cleanup_session);
+    assert!(
+        database
+            .__deferred_free_backlog_for_test()
+            .unwrap()
+            .iter()
+            .map(|(_, pages)| pages)
+            .sum::<usize>()
+            > 64
+    );
+    database
+        .__fail_next_close_drain_for_test()
+        .expect("arm cleanup commit I/O fault");
+
+    let session =
+        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
+            .expect("a live file owner selects the owner route once");
+    let request = std::thread::spawn(move || session.request_owner("administrative", b"hold"));
+    handler.wait_until_entered();
+    let owned_before_drain = database
+        .read_route_resources_for_test()
+        .expect("capture the owner channel before draining");
+    assert_database_resources_owned(owned_before_drain);
+
+    let closing_database = Arc::clone(&database);
+    let close = std::thread::spawn(move || closing_database.close());
+    drain_started_at
+        .recv()
+        .expect("owner close announces draining before its configured deadline");
+    assert_quiescent_direct_reader(&path, &runtime_root);
+    assert_child_writer_sees_existing_owner(&path);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+    clock.advance_to(
+        contextdb_core::read_contract::OwnerServiceTimeouts::default().shutdown_drain_ms,
+    );
+    let error = close
+        .join()
+        .expect("close returns its typed drain outcome")
+        .expect_err("a handler held beyond the drain deadline leaves the database open");
+    assert!(matches!(error, Error::OwnerReadDrainTimeout));
+    assert_eq!(
+        database.owner_read_status(),
+        contextdb_core::read_contract::OwnerReadStatus {
+            state: OwnerServingState::NotServing,
+            reason: Some(OwnerServingReason::ShutdownDraining),
+        }
+    );
+    assert_quiescent_direct_reader(&path, &runtime_root);
+    assert!(
+        database
+            .execute("SELECT id, payload FROM lifecycle_rows", &HashMap::new())
+            .is_err()
+    );
+    assert!(matches!(
+        Database::open(&path),
+        Err(Error::DatabaseLocked { .. })
+    ));
+    assert_child_writer_sees_existing_owner(&path);
+    let retained_after_timeout = database
+        .read_route_resources_for_test()
+        .expect("inspect retained resources after the drain timeout");
+    assert_eq!(
+        retained_after_timeout.channel_identity,
+        owned_before_drain.channel_identity
+    );
+    assert_eq!(
+        retained_after_timeout.owner_services_started,
+        owned_before_drain.owner_services_started
+    );
+    assert_database_resources_owned(retained_after_timeout);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+
+    handler.release();
+    request
+        .join()
+        .expect("held request joins after release")
+        .expect("the handler receives its completed request");
+    assert!(!handler.cancellation_observed());
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+    let cleanup_error = database
+        .close()
+        .expect_err("retry must report the cleanup failure after releasing resources");
+    assert!(
+        cleanup_error
+            .to_string()
+            .contains("injected deferred-free commit I/O failure"),
+        "preserve the original cleanup error across drain timeout: {cleanup_error}"
+    );
+    assert_owner_listener_released(&path, &runtime_root);
+    assert_eq!(plugin.counts.opened.load(Ordering::SeqCst), 1);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 1);
+    let reopened = Database::open(&path).expect("reopen after successful retry close");
+    let persisted = reopened
+        .execute(
+            "SELECT payload FROM lifecycle_rows WHERE id = $id",
+            &HashMap::from([("id".to_owned(), contextdb_core::Value::Int64(1))]),
+        )
+        .expect("read the committed fixture after drain timeout");
+    assert_eq!(
+        persisted.rows,
+        vec![vec![contextdb_core::Value::Text(
+            "ordinary operations survive draining".to_owned()
+        )]]
+    );
+    reopened.close().expect("close final verification reopen");
+}
+
+#[test]
+fn handoff_error_survives_owner_read_timeout_and_retry() {
+    let handler = GatedHandler::default();
+    let plugin = CountingPlugin::new();
+    let clock = ManualDeadlineClock::default();
+    let (drain_started, drain_started_at) = std::sync::mpsc::channel();
+    let (directory, runtime_root, database) = create_owner_database(
+        handler.clone(),
+        plugin.clone(),
+        clock.clone(),
+        drain_started,
+    );
+    let path = directory.path().join("owner-read-lifecycle.db");
+
+    let session =
+        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
+            .expect("a live file owner selects the owner route once");
+    let request = std::thread::spawn(move || session.request_owner("administrative", b"hold"));
+    handler.wait_until_entered();
+    let owned_before_drain = database
+        .read_route_resources_for_test()
+        .expect("capture the owner channel before draining");
+    assert_database_resources_owned(owned_before_drain);
+
+    database
+        .__fail_next_close_handoff_for_test()
+        .expect("arm handoff preparation fault");
+    let closing_database = Arc::clone(&database);
+    let close = std::thread::spawn(move || closing_database.close());
+    drain_started_at
+        .recv()
+        .expect("owner close announces draining before its configured deadline");
+    assert_child_writer_sees_existing_owner(&path);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+    clock.advance_to(
+        contextdb_core::read_contract::OwnerServiceTimeouts::default().shutdown_drain_ms,
+    );
+    let error = close
+        .join()
+        .expect("close returns its typed drain outcome")
+        .expect_err("a handler held beyond the drain deadline leaves the database open");
+    assert!(matches!(error, Error::OwnerReadDrainTimeout));
+    assert_eq!(
+        database.owner_read_status(),
+        contextdb_core::read_contract::OwnerReadStatus {
+            state: OwnerServingState::NotServing,
+            reason: Some(OwnerServingReason::ShutdownDraining),
+        }
+    );
+    assert!(
+        database
+            .execute("SELECT id, payload FROM lifecycle_rows", &HashMap::new())
+            .is_err()
+    );
+    assert!(matches!(
+        Database::open(&path),
+        Err(Error::DatabaseLocked { .. })
+    ));
+    assert_child_writer_sees_existing_owner(&path);
+    let retained_after_timeout = database
+        .read_route_resources_for_test()
+        .expect("inspect retained resources after the drain timeout");
+    assert_eq!(
+        retained_after_timeout.channel_identity,
+        owned_before_drain.channel_identity
+    );
+    assert_eq!(
+        retained_after_timeout.owner_services_started,
+        owned_before_drain.owner_services_started
+    );
+    assert_database_resources_owned(retained_after_timeout);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+
+    handler.release();
+    request
+        .join()
+        .expect("held request joins after release")
+        .expect("the handler receives its completed request");
+    assert!(!handler.cancellation_observed());
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+    let handoff_error = database
+        .close()
+        .expect_err("retry must report the handoff failure after releasing resources");
+    assert!(
+        handoff_error
+            .to_string()
+            .contains("injected handoff preparation I/O failure"),
+        "preserve the original handoff error across drain timeout: {handoff_error}"
+    );
+    assert_owner_listener_released(&path, &runtime_root);
+    assert_eq!(plugin.counts.opened.load(Ordering::SeqCst), 1);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 1);
+    let reopened = Database::open(&path).expect("reopen after successful retry close");
+    let persisted = reopened
+        .execute(
+            "SELECT payload FROM lifecycle_rows WHERE id = $id",
+            &HashMap::from([("id".to_owned(), contextdb_core::Value::Int64(1))]),
+        )
+        .expect("read the committed fixture after drain timeout");
+    assert_eq!(
+        persisted.rows,
+        vec![vec![contextdb_core::Value::Text(
+            "ordinary operations survive draining".to_owned()
+        )]]
     );
     reopened.close().expect("close final verification reopen");
 }
@@ -581,17 +1064,19 @@ fn a_suspended_cursor_is_cancelled_and_released_when_its_owner_closes() {
     // for: nothing admitted is left for the drain to wait on, the close
     // finishes, and the channel comes down with it.
     let closing = Arc::clone(&database);
-    let close = std::thread::spawn(move || closing.close());
+    let (closed, closed_at) = std::sync::mpsc::channel();
+    let close = std::thread::spawn(move || {
+        let result = closing.close();
+        closed.send(result).expect("publish cursor-holding close");
+    });
     drain_started_at
         .recv()
         .expect("cursor-holding close reaches draining");
-    clock.advance_to(
-        contextdb_core::read_contract::OwnerServiceTimeouts::default().shutdown_drain_ms,
-    );
-    close
-        .join()
-        .expect("cursor-holding close joins")
+    closed_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("cursor-holding close completes its actual service workers")
         .expect("a cancelled cursor leaves the drain nothing to wait for");
+    close.join().expect("cursor-holding close joins");
 
     plugin.wait_until_closed();
     assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 1);
@@ -601,26 +1086,426 @@ fn a_suspended_cursor_is_cancelled_and_released_when_its_owner_closes() {
         .expect("inspect what the closed owner still holds");
     assert_eq!(after_close.active_cursors, 0);
 
-    // The reader is told plainly that the owner it was reading through has
-    // stopped; it is not left holding a cursor that no longer exists, and it
-    // is not quietly moved to some other view of the store.
-    assert!(matches!(
-        cursor.fetch(None),
-        Err(Error::ReadFailure(failure))
-            if failure.kind() == ReadFailureKind::OwnerNotServing
-    ));
-    assert!(matches!(
-        cursor.close(),
-        Err(Error::ReadFailure(failure))
-            if failure.kind() == ReadFailureKind::OwnerNotServing
-    ));
+    // Owner shutdown releases the serving resources. The client still owns
+    // the registered snapshot and finishes that exact view through FILE.
+    let page = cursor
+        .fetch(None)
+        .expect("continue the registered snapshot");
+    assert_eq!(
+        page.rows,
+        vec![vec![
+            contextdb_core::Value::Int64(cursor_row_id),
+            contextdb_core::Value::Text("cursor-retained-row".to_owned()),
+        ]]
+    );
+    assert!(!page.has_more);
+    cursor.close().expect("release the retained snapshot");
 
     drop(database);
     Database::open(&path).expect("the file reopens once its closed owner has released it");
 }
 
 #[test]
-fn drop_defers_final_resource_release_until_a_cancelled_handler_returns() {
+fn active_cursor_fetch_completes_before_graceful_owner_close_releases_it() {
+    let handler = GatedHandler::default();
+    let plugin = CountingPlugin::new();
+    let clock = ManualDeadlineClock::default();
+    let initial_now_ms = clock.now_ms();
+    let publication = CursorRegistryPublicationGate::default();
+    let held_fetch = GracefulFetchGate::default();
+    let (drain_started, drain_started_at) = std::sync::mpsc::channel();
+    let (accept_exited, accept_exited_at) = std::sync::mpsc::channel();
+    let (accept_joined, accept_joined_at) = std::sync::mpsc::channel();
+    let (service_dropped, service_dropped_at) = std::sync::mpsc::channel();
+    let directory = tempfile::TempDir::new().expect("task-scoped owner database directory");
+    let path = directory.path().join("fetch-close-publication-race.db");
+    let runtime_root = secure_runtime_root(&directory, "fetch-close-publication-runtime");
+    let mut options = owner_options(
+        plugin.clone(),
+        handler,
+        clock.clone(),
+        drain_started,
+        runtime_root.clone(),
+    );
+    let hooks = options
+        .owner_reads
+        .test_hooks
+        .as_mut()
+        .expect("owner lifecycle fixture installs test hooks");
+    hooks.accept_thread_exited = Some(accept_exited);
+    hooks.accept_thread_joined = Some(accept_joined);
+    hooks.service_dropped = Some(service_dropped);
+    options.test_kernel_observer = Some(Arc::new(held_fetch.clone()));
+    let database = Arc::new(
+        OwnerServiceSpec::with_publication_observer_during_start_for_test(
+            Arc::new(publication.clone()),
+            || {
+                Database::open_with_options(&path, options)
+                    .expect("open owner with the passive cursor publication barrier")
+            },
+        ),
+    );
+    database
+        .execute(
+            "CREATE TABLE fetch_rows (id INTEGER PRIMARY KEY, payload TEXT)",
+            &HashMap::new(),
+        )
+        .expect("create cursor fetch fixture");
+    for id in 1_i64..=128 {
+        let payload = if [1_i64, 64, 128].contains(&id) {
+            "needle".to_owned()
+        } else {
+            format!("hay-{id}")
+        };
+        database
+            .execute(
+                "INSERT INTO fetch_rows (id, payload) VALUES ($id, $payload)",
+                &HashMap::from([
+                    ("id".to_owned(), contextdb_core::Value::Int64(id)),
+                    ("payload".to_owned(), contextdb_core::Value::Text(payload)),
+                ]),
+            )
+            .expect("seed retained cursor row");
+    }
+    let session = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
+        ReadSession::open_with_options(
+            &path,
+            ReadSessionOptions {
+                limits: ReadLimits {
+                    cursor_page_rows: 1,
+                    ..ReadLimits::default()
+                },
+                ..ReadSessionOptions::default()
+            },
+        )
+    })
+    .expect("external reader selects the live owner");
+    let cursor = session
+        .open_cursor(
+            "SELECT id, payload FROM fetch_rows WHERE payload = 'needle'",
+            &HashMap::new(),
+        )
+        .expect("open the retained owner cursor before shutdown");
+    assert!(cursor.first_page().has_more);
+    drop(session);
+    assert_eq!(
+        database
+            .read_route_resources_for_test()
+            .expect("inspect cursor before the fetch race")
+            .active_cursors,
+        1
+    );
+
+    publication.arm();
+    let fetching = std::thread::spawn(move || {
+        let mut cursor = cursor;
+        let fetched = cursor.fetch(std::num::NonZeroUsize::new(2));
+        (cursor, fetched)
+    });
+    held_fetch.wait_until_entered();
+
+    let closing = Arc::clone(&database);
+    let (closed, closed_at) = std::sync::mpsc::channel();
+    let close = std::thread::spawn(move || {
+        closed
+            .send(closing.close())
+            .expect("publish cursor-race close outcome");
+    });
+    drain_started_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("owner close marks the service draining while fetch publication is held");
+    assert_quiescent_direct_reader(&path, &runtime_root);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        closed_at.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(clock.now_ms(), initial_now_ms);
+
+    held_fetch.release();
+    publication.wait_until_entered();
+    assert!(matches!(
+        closed_at.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    publication.release();
+    let (cursor, fetched) = fetching.join().expect("cursor fetch thread joins");
+    let page = fetched.expect("accepted fetch completes across graceful close");
+    assert_eq!(page.rows.len(), 2);
+    assert!(!held_fetch.cancellation_observed());
+    drop(cursor);
+    closed_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("owner close completes after the fetch publishes")
+        .expect("owner close drains accepted fetch");
+    close.join().expect("cursor-race close thread joins");
+    accept_exited_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("close makes the accept worker exit after the fetch");
+    accept_joined_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("close joins the accept worker after the fetch");
+    assert_eq!(clock.now_ms(), initial_now_ms);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        database
+            .read_route_resources_for_test()
+            .expect("inspect owner resources after the fetch race")
+            .active_cursors,
+        0
+    );
+    assert_owner_listener_released(&path, &runtime_root);
+    drop(database);
+    service_dropped_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("closed owner service drops after the accepted fetch");
+}
+
+#[test]
+fn graceful_close_delivers_a_completed_cursor_page_before_releasing_owner() {
+    let handler = GatedHandler::default();
+    let plugin = CountingPlugin::new();
+    let clock = ManualDeadlineClock::default();
+    let initial_now_ms = clock.now_ms();
+    let publication = CursorPagePublicationGate::default();
+    let (drain_started, drain_started_at) = std::sync::mpsc::channel();
+    let directory = tempfile::TempDir::new().expect("task-scoped owner database directory");
+    let path = directory.path().join("fetch-close-delivery-miss.db");
+    let runtime_root = secure_runtime_root(&directory, "fetch-close-delivery-runtime");
+    let database = Arc::new(
+        OwnerServiceSpec::with_publication_observer_during_start_for_test(
+            Arc::new(publication.clone()),
+            || {
+                Database::open_with_options(
+                    &path,
+                    owner_options(
+                        plugin.clone(),
+                        handler,
+                        clock.clone(),
+                        drain_started,
+                        runtime_root.clone(),
+                    ),
+                )
+                .expect("open owner with the passive cursor page delivery barrier")
+            },
+        ),
+    );
+    database
+        .execute(
+            "CREATE TABLE delivery_rows (id INTEGER PRIMARY KEY, payload TEXT)",
+            &HashMap::new(),
+        )
+        .expect("create cursor delivery fixture");
+    for id in 1_i64..=2 {
+        database
+            .execute(
+                "INSERT INTO delivery_rows (id, payload) VALUES ($id, $payload)",
+                &HashMap::from([
+                    ("id".to_owned(), contextdb_core::Value::Int64(id)),
+                    (
+                        "payload".to_owned(),
+                        contextdb_core::Value::Text(format!("delivery-row-{id}")),
+                    ),
+                ]),
+            )
+            .expect("seed cursor delivery row");
+    }
+    let session = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
+        ReadSession::open_with_options(
+            &path,
+            ReadSessionOptions {
+                limits: ReadLimits {
+                    cursor_page_rows: 1,
+                    ..ReadLimits::default()
+                },
+                ..ReadSessionOptions::default()
+            },
+        )
+    })
+    .expect("external reader selects the live owner");
+    let cursor = session
+        .open_cursor(
+            "SELECT id, payload FROM delivery_rows ORDER BY id",
+            &HashMap::new(),
+        )
+        .expect("open the retained cursor before its delivery race");
+    assert!(cursor.first_page().has_more);
+    drop(session);
+
+    publication.arm();
+    let fetching = std::thread::spawn(move || {
+        let mut cursor = cursor;
+        let fetched = cursor.fetch(None);
+        (cursor, fetched)
+    });
+    publication.wait_until_entered();
+    assert_eq!(
+        database
+            .read_route_resources_for_test()
+            .expect("the completed page is back in the owner registry before delivery")
+            .active_cursors,
+        1
+    );
+
+    let closing = Arc::clone(&database);
+    let (closed, closed_at) = std::sync::mpsc::channel();
+    let close = std::thread::spawn(move || {
+        closed
+            .send(closing.close())
+            .expect("publish cursor delivery close outcome");
+    });
+    drain_started_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("owner close announces draining after the page is stored");
+    assert_quiescent_direct_reader(&path, &runtime_root);
+    assert_eq!(clock.now_ms(), initial_now_ms);
+    assert!(matches!(
+        closed_at.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+
+    publication.release();
+    let (cursor, fetched) = fetching.join().expect("cursor delivery fetch thread joins");
+    let page = fetched.expect("accepted cursor page is delivered across graceful close");
+    assert_eq!(page.rows.len(), 1);
+    drop(cursor);
+    closed_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("owner close completes after the page is delivered")
+        .expect("delivered cursor page leaves no active owner operation");
+    close.join().expect("cursor delivery close thread joins");
+    assert_eq!(clock.now_ms(), initial_now_ms);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        database
+            .read_route_resources_for_test()
+            .expect("drained delivery releases the owner cursor")
+            .active_cursors,
+        0
+    );
+}
+
+#[test]
+fn accepted_first_cursor_page_publishes_before_owner_drop_releases_it() {
+    let handler = GatedHandler::default();
+    let plugin = CountingPlugin::new();
+    let clock = ManualDeadlineClock::default();
+    let initial_now_ms = clock.now_ms();
+    let publication = CursorRegistryPublicationGate::default();
+    let (drain_started, drain_started_at) = std::sync::mpsc::channel();
+    let (accept_exited, accept_exited_at) = std::sync::mpsc::channel();
+    let (service_dropped, service_dropped_at) = std::sync::mpsc::channel();
+    let directory = tempfile::TempDir::new().expect("task-scoped owner database directory");
+    let path = directory.path().join("open-drop-publication-race.db");
+    let runtime_root = secure_runtime_root(&directory, "open-drop-publication-runtime");
+    let mut options = owner_options(
+        plugin.clone(),
+        handler,
+        clock.clone(),
+        drain_started,
+        runtime_root.clone(),
+    );
+    let hooks = options
+        .owner_reads
+        .test_hooks
+        .as_mut()
+        .expect("owner lifecycle fixture installs test hooks");
+    hooks.accept_thread_exited = Some(accept_exited);
+    hooks.service_dropped = Some(service_dropped);
+    let database = OwnerServiceSpec::with_publication_observer_during_start_for_test(
+        Arc::new(publication.clone()),
+        || {
+            Database::open_with_options(&path, options)
+                .expect("open owner with the passive cursor publication barrier")
+        },
+    );
+    database
+        .execute(
+            "CREATE TABLE open_rows (id INTEGER PRIMARY KEY, payload TEXT)",
+            &HashMap::new(),
+        )
+        .expect("create cursor open fixture");
+    for id in 1_i64..=2 {
+        database
+            .execute(
+                "INSERT INTO open_rows (id, payload) VALUES ($id, $payload)",
+                &HashMap::from([
+                    ("id".to_owned(), contextdb_core::Value::Int64(id)),
+                    (
+                        "payload".to_owned(),
+                        contextdb_core::Value::Text(format!("open-row-{id}")),
+                    ),
+                ]),
+            )
+            .expect("seed retained cursor row");
+    }
+    let session = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
+        ReadSession::open_with_options(
+            &path,
+            ReadSessionOptions {
+                limits: ReadLimits {
+                    cursor_page_rows: 1,
+                    ..ReadLimits::default()
+                },
+                ..ReadSessionOptions::default()
+            },
+        )
+    })
+    .expect("external reader selects the live owner");
+
+    publication.arm();
+    let opening = std::thread::spawn(move || {
+        let opened = session.open_cursor(
+            "SELECT id, payload FROM open_rows ORDER BY id",
+            &HashMap::new(),
+        );
+        (session, opened)
+    });
+    publication.wait_until_entered();
+    assert_eq!(
+        database
+            .read_route_resources_for_test()
+            .expect("inspect owner while first-page publication is held")
+            .active_cursors,
+        0
+    );
+
+    let (drop_returned, drop_returned_at) = std::sync::mpsc::channel();
+    let dropping = std::thread::spawn(move || {
+        drop(database);
+        drop_returned
+            .send(())
+            .expect("publish owner-handle drop return");
+    });
+    drain_started_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("owner drop marks the service draining while first-page publication is held");
+    assert_quiescent_direct_reader(&path, &runtime_root);
+    drop_returned_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("owner drop remains nonwaiting while first-page publication is held");
+    dropping.join().expect("owner-handle drop thread joins");
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+    assert_eq!(clock.now_ms(), initial_now_ms);
+
+    publication.release();
+    let (session, opened) = opening.join().expect("cursor open thread joins");
+    let cursor = opened.expect("accepted first page publishes across ordinary drop");
+    assert_eq!(cursor.first_page().rows.len(), 1);
+    drop(cursor);
+    drop(session);
+    accept_exited_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("drop stops the accept worker after the held open returns");
+    service_dropped_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("owner service drops after the held open releases its store hold");
+    assert_eq!(clock.now_ms(), initial_now_ms);
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn drop_defers_final_resource_release_until_an_accepted_handler_returns() {
     let handler = GatedHandler::default();
     let plugin = CountingPlugin::new();
     let clock = ManualDeadlineClock::default();
@@ -663,7 +1548,7 @@ fn drop_defers_final_resource_release_until_a_cancelled_handler_returns() {
     drain_started_at
         .recv()
         .expect("drop announces draining through the manual-clock seam");
-    assert_bound_draining_listener(&path, &runtime_root);
+    assert_quiescent_direct_reader(&path, &runtime_root);
     clock.advance_to(
         contextdb_core::read_contract::OwnerServiceTimeouts::default().shutdown_drain_ms,
     );
@@ -677,7 +1562,7 @@ fn drop_defers_final_resource_release_until_a_cancelled_handler_returns() {
         Err(Error::DatabaseLocked { .. })
     ));
     assert_child_writer_sees_existing_owner(&path);
-    assert_bound_draining_listener(&path, &runtime_root);
+    assert_quiescent_direct_reader(&path, &runtime_root);
     let retained_by_finalizer = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
         ReadSession::route_resources_for_path_for_test(&path)
     })
@@ -692,12 +1577,175 @@ fn drop_defers_final_resource_release_until_a_cancelled_handler_returns() {
     request
         .join()
         .expect("held request joins after the eventual finalizer observes release")
-        .expect("the cancelled handler returns through the request path");
-    assert!(handler.cancellation_observed());
+        .expect("the accepted handler returns through the request path");
+    assert!(!handler.cancellation_observed());
     plugin.wait_until_closed();
     assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 1);
     assert_owner_listener_released(&path, &runtime_root);
     Database::open(&path).expect("reopen succeeds after the eventual finalizer releases resources");
+}
+
+#[test]
+fn authenticated_inflight_owner_reader_close_requires_service_lifecycle_completion() {
+    let handler = GatedHandler::default();
+    let plugin = CountingPlugin::new();
+    let clock = ManualDeadlineClock::default();
+    let (drain_started, drain_started_at) = std::sync::mpsc::channel();
+    let (registered, registered_at) = std::sync::mpsc::channel();
+    let (accept_exited, accept_exited_at) = std::sync::mpsc::channel();
+    let (accept_joined, accept_joined_at) = std::sync::mpsc::channel();
+    let (service_dropped, service_dropped_at) = std::sync::mpsc::channel();
+    let directory = tempfile::TempDir::new().expect("task-scoped owner database directory");
+    let path = directory.path().join("authenticated-close-lifecycle.db");
+    let runtime_root = secure_runtime_root(&directory, "authenticated-close-runtime");
+    let mut options = owner_options(
+        plugin.clone(),
+        handler.clone(),
+        clock.clone(),
+        drain_started,
+        runtime_root.clone(),
+    );
+    let hooks = options
+        .owner_reads
+        .test_hooks
+        .as_mut()
+        .expect("owner lifecycle fixture installs test hooks");
+    hooks.active_request_registered = Some(registered);
+    hooks.accept_thread_exited = Some(accept_exited);
+    hooks.accept_thread_joined = Some(accept_joined);
+    hooks.service_dropped = Some(service_dropped);
+    let database = Arc::new(
+        Database::open_with_options(&path, options)
+            .expect("configured file owner opens before its authenticated reader"),
+    );
+    let session =
+        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
+            .expect("external reader selects the authenticated owner route");
+    assert_eq!(
+        session.route(),
+        contextdb_core::read_contract::ReadRoute::Owner
+    );
+    let request = std::thread::spawn(move || session.request_owner("administrative", b"hold"));
+    registered_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("authenticated request registers before owner shutdown begins");
+    handler.wait_until_entered();
+    let active = database
+        .read_route_resources_for_test()
+        .expect("inspect the owner after its authenticated operation registered");
+    assert_eq!(active.active_owner_slots, 1);
+
+    let closing = Arc::clone(&database);
+    let close = std::thread::spawn(move || closing.close());
+    drain_started_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("close reaches the owner drain after the registered operation");
+    assert_quiescent_direct_reader(&path, &runtime_root);
+    clock.advance_to(
+        contextdb_core::read_contract::OwnerServiceTimeouts::default().shutdown_drain_ms,
+    );
+    assert!(matches!(
+        close.join().expect("close thread joins"),
+        Err(Error::OwnerReadDrainTimeout)
+    ));
+    assert_eq!(
+        database
+            .read_route_resources_for_test()
+            .expect("registered operation remains live after the configured drain limit")
+            .active_owner_slots,
+        1
+    );
+
+    handler.release();
+    request
+        .join()
+        .expect("authenticated request thread joins")
+        .expect("accepted handler returns through the authenticated route");
+    database
+        .close()
+        .expect("retry close completes after the active operation releases");
+    accept_exited_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("close makes the owner accept worker exit after draining");
+    accept_joined_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("service owns and joins its accept worker during close");
+    drop(database);
+    service_dropped_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("final owner service drop follows its completed close lifecycle");
+}
+
+#[test]
+fn authenticated_inflight_owner_reader_drop_does_not_wait_for_operation_or_service_release() {
+    let handler = GatedHandler::default();
+    let plugin = CountingPlugin::new();
+    let clock = ManualDeadlineClock::default();
+    let (drain_started, drain_started_at) = std::sync::mpsc::channel();
+    let (registered, registered_at) = std::sync::mpsc::channel();
+    let (accept_exited, accept_exited_at) = std::sync::mpsc::channel();
+    let (service_dropped, service_dropped_at) = std::sync::mpsc::channel();
+    let directory = tempfile::TempDir::new().expect("task-scoped owner database directory");
+    let path = directory.path().join("authenticated-drop-lifecycle.db");
+    let runtime_root = secure_runtime_root(&directory, "authenticated-drop-runtime");
+    let mut options = owner_options(
+        plugin.clone(),
+        handler.clone(),
+        clock,
+        drain_started,
+        runtime_root.clone(),
+    );
+    let hooks = options
+        .owner_reads
+        .test_hooks
+        .as_mut()
+        .expect("owner lifecycle fixture installs test hooks");
+    hooks.active_request_registered = Some(registered);
+    hooks.accept_thread_exited = Some(accept_exited);
+    hooks.service_dropped = Some(service_dropped);
+    let database = Database::open_with_options(&path, options)
+        .expect("configured file owner opens before its authenticated reader");
+    let session =
+        ReadSession::with_runtime_directory_for_test(&runtime_root, || ReadSession::open(&path))
+            .expect("external reader selects the authenticated owner route");
+    assert_eq!(
+        session.route(),
+        contextdb_core::read_contract::ReadRoute::Owner
+    );
+    let request = std::thread::spawn(move || session.request_owner("administrative", b"hold"));
+    registered_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("authenticated request registers before owner drop begins");
+    handler.wait_until_entered();
+
+    let (drop_returned, drop_returned_at) = std::sync::mpsc::channel();
+    let dropping = std::thread::spawn(move || {
+        drop(database);
+        drop_returned
+            .send(())
+            .expect("publish owner-handle drop return");
+    });
+    drain_started_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("drop reaches the owner shutdown after the registered operation");
+    drop_returned_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("drop stays nonwaiting while its authenticated operation is active");
+    dropping.join().expect("owner-handle drop thread joins");
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 0);
+
+    handler.release();
+    request
+        .join()
+        .expect("authenticated request thread joins")
+        .expect("accepted handler returns through the authenticated route");
+    accept_exited_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("drop wakes the owner accept worker after the active operation releases");
+    service_dropped_at
+        .recv_timeout(LIFECYCLE_WATCHDOG)
+        .expect("drop releases the owner service after its active operation ends");
+    assert_eq!(plugin.counts.closed.load(Ordering::SeqCst), 1);
 }
 
 #[test]

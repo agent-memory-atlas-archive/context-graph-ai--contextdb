@@ -1,6 +1,7 @@
 use contextdb_core::read_contract::{
     CursorPage, OwnerReadCancellation, OwnerReadLimits, OwnerServiceTimeouts, OwnerServingState,
-    ReadClientTimeouts, ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits, ReadRoute,
+    ReadClientTimeouts, ReadFailure, ReadFailureDetail, ReadFailureKind, ReadFailureLimit,
+    ReadLimits, ReadRoute,
 };
 use contextdb_core::{Error, Result, Value};
 use contextdb_engine::local_transport::MAX_FRAME_BYTES;
@@ -340,6 +341,95 @@ fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
     owner
         .close()
         .expect("close the live owner after route comparison");
+}
+
+#[test]
+fn file_and_live_owner_reads_report_the_same_one_byte_memory_limit() {
+    let directory = tempfile::TempDir::new().expect("task-scoped route fixture directory");
+    let path = directory.path().join("one-byte-memory.db");
+    let seed = Database::open(&path).expect("create the committed fixture");
+    seed.execute(
+        "CREATE TABLE route_rows (id TEXT PRIMARY KEY, payload TEXT) SYNC CONFLICT KEEP LATEST",
+        &HashMap::new(),
+    )
+    .expect("create the consumer-shaped table");
+    let tx = seed.begin().expect("begin fixture write");
+    for ordinal in 0..=600 {
+        seed.execute_in_tx(
+            tx,
+            "INSERT INTO route_rows (id, payload) VALUES ($id, $payload)",
+            &HashMap::from([
+                ("id".into(), Value::Text(format!("row-{ordinal:04}"))),
+                ("payload".into(), Value::Text("x".repeat(8 * 1024))),
+            ]),
+        )
+        .expect("seed a committed row");
+    }
+    seed.commit(tx).expect("commit the wide rows");
+    seed.close().expect("release the committed fixture");
+    let runtime_root = secure_runtime_root(&directory, "one-byte-memory-runtime");
+    let mut options = session_options();
+    options.limits.memory = 1;
+    options.memory_limit = Some(1);
+    let query = "SELECT id, payload FROM route_rows ORDER BY id";
+
+    let file = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
+        ReadSession::open_with_options(&path, options.clone())
+    });
+    let file_error = match file {
+        Ok(file) => {
+            assert_eq!(file.route(), ReadRoute::File);
+            file.execute(query, &HashMap::new()).unwrap_err()
+        }
+        Err(error) => error,
+    };
+
+    let owner = Database::open_with_options(
+        &path,
+        owner_options(
+            Arc::new(NonceHandler { nonce: Vec::new() }),
+            runtime_root.clone(),
+            None,
+        ),
+    )
+    .expect("start the live owner");
+    let live = ReadSession::with_runtime_directory_for_test(&runtime_root, || {
+        ReadSession::open_with_options(&path, options)
+    });
+    let live_error = match live {
+        Ok(live) => {
+            assert_eq!(live.route(), ReadRoute::Owner);
+            live.execute(query, &HashMap::new()).unwrap_err()
+        }
+        Err(error) => error,
+    };
+
+    for (route, error) in [
+        (ReadRoute::File, file_error),
+        (ReadRoute::Owner, live_error),
+    ] {
+        if let Error::MemoryBudgetExceeded {
+            budget_limit_bytes, ..
+        } = error
+        {
+            assert_eq!(budget_limit_bytes, 1, "{route:?}");
+            continue;
+        }
+        let Error::ReadFailure(failure) = error else {
+            panic!("{route:?} must return a typed read failure, got {error:?}");
+        };
+        assert_eq!(
+            failure.kind(),
+            ReadFailureKind::OwnerLimitExceeded,
+            "{route:?}"
+        );
+        let ReadFailureDetail::OwnerLimitExceeded(detail) = failure.detail() else {
+            panic!("{route:?} must name the crossed limit, got {failure:?}");
+        };
+        assert_eq!(detail.limit, ReadFailureLimit::Memory, "{route:?}");
+        assert_eq!(detail.value, 1, "{route:?}");
+    }
+    owner.close().expect("close the live owner");
 }
 
 #[test]

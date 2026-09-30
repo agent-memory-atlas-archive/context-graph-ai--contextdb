@@ -94,6 +94,7 @@ fn failed_synced_commit_publishes_neither_row_nor_authenticated_receipt() {
                 incarnation,
                 source_lsn: receipt_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
         )
         .expect_err("injected failure rejects the synced transaction");

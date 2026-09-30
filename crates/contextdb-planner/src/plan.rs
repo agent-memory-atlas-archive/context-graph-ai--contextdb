@@ -102,6 +102,8 @@ pub enum PhysicalPlan {
     ShowDiskLimit,
     SetMaintenancePollInterval(u64),
     ShowMaintenancePollInterval,
+    SetVectorServingCache(Option<u64>),
+    ShowVectorServingCache,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicyPlan),
@@ -269,6 +271,9 @@ pub struct CreateTablePlan {
     pub history: Option<contextdb_core::HistoryPolicy>,
     pub delivery_manifest_tables: Option<Vec<String>>,
     pub edge_discard: Option<contextdb_core::EdgeDiscardMode>,
+    /// The `MAINTAIN COUNT` declaration this CREATE wrote, already mapped to
+    /// the engine's own sort direction. `None` means it wrote none.
+    pub maintained_counts: Option<contextdb_core::MaintainedCounts>,
 }
 
 #[derive(Debug, Clone)]

@@ -49,21 +49,30 @@ fn axis3(axis: usize) -> Vec<f32> {
 }
 
 fn create_single_table(db: &Database) {
+    // SEARCH_MODE INDEXED uses the maintained
+    // graph route at every non-empty cardinality, never falling back to exact. This suite
+    // proves graph build determinism (topology digest stability, build-serial reuse across
+    // rebuilds and reopens), so the route must be pinned instead of left to AUTO's own
+    // cost-vs-walk costing, which may legitimately choose
+    // exact at this row count.
     db.execute(
-        "CREATE TABLE det_one (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        "CREATE TABLE det_one (id UUID PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)",
         &empty(),
     )
     .unwrap();
 }
 
 fn create_reopen_tables(db: &Database) {
+    // Pinned to SEARCH_MODE INDEXED for the same
+    // reason as create_single_table above — this suite proves synced graph state survives
+    // reopen, not AUTO's routing choice.
     db.execute(
-        "CREATE TABLE table_text (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        "CREATE TABLE table_text (id UUID PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)",
         &empty(),
     )
     .unwrap();
     db.execute(
-        "CREATE TABLE table_face (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        "CREATE TABLE table_face (id UUID PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)",
         &empty(),
     )
     .unwrap();

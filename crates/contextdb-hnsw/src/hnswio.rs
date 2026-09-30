@@ -307,7 +307,9 @@ where
                         "ContextDB HNSW graph has an edge above its layer limit"
                     ));
                 }
-                if encoded_neighbours.len() > payload.max_nb_connection.saturating_mul(2) {
+                if encoded_neighbours.len()
+                    > crate::hnsw::layer0_max_nb_connection(payload.max_nb_connection)
+                {
                     return Err(anyhow!("ContextDB HNSW graph has too many neighbours"));
                 }
                 if encoded_neighbours.is_empty() {

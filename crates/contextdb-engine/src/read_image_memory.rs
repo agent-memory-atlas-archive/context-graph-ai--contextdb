@@ -13,6 +13,9 @@ use std::sync::{
 #[derive(Debug)]
 pub(crate) struct ImageMemory {
     pub(crate) accountant: Arc<MemoryAccountant>,
+    subsystem: &'static str,
+    operation: &'static str,
+    hint: &'static str,
     held: AtomicUsize,
     failure: parking_lot::Mutex<Option<Error>>,
 }
@@ -23,17 +26,43 @@ impl ImageMemory {
                 Some(limit) => MemoryAccountant::with_budget(limit),
                 None => MemoryAccountant::no_limit(),
             }),
+            subsystem: "direct_read",
+            operation: "hydrate_owned_image",
+            hint: "Raise MEMORY_LIMIT to admit the complete committed read image.",
+            held: AtomicUsize::new(0),
+            failure: parking_lot::Mutex::new(None),
+        })
+    }
+    /// Admission into an accountant that already exists -- a reading
+    /// session's own -- so what is decoded under [`Self::scope`] is charged
+    /// where the session's limit sees it, allocation by allocation, and given
+    /// back when this charge is dropped.
+    pub(crate) fn charging(accountant: Arc<MemoryAccountant>) -> Arc<Self> {
+        Self::charging_for(
+            accountant,
+            "direct_read",
+            "hydrate_owned_image",
+            "Raise MEMORY_LIMIT to admit the complete committed read image.",
+        )
+    }
+    pub(crate) fn charging_for(
+        accountant: Arc<MemoryAccountant>,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            accountant,
+            subsystem,
+            operation,
+            hint,
             held: AtomicUsize::new(0),
             failure: parking_lot::Mutex::new(None),
         })
     }
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
-        self.accountant.try_allocate_for(
-            bytes,
-            "direct_read",
-            "hydrate_owned_image",
-            "Raise MEMORY_LIMIT to admit the complete committed read image.",
-        )?;
+        self.accountant
+            .try_allocate_for(bytes, self.subsystem, self.operation, self.hint)?;
         self.held.fetch_add(bytes, Ordering::SeqCst);
         Ok(())
     }
@@ -61,42 +90,43 @@ impl ImageMemory {
         operation()
     }
 }
-/// Source-page allocations may be evicted and reloaded during hydration.
-/// Conservatively own every admission until all source handles are closed.
-struct SourceMemory {
-    image: Arc<ImageMemory>,
-    held: AtomicUsize,
-}
-impl Drop for SourceMemory {
-    fn drop(&mut self) {
-        self.image.release(self.held.load(Ordering::SeqCst));
-    }
-}
-pub(crate) fn with_source_memory<R>(image: Arc<ImageMemory>, operation: impl FnOnce() -> R) -> R {
-    let source = Arc::new(SourceMemory {
-        image,
-        held: AtomicUsize::new(0),
-    });
-    redb::with_read_memory_admission(
-        Arc::new(move |bytes| match source.image.reserve(bytes) {
-            Ok(()) => {
-                source.held.fetch_add(bytes, Ordering::SeqCst);
-                Ok(())
-            }
-            Err(error) => {
-                *source.image.failure.lock() = Some(error);
-                Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory))
-            }
-        }),
-        operation,
-    )
-}
-
 impl Drop for ImageMemory {
     fn drop(&mut self) {
         self.accountant.release(self.held.load(Ordering::SeqCst));
     }
 }
+/// The memory an answer holds against its reader's limit for as long as the
+/// caller holds the answer: given back when its last copy is dropped. It is
+/// bookkeeping, not content, so it never makes two answers unequal.
+#[derive(Clone, Default)]
+pub(crate) struct AnswerCharge(Option<Arc<ImageMemory>>);
+
+impl AnswerCharge {
+    pub(crate) fn holding(charge: Arc<ImageMemory>) -> Self {
+        Self(Some(charge))
+    }
+
+    /// The bytes this answer holds.
+    pub(crate) fn held(&self) -> usize {
+        self.0.as_ref().map_or(0, |charge| charge.held())
+    }
+}
+
+impl std::fmt::Debug for AnswerCharge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("AnswerCharge")
+            .field(&self.held())
+            .finish()
+    }
+}
+
+impl PartialEq for AnswerCharge {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 thread_local! { static ACTIVE: RefCell<Vec<Arc<ImageMemory>>> = const { RefCell::new(Vec::new()) }; }
 pub(crate) fn reserve(bytes: usize) -> Result<()> {
     ACTIVE.with(|active| match active.borrow().last() {
@@ -697,341 +727,5 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Admitted<D> {
     }
     fn is_human_readable(&self) -> bool {
         self.0.is_human_readable()
-    }
-}
-
-// Size canonical JSON workspace without materializing a document or encoded
-// buffer. Text escaping and byte-to-JSON expansion are counted by serde itself.
-pub(crate) fn canonical_workspace<T: serde::Serialize>(values: &[T]) -> Result<usize> {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(bytes.len())
-                .ok_or_else(|| std::io::Error::other("canonical JSON length overflow"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut retained = values.len().saturating_mul(std::mem::size_of::<Vec<u8>>());
-    let mut workspace = 0usize;
-    for value in values {
-        let mut encoded = Count(0);
-        serde_json::to_writer(&mut encoded, value).map_err(|e| Error::Other(e.to_string()))?;
-        let document = value
-            .serialize(JsonMemory)
-            .map_err(|e| Error::Other(e.to_string()))?;
-        // Vec's geometric growth can hold its old and replacement buffer
-        // simultaneously. The final buffers of earlier records remain owned.
-        retained = retained.saturating_add(encoded.0.saturating_mul(2).max(128));
-        workspace = workspace.max(document.saturating_add(encoded.0));
-    }
-    Ok(retained.saturating_add(workspace))
-}
-
-struct JsonMemory;
-struct JsonCollection {
-    bytes: usize,
-    element_bytes: usize,
-}
-impl JsonCollection {
-    fn element<T: ?Sized + serde::Serialize>(
-        &mut self,
-        value: &T,
-    ) -> std::result::Result<(), serde_json::Error> {
-        self.bytes = self
-            .bytes
-            .saturating_add(self.element_bytes)
-            .saturating_add(value.serialize(JsonMemory)?);
-        Ok(())
-    }
-}
-impl serde::Serializer for JsonMemory {
-    type Ok = usize;
-    type Error = serde_json::Error;
-    type SerializeSeq = JsonCollection;
-    type SerializeTuple = JsonCollection;
-    type SerializeTupleStruct = JsonCollection;
-    type SerializeTupleVariant = JsonCollection;
-    type SerializeMap = JsonCollection;
-    type SerializeStruct = JsonCollection;
-    type SerializeStructVariant = JsonCollection;
-    fn serialize_bool(self, _: bool) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_i8(self, _: i8) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_i16(self, _: i16) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_i32(self, _: i32) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_i64(self, _: i64) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_i128(self, _: i128) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_u8(self, _: u8) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_u16(self, _: u16) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_u32(self, _: u32) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_u64(self, _: u64) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_u128(self, _: u128) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_f32(self, _: f32) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_f64(self, _: f64) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_char(self, value: char) -> std::result::Result<usize, Self::Error> {
-        Ok(value.len_utf8())
-    }
-    fn serialize_str(self, value: &str) -> std::result::Result<usize, Self::Error> {
-        Ok(value.len())
-    }
-    fn serialize_bytes(self, value: &[u8]) -> std::result::Result<usize, Self::Error> {
-        Ok(value
-            .len()
-            .saturating_mul(std::mem::size_of::<serde_json::Value>()))
-    }
-    fn serialize_none(self) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_some<T: ?Sized + serde::Serialize>(
-        self,
-        value: &T,
-    ) -> std::result::Result<usize, Self::Error> {
-        value.serialize(self)
-    }
-    fn serialize_unit(self) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_unit_struct(self, _: &'static str) -> std::result::Result<usize, Self::Error> {
-        Ok(0)
-    }
-    fn serialize_unit_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        variant: &'static str,
-    ) -> std::result::Result<usize, Self::Error> {
-        Ok(variant.len())
-    }
-    fn serialize_newtype_struct<T: ?Sized + serde::Serialize>(
-        self,
-        _: &'static str,
-        value: &T,
-    ) -> std::result::Result<usize, Self::Error> {
-        value.serialize(self)
-    }
-    fn serialize_newtype_variant<T: ?Sized + serde::Serialize>(
-        self,
-        _: &'static str,
-        _: u32,
-        variant: &'static str,
-        value: &T,
-    ) -> std::result::Result<usize, Self::Error> {
-        Ok(1024usize
-            .saturating_add(variant.len())
-            .saturating_add(value.serialize(self)?))
-    }
-    fn serialize_seq(self, len: Option<usize>) -> std::result::Result<JsonCollection, Self::Error> {
-        Ok(JsonCollection {
-            bytes: len
-                .unwrap_or(4)
-                .saturating_mul(std::mem::size_of::<serde_json::Value>()),
-            element_bytes: if len.is_some() {
-                0
-            } else {
-                4 * std::mem::size_of::<serde_json::Value>()
-            },
-        })
-    }
-    fn serialize_tuple(self, len: usize) -> std::result::Result<JsonCollection, Self::Error> {
-        self.serialize_seq(Some(len))
-    }
-    fn serialize_tuple_struct(
-        self,
-        _: &'static str,
-        len: usize,
-    ) -> std::result::Result<JsonCollection, Self::Error> {
-        self.serialize_seq(Some(len))
-    }
-    fn serialize_tuple_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> std::result::Result<JsonCollection, Self::Error> {
-        let mut result = self.serialize_seq(Some(len))?;
-        result.bytes = result
-            .bytes
-            .saturating_add(1024)
-            .saturating_add(variant.len());
-        Ok(result)
-    }
-    fn serialize_map(self, _: Option<usize>) -> std::result::Result<JsonCollection, Self::Error> {
-        Ok(JsonCollection {
-            bytes: 1024,
-            element_bytes: 128,
-        })
-    }
-    fn serialize_struct(
-        self,
-        _: &'static str,
-        len: usize,
-    ) -> std::result::Result<JsonCollection, Self::Error> {
-        self.serialize_map(Some(len))
-    }
-    fn serialize_struct_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> std::result::Result<JsonCollection, Self::Error> {
-        let mut result = self.serialize_map(Some(len))?;
-        result.bytes = result
-            .bytes
-            .saturating_add(1024)
-            .saturating_add(variant.len());
-        Ok(result)
-    }
-    fn collect_str<T: ?Sized + std::fmt::Display>(
-        self,
-        value: &T,
-    ) -> std::result::Result<usize, Self::Error> {
-        struct Length(usize);
-        impl std::fmt::Write for Length {
-            fn write_str(&mut self, value: &str) -> std::fmt::Result {
-                self.0 = self.0.saturating_add(value.len());
-                Ok(())
-            }
-        }
-        let mut length = Length(0);
-        std::fmt::write(&mut length, format_args!("{value}")).map_err(serde::ser::Error::custom)?;
-        Ok(length.0.saturating_mul(3).max(8))
-    }
-}
-impl serde::ser::SerializeSeq for JsonCollection {
-    type Ok = usize;
-    type Error = serde_json::Error;
-    fn serialize_element<T: ?Sized + serde::Serialize>(
-        &mut self,
-        value: &T,
-    ) -> std::result::Result<(), Self::Error> {
-        self.element(value)
-    }
-    fn end(self) -> std::result::Result<usize, Self::Error> {
-        Ok(self.bytes)
-    }
-}
-impl serde::ser::SerializeTuple for JsonCollection {
-    type Ok = usize;
-    type Error = serde_json::Error;
-    fn serialize_element<T: ?Sized + serde::Serialize>(
-        &mut self,
-        value: &T,
-    ) -> std::result::Result<(), Self::Error> {
-        self.element(value)
-    }
-    fn end(self) -> std::result::Result<usize, Self::Error> {
-        Ok(self.bytes)
-    }
-}
-impl serde::ser::SerializeTupleStruct for JsonCollection {
-    type Ok = usize;
-    type Error = serde_json::Error;
-    fn serialize_field<T: ?Sized + serde::Serialize>(
-        &mut self,
-        value: &T,
-    ) -> std::result::Result<(), Self::Error> {
-        self.element(value)
-    }
-    fn end(self) -> std::result::Result<usize, Self::Error> {
-        Ok(self.bytes)
-    }
-}
-impl serde::ser::SerializeTupleVariant for JsonCollection {
-    type Ok = usize;
-    type Error = serde_json::Error;
-    fn serialize_field<T: ?Sized + serde::Serialize>(
-        &mut self,
-        value: &T,
-    ) -> std::result::Result<(), Self::Error> {
-        self.element(value)
-    }
-    fn end(self) -> std::result::Result<usize, Self::Error> {
-        Ok(self.bytes)
-    }
-}
-impl serde::ser::SerializeMap for JsonCollection {
-    type Ok = usize;
-    type Error = serde_json::Error;
-    fn serialize_key<T: ?Sized + serde::Serialize>(
-        &mut self,
-        key: &T,
-    ) -> std::result::Result<(), Self::Error> {
-        // Numeric map keys are rendered as owned decimal strings.
-        self.bytes = self
-            .bytes
-            .saturating_add(40)
-            .saturating_add(key.serialize(JsonMemory)?);
-        Ok(())
-    }
-    fn serialize_value<T: ?Sized + serde::Serialize>(
-        &mut self,
-        value: &T,
-    ) -> std::result::Result<(), Self::Error> {
-        self.element(value)
-    }
-    fn end(self) -> std::result::Result<usize, Self::Error> {
-        Ok(self.bytes)
-    }
-}
-impl serde::ser::SerializeStruct for JsonCollection {
-    type Ok = usize;
-    type Error = serde_json::Error;
-    fn serialize_field<T: ?Sized + serde::Serialize>(
-        &mut self,
-        key: &'static str,
-        value: &T,
-    ) -> std::result::Result<(), Self::Error> {
-        self.bytes = self.bytes.saturating_add(key.len());
-        self.element(value)
-    }
-    fn end(self) -> std::result::Result<usize, Self::Error> {
-        Ok(self.bytes)
-    }
-}
-impl serde::ser::SerializeStructVariant for JsonCollection {
-    type Ok = usize;
-    type Error = serde_json::Error;
-    fn serialize_field<T: ?Sized + serde::Serialize>(
-        &mut self,
-        key: &'static str,
-        value: &T,
-    ) -> std::result::Result<(), Self::Error> {
-        self.bytes = self.bytes.saturating_add(key.len());
-        self.element(value)
-    }
-    fn end(self) -> std::result::Result<usize, Self::Error> {
-        Ok(self.bytes)
     }
 }

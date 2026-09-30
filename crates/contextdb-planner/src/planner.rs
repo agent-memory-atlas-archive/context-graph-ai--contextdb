@@ -28,6 +28,11 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             history: ct.history,
             delivery_manifest_tables: ct.delivery_manifest_tables.clone(),
             edge_discard: ct.edge_discard,
+            maintained_counts: ct
+                .maintained_counts
+                .as_ref()
+                .map(map_maintained_counts_declaration)
+                .transpose()?,
         })),
         Statement::AlterTable(at) => Ok(PhysicalPlan::AlterTable(AlterTablePlan {
             table: at.table.clone(),
@@ -94,6 +99,8 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             Ok(PhysicalPlan::SetMaintenancePollInterval(*milliseconds))
         }
         Statement::ShowMaintenancePollInterval => Ok(PhysicalPlan::ShowMaintenancePollInterval),
+        Statement::SetVectorServingCache(bytes) => Ok(PhysicalPlan::SetVectorServingCache(*bytes)),
+        Statement::ShowVectorServingCache => Ok(PhysicalPlan::ShowVectorServingCache),
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
         Statement::DeclareTenantTablePolicy(declaration) => Ok(
@@ -133,6 +140,38 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             Ok(PhysicalPlan::Pipeline(vec![]))
         }
     }
+}
+
+/// Map one parsed `MAINTAIN COUNT` declaration onto the engine's own sort
+/// direction. `DEFAULT` never reaches a CREATE (the parser refuses it there)
+/// and clears the declaration on an ALTER, so it has no projected form.
+pub fn map_maintained_counts_declaration(
+    declared: &contextdb_parser::ast::MaintainedCountsDecl,
+) -> Result<contextdb_core::MaintainedCounts> {
+    use contextdb_parser::ast::MaintainedCountsDecl;
+    Ok(match declared {
+        MaintainedCountsDecl::None => contextdb_core::MaintainedCounts::None,
+        MaintainedCountsDecl::AllPrefixes => contextdb_core::MaintainedCounts::AllPrefixes,
+        MaintainedCountsDecl::Lists(lists) => {
+            let mut mapped = Vec::with_capacity(lists.len());
+            for columns in lists {
+                let mut list = Vec::with_capacity(columns.len());
+                for (column, direction) in columns {
+                    list.push((
+                        column.clone(),
+                        map_parser_to_core_sort_direction(*direction)?,
+                    ));
+                }
+                mapped.push(list);
+            }
+            contextdb_core::MaintainedCounts::Lists(mapped)
+        }
+        MaintainedCountsDecl::Default => {
+            return Err(Error::PlanError(
+                "MAINTAIN COUNT DEFAULT clears a declaration and has no projected form".to_string(),
+            ));
+        }
+    })
 }
 
 fn extract_propagation_rules(
@@ -497,6 +536,11 @@ fn collect_row_columns(expr: &Expr, selected: &mut BTreeSet<String>) {
             collect_row_columns(pattern, selected);
         }
         Expr::InSubquery { expr, .. } => collect_row_columns(expr, selected),
+        Expr::Row(elements) => {
+            for element in elements {
+                collect_row_columns(element, selected);
+            }
+        }
         Expr::RowVectorSource { .. } | Expr::Literal(_) | Expr::Parameter(_) => {}
     }
 }
@@ -562,6 +606,7 @@ fn expr_contains_row_vector_source(expr: &Expr) -> bool {
             expr_contains_row_vector_source(expr)
                 || select_body_contains_row_vector_source(subquery)
         }
+        Expr::Row(elements) => elements.iter().any(expr_contains_row_vector_source),
         Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => false,
     }
 }

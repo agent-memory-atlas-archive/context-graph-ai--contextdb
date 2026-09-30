@@ -60,6 +60,25 @@ fn exact_search(db: &Database, scope: Uuid, query: Vec<f32>) -> Vec<Uuid> {
         .unwrap_or_else(|error| panic!("exact vector search: {error}")))
 }
 
+fn exact_search_at_snapshot(
+    db: &Database,
+    snapshot: contextdb_core::SnapshotId,
+    scope: Uuid,
+    query: Vec<f32>,
+) -> Vec<Uuid> {
+    ids(&db
+        .execute_at_snapshot(
+            "SELECT id FROM received_vector_items WHERE scope_id = $scope \
+             ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 1",
+            &params([
+                ("scope", Value::Uuid(scope)),
+                ("query", Value::Vector(query)),
+            ]),
+            snapshot,
+        )
+        .unwrap_or_else(|error| panic!("exact vector search at retained snapshot: {error}")))
+}
+
 fn indexed_search(db: &Database, scope: Uuid, query: Vec<f32>) -> Result<Vec<Uuid>, Error> {
     db.execute(
         "SELECT id FROM received_vector_items WHERE scope_id = $scope \
@@ -93,8 +112,8 @@ fn drive_maintenance(db: &Database) {
 }
 
 /// A complete received image replaces both raw vectors and their maintained
-/// routes.  Until finite maintenance creates a route for the new image,
-/// INDEXED must refuse rather than consult the receiver's old saved route.
+/// routes. A route retained for an older reader may continue serving only if
+/// its current-snapshot tail makes the replacement image complete.
 #[tokio::test]
 async fn complete_received_image_invalidates_stale_maintained_vector_generations() {
     let root = TempDir::new().expect("temporary durable edge directory");
@@ -103,13 +122,16 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
     let source = Arc::new(Database::open_memory());
     let edge = Arc::new(Database::open(&edge_path).expect("open durable receiver"));
     let scope = Uuid::from_u128(0xE101);
+    let sibling_scope = Uuid::from_u128(0xE104);
     let old_id = Uuid::from_u128(0xE102);
     let replacement_id = Uuid::from_u128(0xE103);
+    let sibling_id = Uuid::from_u128(0xE105);
 
     source
         .execute(SCHEMA, &empty())
         .expect("declare the source vector table");
     insert(&source, old_id, scope, vec![1.0, 0.0, 0.0]);
+    insert(&source, sibling_id, sibling_scope, vec![0.0, 0.0, 1.0]);
 
     let hub_identity = Arc::new(FabricIdentity::generate());
     let hub_node_id = hub_identity.node_id();
@@ -148,6 +170,13 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
             .expect("the receiver has a maintained route before replacement"),
         vec![old_id]
     );
+    assert_eq!(
+        indexed_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
+            .expect("the sibling partition also has a maintained route before replacement"),
+        vec![sibling_id]
+    );
+    let old_snapshot = edge.snapshot();
+    let old_pin = edge.pin_snapshot(old_snapshot);
 
     // The schema entry makes the next authenticated pull use the received
     // complete-image transaction. Its accepted rows now contain only the
@@ -181,13 +210,23 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
         vec![old_id],
         "the old vector owner is absent from the received replacement image"
     );
-    assert!(
-        matches!(
-            indexed_search(&edge, scope, vec![0.0, 1.0, 0.0]),
-            Err(Error::VectorIndexedRouteUnavailable { .. })
-        ),
-        "INDEXED must refuse until maintenance creates a route for the replacement image, \
-         rather than use the old base/change/catalog route"
+    assert_eq!(
+        indexed_search(&edge, scope, vec![0.0, 1.0, 0.0])
+            .expect("the retained chain is complete for the current replacement image"),
+        vec![replacement_id],
+        "the route retained for the older reader must merge the replacement tail and never \
+         return the superseded owner"
+    );
+    assert_eq!(
+        indexed_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
+            .expect("the retained chain remains complete for the unchanged sibling"),
+        vec![sibling_id],
+        "the full affected-table image preserves the unchanged sibling's current result"
+    );
+    assert_eq!(
+        exact_search_at_snapshot(&edge, old_snapshot, scope, vec![1.0, 0.0, 0.0]),
+        vec![old_id],
+        "the full-image publication and superseded-version prune preserve a pinned older snapshot"
     );
 
     drive_maintenance(&edge);
@@ -196,6 +235,12 @@ async fn complete_received_image_invalidates_stale_maintained_vector_generations
             .expect("finite maintenance creates the replacement route"),
         vec![replacement_id]
     );
+    assert_eq!(
+        indexed_search(&edge, sibling_scope, vec![0.0, 0.0, 1.0])
+            .expect("finite maintenance rebuilds the unchanged sibling for the full image"),
+        vec![sibling_id]
+    );
+    drop(old_pin);
 
     drop(client);
     shutdown.store(true, Ordering::SeqCst);

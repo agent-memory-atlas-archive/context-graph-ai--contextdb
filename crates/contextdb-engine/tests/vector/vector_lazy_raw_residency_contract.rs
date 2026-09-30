@@ -3,11 +3,11 @@
 //! but only the partition an operation actually needs may become resident.
 
 use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
-use contextdb_core::{Error, RowId, Value, VectorIndexRef, VectorPartitionKey};
+use contextdb_core::{ContextId, Error, RowId, Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use serial_test::serial;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -508,9 +508,13 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
         point_loads > 0,
         "the versioned graph candidate must use the point loader"
     );
-    assert_eq!(
-        point_loads, observed_unique_candidates,
-        "each distinct visible graph candidate requires exactly one native body score"
+    // The one search scores its candidates nearest first and stops once the
+    // page cannot change, so it point-loads the rows it returns and never more
+    // than the distinct candidates its graph walk handed back, each once.
+    assert!(
+        (1..=observed_unique_candidates).contains(&point_loads),
+        "native scoring point-loads only distinct visible graph candidates, each once: \
+         {point_loads} point loads for {observed_unique_candidates} distinct candidates"
     );
     assert!(
         point_loads <= observed_graph_candidates,
@@ -550,6 +554,102 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
         MANY_PARTITIONS * MANY_ROWS_PER_PARTITION,
     );
     drop(old_pin);
+}
+
+/// When the automatic route compares rows exhaustively, it answers inside the
+/// memory the database declared by reading each stored vector through its own
+/// point read, instead of loading a whole partition of vectors it has no room
+/// for. An exhaustive search the caller asked for outright is the control:
+/// the same ceiling refuses its complete-partition load with the typed memory
+/// refusal, which proves no whole partition fits.
+#[test]
+#[serial]
+fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
+    let root = TempDir::new().expect("temporary many-partition store directory");
+    let path = root.path().join("auto-exhaustive-streams.redb");
+    {
+        let db = Database::open(&path).expect("open many-partition fixture");
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        // Every admitted row sits below the automatic indexing threshold, so
+        // the automatic route is the exhaustive one for the whole statement.
+        db.execute(
+            &format!(
+                "CREATE TABLE raw_residency_items (\
+                 id UUID PRIMARY KEY, \
+                 scope_id UUID NOT NULL, \
+                 embedding VECTOR({MANY_VECTOR_DIMENSION}) PARTITION_KEY (scope_id) \
+                    MAX_PARTITIONS 8 SEARCH_MODE AUTO AUTO_INDEX_AT 5000\
+                 )"
+            ),
+            &empty(),
+        )
+        .expect("create the many-partition vector table");
+        for partition_ordinal in 0..MANY_PARTITIONS {
+            seed_many_partition(&db, partition_ordinal);
+        }
+        db.close().expect("close the fixture");
+    }
+
+    let db = Database::open(&path).expect("reopen with dormant raw bodies");
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    let query = params([("query", Value::Vector(many_vector(0)))]);
+    let exact_sql = "SELECT id FROM raw_residency_items \
+                     ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 2";
+    let auto_sql = "SELECT id FROM raw_residency_items \
+                    ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 2";
+    let exact = db
+        .execute(exact_sql, &query)
+        .expect("the exhaustive control answers while memory is unlimited");
+    assert_eq!(
+        result_ids(&exact),
+        vec![many_id(0, 0), many_id(0, 1)],
+        "the fixture's two nearest rows"
+    );
+    db.vector_store_for_test().evict_reloadable_raw_partitions();
+    assert_eq!(
+        db.vector_store_for_test()
+            .resident_raw_partition_count_for_test(),
+        0
+    );
+
+    let bytes_per_f32_body = MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>();
+    let minimum_bulk_reservation =
+        MANY_ROWS_PER_PARTITION * bytes_per_f32_body * 2 + bytes_per_f32_body * 2;
+    let settled_usage = db.accountant().usage().used;
+    db.set_memory_limit(Some(settled_usage + minimum_bulk_reservation - 1))
+        .expect("leave room for one stored vector at a time but not a whole partition");
+    let settled_usage = db.accountant().usage().used;
+
+    let refused = db
+        .execute(exact_sql, &query)
+        .expect_err("no whole partition fits under this ceiling");
+    assert!(
+        matches!(
+            &refused,
+            Error::MemoryBudgetExceeded { operation, .. }
+                if operation == "load_raw_vector_partition"
+        ),
+        "the control is refused at the complete-partition load: {refused:?}"
+    );
+
+    let auto = db.execute(auto_sql, &query).unwrap_or_else(|error| {
+        panic!(
+            "the automatic exhaustive find must answer inside the declared memory by reading \
+             one stored vector at a time, not load a whole partition: {error:?}"
+        )
+    });
+    assert_eq!(auto.rows, exact.rows, "the automatic route answers exactly");
+    assert_eq!(
+        db.vector_store_for_test()
+            .resident_raw_partition_count_for_test(),
+        0,
+        "streaming never installs a complete raw partition"
+    );
+    assert_eq!(
+        db.accountant().usage().used,
+        settled_usage,
+        "the find returns everything it charged"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1121,331 @@ fn id_only_candidate_route_step_1_counter_and_trace() {
     );
 }
 
+/// A composite index whose complete pushed key covers the candidate filter
+/// supplies the same identity-only route as a single-column index. The
+/// selected rows are hydrated only after global top-k chooses them.
+#[test]
+#[serial]
+fn composite_covering_index_supplies_vector_candidate_identities_without_row_bodies() {
+    let (_root, db) = open_lang_residency_fixture(true);
+    db.execute(
+        "CREATE INDEX lang_scope_idx ON raw_residency_items (lang, scope_id)",
+        &empty(),
+    )
+    .expect("create the composite candidate index");
+
+    let query = params([
+        ("query", Value::Vector(lang_query(0))),
+        ("scope_0", Value::Uuid(lang_scope(0))),
+        ("scope_1", Value::Uuid(lang_scope(1))),
+        ("scope_2", Value::Uuid(lang_scope(2))),
+    ]);
+    let sql = "SELECT id FROM raw_residency_items \
+               WHERE lang = 'en' AND scope_id IN ($scope_0, $scope_1, $scope_2) \
+               ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
+    let exact_sql = sql.replace("USE VECTOR INDEXED", "USE VECTOR EXACT");
+    let expected = db
+        .execute(&exact_sql, &query)
+        .expect("the exact route establishes the ranked answer");
+
+    let before = db.__candidate_derivation_counters_for_test();
+    let bounded = bounded::execute(&db, &bounded_request(sql, query))
+        .expect("the bounded composite-index route answers");
+    let after = db.__candidate_derivation_counters_for_test();
+
+    assert_eq!(bounded.result.rows, expected.rows);
+    assert_eq!(
+        after - before,
+        0,
+        "a fully pushed composite candidate index must hand off identities without row bodies"
+    );
+    assert_eq!(
+        bounded.result.trace.index_used.as_deref(),
+        Some("lang_scope_idx")
+    );
+    assert_eq!(
+        bounded
+            .result
+            .trace
+            .predicates_pushed
+            .iter()
+            .map(|column| column.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["lang", "scope_id"]
+    );
+}
+
+fn composite_strict_range_fixture() -> (Database, Uuid) {
+    let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.execute(
+        "CREATE TABLE composite_range_candidates (\
+         id UUID PRIMARY KEY, \
+         context_id UUID NOT NULL CONTEXT_ID, \
+         boundary INTEGER NOT NULL, \
+         tie INTEGER NOT NULL, \
+         embedding VECTOR(2) SEARCH_MODE INDEXED AUTO_INDEX_AT 1)",
+        &empty(),
+    )
+    .expect("create the strict composite-range vector fixture");
+    let allowed_context = Uuid::from_u128(0xCA40);
+    let hidden_context = Uuid::from_u128(0xCA41);
+    for (ordinal, context, boundary, embedding) in [
+        (1_u128, allowed_context, 100_i64, vec![1.0, 0.0]),
+        (2, hidden_context, 100, vec![1.0, 0.001]),
+        (3, allowed_context, 101, vec![0.9, 0.1]),
+        (4, hidden_context, 102, vec![0.99, 0.01]),
+        (5, allowed_context, 99, vec![0.8, 0.2]),
+        (6, hidden_context, 98, vec![0.98, 0.02]),
+    ] {
+        db.execute(
+            "INSERT INTO composite_range_candidates \
+             (id, context_id, boundary, tie, embedding) \
+             VALUES ($id, $context, $boundary, $tie, $embedding)",
+            &params([
+                ("id", Value::Uuid(Uuid::from_u128(0xCA40_0000 + ordinal))),
+                ("context", Value::Uuid(context)),
+                ("boundary", Value::Int64(boundary)),
+                ("tie", Value::Int64(ordinal as i64)),
+                ("embedding", Value::Vector(embedding)),
+            ]),
+        )
+        .expect("insert one strict composite-range candidate");
+    }
+    let vector_index = VectorIndexRef::new("composite_range_candidates", "embedding");
+    for _ in 0..MAX_MAINTENANCE_CYCLES {
+        if db
+            .vector_store_for_test()
+            .partition_infos(&vector_index)
+            .expect("inspect the unpartitioned vector route")
+            .iter()
+            .any(|info| info.graph_available)
+        {
+            return (db, allowed_context);
+        }
+        db.run_maintenance_cycle()
+            .expect("one finite maintenance cycle publishes the graph");
+    }
+    panic!("maintenance did not publish the strict composite-range graph");
+}
+
+fn assert_strict_composite_range_matches_exact(
+    direction: &str,
+    predicate: &str,
+    expected: &[Uuid],
+    expected_visible: &[Uuid],
+) {
+    let (db, allowed_context) = composite_strict_range_fixture();
+    let query = params([("query", Value::Vector(vec![1.0, 0.0]))]);
+    let exact_sql = format!(
+        "SELECT id FROM composite_range_candidates WHERE {predicate} \
+         ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10"
+    );
+    let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR INDEXED");
+
+    let exact = db
+        .execute(&exact_sql, &query)
+        .expect("ordinary exact scoring establishes the strict-range answer");
+    assert_eq!(
+        result_ids(&exact),
+        expected,
+        "the exact control must return every row inside the strict range"
+    );
+    let scoped = db.scoped_with_constraints(
+        Some(BTreeSet::from([ContextId::new(allowed_context)])),
+        None,
+        None,
+    );
+    let scoped_exact = scoped
+        .execute(&exact_sql, &query)
+        .expect("the restricted exact route establishes the visible answer");
+    assert_eq!(
+        result_ids(&scoped_exact),
+        expected_visible,
+        "the exact control must remove every unauthorized range match"
+    );
+    db.execute(
+        &format!(
+            "CREATE INDEX boundary_tie_idx ON composite_range_candidates \
+             (boundary {direction}, tie ASC)"
+        ),
+        &empty(),
+    )
+    .expect("create the composite candidate index after the exact controls");
+    let bounded = bounded::execute(&db, &bounded_request(&indexed_sql, query.clone()))
+        .expect("bounded indexed scoring answers the strict composite range");
+    assert_eq!(
+        result_ids(&bounded.result),
+        result_ids(&exact),
+        "the composite index must not admit the excluded boundary"
+    );
+    assert!(
+        result_ids(&bounded.result)
+            .into_iter()
+            .all(|id| id != Uuid::from_u128(0xCA40_0001) && id != Uuid::from_u128(0xCA40_0002)),
+        "rows equal to the strict boundary must remain excluded"
+    );
+
+    let scoped_bounded = bounded::execute(&scoped, &bounded_request(&indexed_sql, query.clone()))
+        .expect("the restricted bounded route answers");
+    assert_eq!(
+        result_ids(&scoped_bounded.result),
+        result_ids(&scoped_exact),
+        "range correction must preserve authorization before top-k"
+    );
+    let hidden_ids = [
+        Uuid::from_u128(0xCA40_0002),
+        Uuid::from_u128(0xCA40_0004),
+        Uuid::from_u128(0xCA40_0006),
+    ];
+    assert!(
+        result_ids(&scoped_bounded.result)
+            .iter()
+            .all(|id| !hidden_ids.contains(id)),
+        "the restricted answer must not include an unauthorized candidate"
+    );
+}
+
+#[test]
+#[serial]
+fn asc_composite_strict_greater_than_matches_exact_without_boundary_rows() {
+    assert_strict_composite_range_matches_exact(
+        "ASC",
+        "boundary > 100",
+        &[Uuid::from_u128(0xCA40_0004), Uuid::from_u128(0xCA40_0003)],
+        &[Uuid::from_u128(0xCA40_0003)],
+    );
+}
+
+#[test]
+#[serial]
+fn desc_composite_strict_less_than_matches_exact_without_boundary_rows() {
+    assert_strict_composite_range_matches_exact(
+        "DESC",
+        "boundary < 100",
+        &[Uuid::from_u128(0xCA40_0006), Uuid::from_u128(0xCA40_0005)],
+        &[Uuid::from_u128(0xCA40_0005)],
+    );
+}
+
+#[test]
+#[serial]
+fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
+    for direction in ["ASC", "DESC"] {
+        let db = Database::open_memory();
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        for (table, nullability) in [
+            ("nullable_lower_range", ""),
+            ("required_lower_range", "NOT NULL"),
+        ] {
+            db.execute(
+                &format!(
+                    "CREATE TABLE {table} (\
+                     id UUID PRIMARY KEY, \
+                     boundary INTEGER {nullability}, \
+                     embedding VECTOR(2) SEARCH_MODE INDEXED AUTO_INDEX_AT 1)"
+                ),
+                &empty(),
+            )
+            .expect("declare a single-column lower-range fixture");
+            db.execute(
+                &format!("CREATE INDEX {table}_boundary_idx ON {table} (boundary {direction})"),
+                &empty(),
+            )
+            .expect("declare the directed single-column index");
+            for (ordinal, boundary, embedding) in [
+                (1_u128, Value::Int64(100), vec![0.8, 0.2]),
+                (2, Value::Int64(101), vec![0.9, 0.1]),
+                (3, Value::Int64(102), vec![0.7, 0.3]),
+            ] {
+                db.execute(
+                    &format!(
+                        "INSERT INTO {table} (id, boundary, embedding) \
+                         VALUES ($id, $boundary, $embedding)"
+                    ),
+                    &params([
+                        ("id", Value::Uuid(Uuid::from_u128(0xCA50_0000 + ordinal))),
+                        ("boundary", boundary),
+                        ("embedding", Value::Vector(embedding)),
+                    ]),
+                )
+                .expect("insert a finite lower-range candidate");
+            }
+            if table == "nullable_lower_range" {
+                db.execute(
+                    &format!(
+                        "INSERT INTO {table} (id, boundary, embedding) \
+                         VALUES ($id, NULL, $embedding)"
+                    ),
+                    &params([
+                        ("id", Value::Uuid(Uuid::from_u128(0xCA50_00FF))),
+                        ("embedding", Value::Vector(vec![1.0, 0.0])),
+                    ]),
+                )
+                .expect("insert the NULL-tail candidate closest to the query");
+            }
+        }
+        for _ in 0..MAX_MAINTENANCE_CYCLES {
+            db.run_maintenance_cycle()
+                .expect("publish the finite fixture graphs");
+            let all_ready = ["nullable_lower_range", "required_lower_range"]
+                .into_iter()
+                .all(|table| {
+                    db.vector_store_for_test()
+                        .partition_infos(&VectorIndexRef::new(table, "embedding"))
+                        .expect("inspect one unpartitioned vector route")
+                        .iter()
+                        .any(|info| info.graph_available)
+                });
+            if all_ready {
+                break;
+            }
+        }
+
+        for operator in [">", ">="] {
+            for (table, should_materialize) in [
+                ("nullable_lower_range", true),
+                ("required_lower_range", false),
+            ] {
+                let query = params([("query", Value::Vector(vec![1.0, 0.0]))]);
+                let exact_sql = format!(
+                    "SELECT id FROM {table} WHERE boundary {operator} 100 \
+                     ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10"
+                );
+                let indexed_sql = exact_sql.replace("USE VECTOR EXACT", "USE VECTOR INDEXED");
+                let exact = db
+                    .execute(&exact_sql, &query)
+                    .expect("the exact route establishes SQL NULL semantics");
+                let before = db.__candidate_derivation_counters_for_test();
+                let indexed = bounded::execute(&db, &bounded_request(&indexed_sql, query))
+                    .expect("the directed indexed route answers");
+                let materialized = db.__candidate_derivation_counters_for_test() - before;
+                assert_eq!(
+                    indexed.result.rows, exact.rows,
+                    "{direction} {operator} must agree with the explicit exact oracle for {table}"
+                );
+                assert!(
+                    result_ids(&indexed.result)
+                        .iter()
+                        .all(|id| *id != Uuid::from_u128(0xCA50_00FF)),
+                    "SQL ordered comparisons must exclude the NULL-tail identity"
+                );
+                if should_materialize {
+                    assert!(
+                        materialized > 0,
+                        "nullable {direction} {operator} must retain row-level SQL checks"
+                    );
+                } else {
+                    assert_eq!(
+                        materialized, 0,
+                        "NOT NULL {direction} {operator} keeps the finite identity-only optimization"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// An index chooses a driving predicate; other predicates on that same key
 /// still decide the answer, and SQL NULL never satisfies a comparison.
 #[test]
@@ -1081,7 +1506,9 @@ fn candidate_identity_optimization_preserves_repeated_terms_and_null_comparisons
             "SELECT id FROM candidate_semantics WHERE {predicate} ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 10"
         );
         let ordinary = db.execute(&sql, &query).unwrap();
+        let before = db.__candidate_derivation_counters_for_test();
         let bounded = bounded::execute(&db, &bounded_request(&sql, query.clone())).unwrap();
+        let materialized = db.__candidate_derivation_counters_for_test() - before;
         assert_eq!(
             result_ids(&ordinary)
                 .into_iter()
@@ -1096,6 +1523,12 @@ fn candidate_identity_optimization_preserves_repeated_terms_and_null_comparisons
             expected,
             "bounded: {predicate}"
         );
+        if predicate == "lang < 'fr'" {
+            assert_eq!(
+                materialized, 0,
+                "nullable < keeps the identity-only candidate route because NULL is outside the physical range"
+            );
+        }
     }
 }
 

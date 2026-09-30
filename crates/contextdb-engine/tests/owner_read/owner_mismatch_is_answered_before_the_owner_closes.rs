@@ -139,6 +139,11 @@ impl LiveOwner {
             test_hooks: Some(OwnerReadTestHooks {
                 clock: Arc::new(clock.clone()),
                 drain_started,
+                active_request_registered: None,
+                accept_thread_exited: None,
+                accept_thread_joined: None,
+                service_dropped: None,
+                quiescent_stop: None,
             }),
         };
         let listener = ValidatedOwnerListener::new(ChannelPathFacts {

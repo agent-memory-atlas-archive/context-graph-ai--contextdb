@@ -1,10 +1,38 @@
 //! Current protocol-seven guards for schema provenance and conflict shape.
 
+use contextdb_core::Incarnation;
 use contextdb_core::{Lsn, Value};
 use contextdb_server::protocol::{
-    PROTOCOL_VERSION, WireChangeSet, WireConflict, WireDdlChange, WireDdlProvenance,
+    PROTOCOL_VERSION, WireChangeSet, WireConflict, WireDdlAuthor, WireDdlChange, WireDdlProvenance,
     WireNaturalKey, canonical_ddl_provenance_digest, validate_wire_ddl_provenance,
 };
+
+/// The author block every schema record carries: the identity that wrote the
+/// record and its own signature over it. These guards are about the wire SHAPE
+/// the validator enforces, so the signature here is only signature-shaped --
+/// checking it against the author's public key is the engine's job, and the
+/// engine's own peer journeys prove it.
+fn authored(
+    node_id: &str,
+    source_ddl_lsn: Lsn,
+    ordinal: u32,
+    table: &str,
+    table_generation: u64,
+    digest: &[u8],
+) -> WireDdlAuthor {
+    WireDdlAuthor {
+        node_id: node_id.to_string(),
+        incarnation: Incarnation(1),
+        source_ddl_lsn,
+        ordinal,
+        table: Some(table.to_string()),
+        table_generation: Some(table_generation),
+        digest: digest.to_vec(),
+        attestation: vec![0x5a; 64],
+        // Each fixture record is its author's whole one-statement unit.
+        unit_statements: 1,
+    }
+}
 
 fn wire_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -20,13 +48,23 @@ fn nonempty_schema_provenance_round_trips_and_validates() {
         composite_foreign_keys: Vec::new(),
         composite_unique: Vec::new(),
     };
+    let digest = canonical_ddl_provenance_digest(&ddl, Lsn(9), 0, Some("empty_recreated"), Some(2))
+        .expect("canonical provenance digest");
     let provenance = WireDdlProvenance {
         source_ddl_lsn: Lsn(9),
         ordinal: 0,
         table: Some("empty_recreated".to_string()),
         table_generation: Some(2),
-        digest: canonical_ddl_provenance_digest(&ddl, Lsn(9), 0, Some("empty_recreated"), Some(2))
-            .expect("canonical provenance digest"),
+        digest: digest.clone(),
+        author: Some(authored(
+            &"a1".repeat(32),
+            Lsn(9),
+            0,
+            "empty_recreated",
+            2,
+            &digest,
+        )),
+        unattested: false,
     };
     let wire = WireChangeSet {
         ddl: vec![ddl],
@@ -47,6 +85,39 @@ fn nonempty_schema_provenance_round_trips_and_validates() {
 }
 
 #[test]
+fn unattested_schema_marker_survives_the_compact_wire_encoding() {
+    let ddl = WireDdlChange::DropTable {
+        name: "relayed_notes".to_string(),
+    };
+    let wire = WireChangeSet {
+        ddl: vec![ddl.clone()],
+        ddl_lsn: vec![Lsn(9)],
+        ddl_provenance: vec![WireDdlProvenance {
+            source_ddl_lsn: Lsn(9),
+            ordinal: 0,
+            table: Some("relayed_notes".to_string()),
+            table_generation: Some(1),
+            digest: canonical_ddl_provenance_digest(
+                &ddl,
+                Lsn(9),
+                0,
+                Some("relayed_notes"),
+                Some(1),
+            )
+            .expect("canonical provenance digest"),
+            author: None,
+            unattested: true,
+        }],
+        ..WireChangeSet::default()
+    };
+    validate_wire_ddl_provenance(&wire).expect("explicit unattested schema shape");
+    let bytes = rmp_serde::to_vec(&wire).expect("encode unattested schema");
+    let decoded: WireChangeSet = rmp_serde::from_slice(&bytes).expect("decode unattested schema");
+    assert_eq!(decoded, wire);
+    validate_wire_ddl_provenance(&decoded).expect("the marker survives relay encoding");
+}
+
+#[test]
 fn schema_provenance_rejects_missing_source_lsn_before_ordinal_lookup() {
     let ddl = WireDdlChange::DropTable {
         name: "memories".to_string(),
@@ -64,6 +135,16 @@ fn schema_provenance_rejects_missing_source_lsn_before_ordinal_lookup() {
             table_generation: Some(2),
             digest: canonical_ddl_provenance_digest(&ddl, Lsn(9), 0, Some("memories"), Some(2))
                 .expect("canonical provenance digest"),
+            author: Some(authored(
+                &"b2".repeat(32),
+                Lsn(9),
+                0,
+                "memories",
+                2,
+                &canonical_ddl_provenance_digest(&ddl, Lsn(9), 0, Some("memories"), Some(2))
+                    .expect("canonical provenance digest"),
+            )),
+            unattested: false,
         }],
         manifests: Vec::new(),
         purges: Vec::new(),
@@ -106,6 +187,25 @@ fn filtered_schema_entry_keeps_its_original_nonzero_ordinal() {
                 Some(1),
             )
             .expect("canonical provenance digest"),
+            // The delivering peer's own position keeps its ordinal 1; the
+            // author's signed account is its own whole one-statement unit, as
+            // every delivered author unit must be.
+            author: Some(authored(
+                &"c3".repeat(32),
+                Lsn(17),
+                0,
+                "pulled_memories",
+                1,
+                &canonical_ddl_provenance_digest(
+                    &ddl,
+                    Lsn(17),
+                    0,
+                    Some("pulled_memories"),
+                    Some(1),
+                )
+                .expect("canonical provenance digest"),
+            )),
+            unattested: false,
         }],
         manifests: Vec::new(),
         purges: Vec::new(),

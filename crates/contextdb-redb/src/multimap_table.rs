@@ -894,6 +894,8 @@ impl<V: Key + 'static> Drop for MultimapValue<'_, V> {
                     .free_if_uncommitted(*page, &mut allocated_pages)
                 {
                     freed_pages.push(*page);
+                    #[cfg(feature = "test-seams")]
+                    crate::commit_work::note_freed_page();
                 }
             }
         }

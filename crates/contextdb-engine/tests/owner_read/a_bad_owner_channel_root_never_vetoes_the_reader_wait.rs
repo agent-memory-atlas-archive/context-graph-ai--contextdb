@@ -29,18 +29,17 @@
 
 use contextdb_core::Value;
 use contextdb_core::read_contract::{OwnerReadCancellation, ReadRoute};
+use contextdb_engine::local_transport::{channel_socket_path, derive_channel_address};
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
-    RawRedbWriterOpenObservation, try_raw_redb_writer_open_for_test,
+    RawRedbWriterOpenObservation, ReaderSourceStartPause, pause_readers_at_source_start_for_test,
+    reader_breadcrumb_runtime_root_for_test, try_raw_redb_writer_open_for_test,
 };
 use contextdb_engine::persistence::{ReaderReleaseWait, wait_for_reader_release_in_runtime_dir};
-use contextdb_engine::{
-    Database, ReadPhase, ReadProgress, ReadProgressObserver, ReadSession, ReadSessionOptions,
-};
+use contextdb_engine::{Database, ReadSession, ReadSessionOptions};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 /// Failsafe only. Nothing here asserts how long a wake took; this turns a wait
@@ -50,8 +49,8 @@ const WATCHDOG: Duration = Duration::from_secs(60);
 /// how a journey establishes that the wait is genuinely blocked on the holder
 /// rather than having already answered.
 const PARKED: Duration = Duration::from_secs(2);
-/// Enough committed bytes that loading the image reports its progress at least
-/// once, which is where a reader can be parked while it holds the store.
+/// A store with real committed content, so the load these journeys stop a
+/// reader inside is a real one and not an empty file's.
 const WIDE_ROWS: usize = 8;
 const WIDE_ROW_BYTES: usize = 512 * 1024;
 
@@ -65,19 +64,25 @@ fn readers_runtime_directory(inside: &Path) -> PathBuf {
     std::fs::canonicalize(&root).expect("resolve it the way the store will")
 }
 
-/// Make the reader's diagnostic notes unpublishable, so the only thing left
-/// that can answer "is anyone holding this store" is the hold itself.
+/// Make this store's diagnostic notes unpublishable without invalidating the
+/// supplied runtime root. The root itself must stay owner-only so the reader
+/// can open and hold the store; its per-store breadcrumb directory is readable
+/// but not owner-only, so breadcrumb publication is refused.
 ///
-/// The directory is present and readable; it simply is not owner-only, which
-/// is the condition a reader refuses to publish a breadcrumb into. Nothing
-/// about the reader's hold on the store changes.
-fn make_breadcrumbs_unpublishable(runtime_root: &Path) {
-    let directory = runtime_root.join("contextdb");
-    if !directory.exists() {
-        std::fs::create_dir(&directory).expect("create the diagnostic directory");
-    }
+/// The production-selected coordination directory is passed here: the
+/// platform directory when available, else the reader's supplied directory.
+fn make_breadcrumbs_unpublishable(runtime_root: &Path, store: &Path) -> PathBuf {
+    let address = derive_channel_address(store).expect("derive this store's registry address");
+    let name = address
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let directory = runtime_root.join(name);
+    std::fs::create_dir(&directory).expect("create the store's breadcrumb directory");
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750))
-        .expect("make the diagnostic directory one no reader will publish into");
+        .expect("make the store's breadcrumb directory refuse publication");
+    directory
 }
 
 /// A runtime root an operator never created.
@@ -127,75 +132,52 @@ fn idle_store(directory: &Path, name: &str) -> PathBuf {
     path
 }
 
-#[derive(Default)]
+/// A real direct reader, stopped where its read-image source starts -- the
+/// first production point inside the load-time hold, before any registration
+/// is published -- and let go when the journey says so.
+///
+/// Nothing here manufactures a holder. The reader is an ordinary one, holding
+/// the store exactly as any reader does; the store simply stops it at that
+/// point until this handle releases it.
 struct ParkingReader {
-    entered: (Mutex<bool>, Condvar),
-    release: (Mutex<bool>, Condvar),
-    parked: AtomicBool,
+    /// This journey's own pause over its own store: the only handle that can
+    /// free the reader it stopped, and no handle at all on anyone else's.
+    pause: ReaderSourceStartPause,
+    ticket: u64,
 }
 
 impl ParkingReader {
-    fn wait_until_holding(&self) {
-        let (flag, signal) = &self.entered;
-        let mut entered = flag.lock().expect("parked reader state");
-        while !*entered {
-            let (next, timed_out) = signal
-                .wait_timeout(entered, WATCHDOG)
-                .expect("parked reader condvar");
-            entered = next;
-            assert!(
-                !timed_out.timed_out() || *entered,
-                "the reader never reported loading the store, so nothing ever held it"
-            );
-        }
-    }
-
     fn let_go(&self) {
-        let (flag, signal) = &self.release;
-        *flag.lock().expect("parked reader state") = true;
-        signal.notify_all();
+        self.pause.release(self.ticket);
     }
 }
 
-impl ReadProgressObserver for ParkingReader {
-    fn progress(&self, progress: ReadProgress) {
-        if progress.phase != ReadPhase::Hydrating || self.parked.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        {
-            let (flag, signal) = &self.entered;
-            *flag.lock().expect("parked reader state") = true;
-            signal.notify_all();
-        }
-        let (flag, signal) = &self.release;
-        let mut released = flag.lock().expect("parked reader state");
-        while !*released {
-            released = signal.wait(released).expect("parked reader condvar");
-        }
+/// A journey that came apart before it let its reader go still lets it go, so
+/// a failed assertion leaves no reading thread stopped in the store.
+impl Drop for ParkingReader {
+    fn drop(&mut self) {
+        self.let_go();
     }
 }
 
 fn park_a_reader(path: &Path, runtime: &Path) -> (Arc<ParkingReader>, std::thread::JoinHandle<()>) {
-    let parking = Arc::new(ParkingReader::default());
-    let observer: Arc<dyn ReadProgressObserver> = parking.clone();
+    let pause = pause_readers_at_source_start_for_test(path);
     let path = path.to_path_buf();
     let runtime = runtime.to_path_buf();
     let holding = std::thread::spawn(move || {
-        let session = ReadSession::open_with_progress_in_runtime_dir(
-            &path,
-            ReadSessionOptions::default(),
-            Some(runtime),
-            observer,
-        )
-        .expect("an idle store is readable");
+        let session =
+            ReadSession::open_in_runtime_dir(&path, ReadSessionOptions::default(), Some(runtime))
+                .expect("an idle store is readable");
         assert_eq!(
             session.route(),
             ReadRoute::File,
             "a direct reader is what holds the store; an owner route holds nothing"
         );
     });
-    parking.wait_until_holding();
-    (parking, holding)
+    let ticket = pause
+        .wait_for_paused_reader(WATCHDOG)
+        .expect("the reader never started its read-image source, so nothing ever held the store");
+    (Arc::new(ParkingReader { pause, ticket }), holding)
 }
 
 /// The definitive fact, asked of the storage engine itself.
@@ -237,11 +219,20 @@ fn the_wait_follows_the_hold_despite(root_kind: &str, make_root: fn(&Path) -> Pa
     let directory = tempfile::TempDir::new().expect("task-scoped bad-root directory");
     let readers_runtime = readers_runtime_directory(directory.path());
     let path = idle_store(directory.path(), "bad-root.db");
-    make_breadcrumbs_unpublishable(&readers_runtime);
+    let coordination_runtime =
+        reader_breadcrumb_runtime_root_for_test().unwrap_or_else(|| readers_runtime.clone());
+    let breadcrumb_directory = make_breadcrumbs_unpublishable(&coordination_runtime, &path);
     let root = make_root(directory.path());
 
     let (parking, holding) = park_a_reader(&path, &readers_runtime);
     assert_really_held(&path, "a reader parked inside its load");
+    assert_eq!(
+        std::fs::read_dir(&breadcrumb_directory)
+            .expect("inspect the obstructed breadcrumb directory")
+            .count(),
+        0,
+        "the parked reader must not have published a breadcrumb into this store's registry"
+    );
 
     let heard = wait_in_thread(&path, root.clone());
     if let Ok(early) = heard.recv_timeout(PARKED) {
@@ -266,6 +257,12 @@ fn the_wait_follows_the_hold_despite(root_kind: &str, make_root: fn(&Path) -> Pa
          answered {}",
         describe(&answer),
     );
+    std::fs::set_permissions(
+        &breadcrumb_directory,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("restore the breadcrumb directory after the wait");
+    std::fs::remove_dir(&breadcrumb_directory).expect("remove the empty breadcrumb obstruction");
 }
 
 /// Hand a deliberately unreadable fixture back before the task-scoped
@@ -316,4 +313,31 @@ fn a_bad_owner_channel_root_does_not_make_an_unheld_store_look_held() {
         "nobody is holding this store, so there is nothing to wait for, but the wait answered {}",
         describe(&answer),
     );
+}
+
+/// The root itself is usable, while this store's channel pathname is a regular
+/// file. This must not decide a reader-release wait. The file is planted only
+/// after the reader has taken its real source hold, so no owner can bind there.
+/// The owner-channel path does not set the reader-registration root.
+#[test]
+fn a_malformed_channel_path_inside_a_usable_root_does_not_veto_the_reader_wait() {
+    let directory = tempfile::TempDir::new().expect("task-scoped malformed-channel directory");
+    let root = readers_runtime_directory(directory.path());
+    let path = idle_store(directory.path(), "malformed-channel.db");
+    let (parking, holding) = park_a_reader(&path, &root);
+    assert_really_held(&path, "reader before malformed channel publication");
+
+    let channel = channel_socket_path(&root, derive_channel_address(&path).unwrap()).unwrap();
+    std::fs::write(&channel, b"not a socket").expect("plant malformed channel pathname");
+    let heard = wait_in_thread(&path, root);
+    assert!(
+        heard.recv_timeout(PARKED).is_err(),
+        "a malformed channel path ended the wait before its reader released"
+    );
+    parking.let_go();
+    holding.join().expect("the direct reader completes");
+    assert!(matches!(
+        heard.recv_timeout(WATCHDOG).expect("wait answers release"),
+        ReaderReleaseWait::Released
+    ));
 }

@@ -71,8 +71,10 @@ impl ErrorClass {
             Error::SyncError(_)
             | Error::NotSyncEligible(_)
             | Error::SyncPushUnconfirmed { .. }
-            | Error::SyncReplayOfAcceptedDelete { .. } => ErrorClass::Sync,
+            | Error::SyncReplayOfAcceptedDelete { .. }
+            | Error::ReceivedSchemaAuthorshipUnavailable { .. } => ErrorClass::Sync,
             Error::StoreCorrupted { .. }
+            | Error::ReaderCoordinationUnavailable { .. }
             | Error::LegacyVectorStoreDetected { .. }
             | Error::DatabaseLocked { .. }
             | Error::ExportIo { .. }
@@ -143,6 +145,7 @@ pub(crate) fn read_failure_kind_wire_word(kind: ReadFailureKind) -> &'static str
         ReadFailureKind::ConstrainedHandleInspectionRefused => {
             "constrained_handle_inspection_refused"
         }
+        ReadFailureKind::AuthoritativeErasure => "authoritative_erasure",
     }
 }
 
@@ -788,6 +791,7 @@ pub(crate) fn events_status_body_document(
             "delivered": sink.delivered,
             "queued": sink.queued,
             "retried": sink.retried,
+            "uncertain": sink.uncertain,
             "permanent_failures": sink.permanent_failures,
             "examined": sink.examined,
         }));
@@ -1100,6 +1104,11 @@ fn vector_search_document(disclosure: &contextdb_engine::VectorSearchDisclosure)
         "refusal": disclosure.refusal,
         "recovery": disclosure.recovery,
         "query_source": disclosure.query_source.as_str(),
+        "global_candidate_budget": disclosure.global_candidate_budget,
+        "admission_evaluations": disclosure.admission_evaluations,
+        "expansion_evaluations": disclosure.expansion_evaluations,
+        "layers_admitted": disclosure.layers_admitted,
+        "budget_terminal": disclosure.budget_terminal,
         "partitions": disclosure.partition_hnsw.iter().map(|partition| json!({
             "partition": partition.partition,
             "hnsw_m": partition.hnsw_m,
@@ -1116,7 +1125,33 @@ mod tests {
     use super::*;
     use contextdb_engine::Database;
     use contextdb_engine::cli_render;
+    use contextdb_engine::{DirectEventsStatus, DirectSinkStatus};
     use std::collections::HashMap;
+
+    #[test]
+    fn event_status_json_reports_uncertainty_separately() {
+        let status = DirectEventsStatus {
+            event_types: Vec::new(),
+            sinks: vec![DirectSinkStatus {
+                name: "outgoing".to_owned(),
+                sink_type: "CALLBACK".to_owned(),
+                callback_registered: false,
+                delivered: 2,
+                queued: 1,
+                retried: 3,
+                uncertain: 4,
+                permanent_failures: 5,
+                examined: 6,
+            }],
+            routes: Vec::new(),
+            schedules: Vec::new(),
+        };
+        let doc = events_status_body_document(&status, false, None);
+        let sink = &doc["events_status"]["items"][0];
+        assert_eq!(sink["uncertain"], 4);
+        assert_eq!(sink["delivered"], 2);
+        assert_eq!(sink["permanent_failures"], 5);
+    }
 
     /// The `.schema` document for `table`, taken the way the CLI takes it:
     /// through the one metadata door, from the same body every route
@@ -1208,6 +1243,11 @@ mod tests {
             Error::StoreCorrupted {
                 path: "/tmp/store".to_string(),
                 reason: "truncated".to_string(),
+            },
+            Error::ReaderCoordinationUnavailable {
+                operation: "authoritative purge".to_string(),
+                path: "/tmp/runtime".to_string(),
+                reason: "registry is unreadable".to_string(),
             },
             Error::MemoryBudgetExceeded {
                 subsystem: "vector".to_string(),

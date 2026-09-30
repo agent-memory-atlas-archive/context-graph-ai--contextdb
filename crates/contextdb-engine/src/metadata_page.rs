@@ -251,6 +251,10 @@ pub(crate) fn event_status_items(
                 Value::Int64(sink.metrics.retried as i64),
             ),
             (
+                "uncertain".to_owned(),
+                Value::Int64(sink.metrics.uncertain as i64),
+            ),
+            (
                 "permanent_failures".to_owned(),
                 Value::Int64(sink.metrics.permanent_failures as i64),
             ),
@@ -359,6 +363,7 @@ pub(crate) fn promote_event_status_item(
             delivered: number("delivered"),
             queued: number("queued"),
             retried: number("retried"),
+            uncertain: number("uncertain"),
             permanent_failures: number("permanent_failures"),
             examined: number("examined"),
         }),
@@ -423,6 +428,7 @@ pub(crate) fn event_status_items_of(status: &DirectEventsStatus) -> Vec<Metadata
             ("delivered".to_owned(), Value::Int64(sink.delivered as i64)),
             ("queued".to_owned(), Value::Int64(sink.queued as i64)),
             ("retried".to_owned(), Value::Int64(sink.retried as i64)),
+            ("uncertain".to_owned(), Value::Int64(sink.uncertain as i64)),
             (
                 "permanent_failures".to_owned(),
                 Value::Int64(sink.permanent_failures as i64),

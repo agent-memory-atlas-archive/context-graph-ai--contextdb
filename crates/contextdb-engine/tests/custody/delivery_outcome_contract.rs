@@ -2445,8 +2445,13 @@ impl ObserveRestoreStatus {
                 _incarnation: contextdb_core::Incarnation,
                 #[serde(default)]
                 checkpoint: Option<serde::de::IgnoredAny>,
+                refused_schema_unit_digests: Vec<[u8; 32]>,
             }
             let probe: Probe = rmp_serde::from_slice(&envelope.payload).unwrap();
+            assert!(
+                probe.refused_schema_unit_digests.len() <= 128,
+                "the exact refused schema lookup remains bounded"
+            );
             self.observed.lock().unwrap().push(RestoreProbeObservation {
                 count: usize::from(probe.checkpoint.is_some()),
                 bytes: bytes.len(),

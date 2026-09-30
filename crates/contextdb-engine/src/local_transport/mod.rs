@@ -56,6 +56,8 @@ pub use deadlines::{
     handshake_with_deadline, probe_stale_with_deadline, receive_response_with_deadline,
     retry_route_with_deadline, serve_request_with_deadline, write_request_with_deadline,
 };
+#[cfg(any(test, feature = "test-seams"))]
+pub use deadlines::{reset_timer_threads_started_for_test, timer_threads_started_for_test};
 pub use engine_answer::{
     ALL_TAGS, BodyField, ReadChannelError, TAG_ACL_DENIED, TAG_BFS_DEPTH_EXCEEDED,
     TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND, TAG_COLUMN_TYPE_MISMATCH,
@@ -141,7 +143,7 @@ pub const LOCAL_PROTOCOL_MARKER: [u8; 20] = *b"contextdb-local-read";
 /// bytes that are not the shape it expected.
 ///
 /// The golden byte fixtures are what make such a change impossible to miss.
-pub const LOCAL_PROTOCOL_VERSION: u16 = 3;
+pub const LOCAL_PROTOCOL_VERSION: u16 = 4;
 /// A complete local payload may be no larger than four mebibytes.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
@@ -185,6 +187,18 @@ pub(crate) fn refusal(kind: ReadFailureKind) -> LocalTransportError {
 
 pub(crate) fn invalid_channel_data() -> LocalTransportError {
     refusal(ReadFailureKind::InvalidChannelData)
+}
+
+/// A response on an admitted owner connection can cross the reader's decode
+/// ceiling without being malformed. Preserve that one budget result; unreadable
+/// framing and payloads still name invalid channel data.
+pub(crate) fn response_decode_refusal(error: LocalTransportError) -> LocalTransportError {
+    match error {
+        LocalTransportError::Payload(framing::PayloadViolation::MemoryCeilingExceeded {
+            ..
+        }) => error,
+        _ => invalid_channel_data(),
+    }
 }
 
 /// The budget document a caller receives when the memory ceiling in force for

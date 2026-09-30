@@ -57,21 +57,50 @@ pub struct BoundedOrderedRowCursor {
     last_row_id: Option<RowId>,
     reverse: bool,
     /// Where in tree order the run this cursor was opened for begins and
-    /// ends, stated on the index's leading component. A cursor opened with no
-    /// declared run walks the whole index, which is what an ordering with no
-    /// predicate on the leading column asks for.
-    run_start: Bound<DirectedValue>,
-    run_end: Bound<DirectedValue>,
+    /// ends, stated on the complete equality prefix the predicate bound. A
+    /// cursor opened with no declared run walks the whole index, which is what
+    /// an ordering with no predicate on the leading column asks for.
+    run_start: Bound<IndexKey>,
+    run_end: Bound<IndexKey>,
+    /// Number of bound equality components. `run_end` may additionally hold
+    /// ascending NULL sentinels solely to seek a reverse walk to the end of
+    /// that prefix; membership remains decided by these real components.
+    run_prefix_len: usize,
     /// The runs still to walk once the current one is finished, held in the
     /// order the predicate named them and taken from the front. A predicate
     /// naming a LIST of values names one run per value: reading from the
     /// least listed value to the greatest instead reads every key in between
     /// and rejects it afterwards. A range names a single run and leaves this
     /// empty.
-    pending_runs: std::collections::VecDeque<(Bound<DirectedValue>, Bound<DirectedValue>)>,
+    pending_runs: std::collections::VecDeque<(Bound<IndexKey>, Bound<IndexKey>)>,
     retained_key_bytes: usize,
     key_generation: u64,
     exhausted: bool,
+    /// Opaque durable-source position. The engine's retained file source owns
+    /// the encoding; the relational cursor only keeps it between pulls.
+    source_key: Option<Vec<u8>>,
+    /// Opaque position in a retained source's authenticated run cache. The
+    /// relational layer never interprets the cache; it only keeps one run's
+    /// continuation between pulls.
+    source_cache_key: Option<[u8; 32]>,
+    source_cache_position: usize,
+    source_run_precharged: bool,
+    /// Opaque read a retained source keeps open for every run this cursor
+    /// walks, so one statement opens its read and its physical index once
+    /// rather than once per window. The relational layer never looks inside.
+    source_read: Option<SourceReadSlot>,
+    /// Retained source proof state for all windows of this cursor.
+    source_proof: Option<SourceReadSlot>,
+}
+
+/// An opaque, shareable read a retained source attaches to a cursor.
+#[derive(Clone)]
+pub struct SourceReadSlot(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for SourceReadSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SourceReadSlot")
+    }
 }
 
 impl Default for BoundedOrderedRowCursor {
@@ -86,10 +115,17 @@ impl Default for BoundedOrderedRowCursor {
             reverse: false,
             run_start: Bound::Unbounded,
             run_end: Bound::Unbounded,
+            run_prefix_len: 0,
             pending_runs: std::collections::VecDeque::new(),
             retained_key_bytes: 0,
             key_generation: 0,
             exhausted: false,
+            source_key: None,
+            source_cache_key: None,
+            source_cache_position: 0,
+            source_run_precharged: false,
+            source_read: None,
+            source_proof: None,
         }
     }
 }
@@ -111,10 +147,17 @@ impl BoundedOrderedRowCursor {
             reverse,
             run_start: Bound::Unbounded,
             run_end: Bound::Unbounded,
+            run_prefix_len: 0,
             pending_runs: std::collections::VecDeque::new(),
             retained_key_bytes: 0,
             key_generation: 0,
             exhausted: false,
+            source_key: None,
+            source_cache_key: None,
+            source_cache_position: 0,
+            source_run_precharged: false,
+            source_read: None,
+            source_proof: None,
         }
     }
 
@@ -171,38 +214,28 @@ impl BoundedOrderedRowCursor {
             };
         // Borrow each run independently: no copy of all historical keys and
         // no walk through the gaps of an IN-list.
-        for (start, end) in std::iter::once((&self.run_start, &self.run_end))
-            .chain(self.pending_runs.iter().map(|(start, end)| (start, end)))
+        for (start, end, prefix_len) in
+            std::iter::once((&self.run_start, &self.run_end, self.run_prefix_len)).chain(
+                self.pending_runs
+                    .iter()
+                    .map(|(start, end)| (start, end, run_prefix_len(start, end))),
+            )
         {
-            let near = if self.reverse { end } else { start };
-            let seek = if self.reverse && self.image_components != 1 {
-                Bound::Unbounded
-            } else {
-                match near {
-                    Bound::Unbounded => Bound::Unbounded,
-                    Bound::Included(edge) => Bound::Included(std::slice::from_ref(edge)),
-                    Bound::Excluded(edge) => Bound::Excluded(std::slice::from_ref(edge)),
-                }
-            };
-            let inside = |key: &IndexKey| {
-                let Some(leading) = key.first() else {
-                    return true;
-                };
-                match if self.reverse { start } else { end } {
-                    Bound::Unbounded => true,
-                    Bound::Included(edge) => {
-                        if self.reverse {
-                            leading >= edge
-                        } else {
-                            leading <= edge
-                        }
+            let seek = self.seek_from_run(start, end);
+            let inside = |key: &IndexKey| match if self.reverse { start } else { end } {
+                Bound::Unbounded => true,
+                Bound::Included(edge) => {
+                    if self.reverse {
+                        key_prefix_cmp(key, edge, prefix_len).is_ge()
+                    } else {
+                        key_prefix_cmp(key, edge, prefix_len).is_le()
                     }
-                    Bound::Excluded(edge) => {
-                        if self.reverse {
-                            leading > edge
-                        } else {
-                            leading < edge
-                        }
+                }
+                Bound::Excluded(edge) => {
+                    if self.reverse {
+                        key_prefix_cmp(key, edge, prefix_len).is_gt()
+                    } else {
+                        key_prefix_cmp(key, edge, prefix_len).is_lt()
                     }
                 }
             };
@@ -233,7 +266,21 @@ impl BoundedOrderedRowCursor {
     /// The source then starts at the first key inside the run and stops at
     /// the first key past it, instead of starting at the first key of the
     /// index and rejecting everything the predicate excludes.
-    pub fn seeking_run(mut self, start: Bound<DirectedValue>, end: Bound<DirectedValue>) -> Self {
+    pub fn seeking_run(self, start: Bound<IndexKey>, end: Bound<IndexKey>) -> Self {
+        let prefix_len = run_prefix_len(&start, &end);
+        self.seeking_run_with_prefix_len(start, end, prefix_len)
+    }
+
+    /// Declare a run whose reverse seek edge carries physical padding beyond
+    /// the predicate's logical bound. The padding places a reverse cursor at
+    /// the end of the run; comparisons still use only `prefix_len` components.
+    pub fn seeking_run_with_prefix_len(
+        mut self,
+        start: Bound<IndexKey>,
+        end: Bound<IndexKey>,
+        prefix_len: usize,
+    ) -> Self {
+        self.run_prefix_len = prefix_len;
         self.run_start = start;
         self.run_end = end;
         self
@@ -248,7 +295,7 @@ impl BoundedOrderedRowCursor {
     /// a cursor with no declared run already does.
     pub fn seeking_runs(
         mut self,
-        runs: impl IntoIterator<Item = (Bound<DirectedValue>, Bound<DirectedValue>)>,
+        runs: impl IntoIterator<Item = (Bound<IndexKey>, Bound<IndexKey>)>,
     ) -> Self {
         let mut runs = runs.into_iter();
         let Some((start, end)) = runs.next() else {
@@ -256,6 +303,7 @@ impl BoundedOrderedRowCursor {
         };
         self.run_start = start;
         self.run_end = end;
+        self.run_prefix_len = run_prefix_len(&self.run_start, &self.run_end);
         self.pending_runs = runs.collect();
         self
     }
@@ -265,10 +313,10 @@ impl BoundedOrderedRowCursor {
     /// this cursor for as long as the read does -- so a continuation that
     /// leaves them out reports a read holding less memory than it holds.
     pub fn pending_run_bytes(&self) -> usize {
-        let mut bytes = self.pending_runs.len().saturating_mul(std::mem::size_of::<(
-            Bound<DirectedValue>,
-            Bound<DirectedValue>,
-        )>());
+        let mut bytes = self
+            .pending_runs
+            .len()
+            .saturating_mul(std::mem::size_of::<(Bound<IndexKey>, Bound<IndexKey>)>());
         for (start, end) in &self.pending_runs {
             bytes = bytes
                 .saturating_add(bounded_run_bound_bytes(start))
@@ -288,8 +336,12 @@ impl BoundedOrderedRowCursor {
         };
         self.run_start = start;
         self.run_end = end;
+        self.run_prefix_len = run_prefix_len(&self.run_start, &self.run_end);
         self.key = None;
         self.last_row_id = None;
+        self.source_cache_key = None;
+        self.source_cache_position = 0;
+        self.source_run_precharged = false;
         true
     }
 
@@ -297,9 +349,6 @@ impl BoundedOrderedRowCursor {
     /// the cursor walks. A key past the far end ends the walk; the near end
     /// is where the walk began, so it never ends it.
     fn inside_declared_run(&self, key: &IndexKey) -> bool {
-        let Some(leading) = key.first() else {
-            return true;
-        };
         let far_end = if self.reverse {
             &self.run_start
         } else {
@@ -309,40 +358,46 @@ impl BoundedOrderedRowCursor {
             Bound::Unbounded => true,
             Bound::Included(edge) => {
                 if self.reverse {
-                    leading >= edge
+                    key_prefix_cmp(key, edge, self.run_prefix_len).is_ge()
                 } else {
-                    leading <= edge
+                    key_prefix_cmp(key, edge, self.run_prefix_len).is_le()
                 }
             }
             Bound::Excluded(edge) => {
                 if self.reverse {
-                    leading > edge
+                    key_prefix_cmp(key, edge, self.run_prefix_len).is_gt()
                 } else {
-                    leading < edge
+                    key_prefix_cmp(key, edge, self.run_prefix_len).is_lt()
                 }
             }
         }
     }
 
-    /// The tree-order bound the walk starts from. A composite index orders by
-    /// the whole key, so an inclusive edge on the leading component alone
-    /// cannot express "this value followed by anything" on the far side; the
-    /// walk therefore seeks only from the side it starts on and stops at the
-    /// other by inspecting one key past the run.
-    fn seek_from(&self, components: usize) -> Bound<&[DirectedValue]> {
-        let near_end = if self.reverse {
-            if components != 1 {
-                return Bound::Unbounded;
-            }
-            &self.run_end
-        } else {
-            &self.run_start
-        };
+    /// The tree-order bound the walk starts from. A prefix is a lower bound in
+    /// B-tree order, so a forward walk can seek it directly. For a reverse
+    /// walk over an ascending suffix, NULL is the physical high edge and puts
+    /// the cursor at the newest key of that prefix before it reads a posting.
+    fn seek_from_run<'a>(
+        &self,
+        start: &'a Bound<IndexKey>,
+        end: &'a Bound<IndexKey>,
+    ) -> Bound<&'a [DirectedValue]> {
+        let near_end = if self.reverse { end } else { start };
         match near_end {
             Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(edge) => Bound::Included(std::slice::from_ref(edge)),
-            Bound::Excluded(edge) => Bound::Excluded(std::slice::from_ref(edge)),
+            Bound::Included(_) if self.reverse && run_bound_len(end) < self.image_components => {
+                // An included short prefix has no generic physical high edge.
+                // Keep the conservative reverse seek where the caller could
+                // not append a high sentinel for every remaining component.
+                Bound::Unbounded
+            }
+            Bound::Included(edge) => Bound::Included(edge.as_slice()),
+            Bound::Excluded(edge) => Bound::Excluded(edge.as_slice()),
         }
+    }
+
+    fn seek_from(&self) -> Bound<&[DirectedValue]> {
+        self.seek_from_run(&self.run_start, &self.run_end)
     }
 
     pub fn is_exhausted(&self) -> bool {
@@ -360,6 +415,144 @@ impl BoundedOrderedRowCursor {
     pub fn key_generation(&self) -> u64 {
         self.key_generation
     }
+
+    #[doc(hidden)]
+    pub fn source_position(&self) -> Option<&[u8]> {
+        self.source_key.as_deref()
+    }
+
+    #[doc(hidden)]
+    pub fn source_reverse(&self) -> bool {
+        self.reverse
+    }
+
+    #[doc(hidden)]
+    pub fn source_identities_only(&self) -> bool {
+        self.identities_only
+    }
+
+    #[doc(hidden)]
+    pub fn source_configure(&mut self, image_components: usize) {
+        self.image_components = image_components;
+    }
+
+    #[doc(hidden)]
+    pub fn source_seek(&self) -> Bound<&[DirectedValue]> {
+        self.seek_from()
+    }
+
+    #[doc(hidden)]
+    pub fn source_run_bounds(&self) -> (&Bound<IndexKey>, &Bound<IndexKey>, usize) {
+        (&self.run_start, &self.run_end, self.run_prefix_len)
+    }
+
+    #[doc(hidden)]
+    pub fn source_cache_key(&self) -> Option<[u8; 32]> {
+        self.source_cache_key
+    }
+
+    #[doc(hidden)]
+    pub fn source_begin_cached_run(&mut self, key: [u8; 32], precharged: bool) {
+        self.source_cache_key = Some(key);
+        self.source_cache_position = 0;
+        self.source_run_precharged = precharged;
+    }
+
+    #[doc(hidden)]
+    pub fn source_cached_position(&self) -> usize {
+        self.source_cache_position
+    }
+
+    #[doc(hidden)]
+    pub fn source_advance_cached_position(&mut self) {
+        self.source_cache_position = self.source_cache_position.saturating_add(1);
+    }
+
+    #[doc(hidden)]
+    pub fn source_advance_cached_identity(&mut self, source_key: &[u8], row_id: RowId) {
+        self.source_key = Some(source_key.to_vec());
+        self.last_row_id = Some(row_id);
+    }
+
+    #[doc(hidden)]
+    pub fn source_run_precharged(&self) -> bool {
+        self.source_run_precharged
+    }
+
+    #[doc(hidden)]
+    pub fn source_abandon_cached_run(&mut self) {
+        self.source_cache_key = None;
+        self.source_cache_position = 0;
+        self.source_run_precharged = false;
+    }
+
+    #[doc(hidden)]
+    pub fn source_read(&self) -> Option<&SourceReadSlot> {
+        self.source_read.as_ref()
+    }
+
+    #[doc(hidden)]
+    pub fn set_source_read(&mut self, read: SourceReadSlot) {
+        self.source_read = Some(read);
+    }
+
+    #[doc(hidden)]
+    pub fn source_proof(&self) -> Option<&SourceReadSlot> {
+        self.source_proof.as_ref()
+    }
+
+    #[doc(hidden)]
+    pub fn set_source_proof(&mut self, proof: SourceReadSlot) {
+        self.source_proof = Some(proof);
+    }
+
+    #[doc(hidden)]
+    pub fn source_inside_run(&self, key: &IndexKey) -> bool {
+        self.inside_declared_run(key)
+    }
+
+    #[doc(hidden)]
+    pub fn source_advance(&mut self, source_key: Vec<u8>, key: IndexKey, row_id: RowId) {
+        self.source_key = Some(source_key);
+        self.key = Some(key);
+        self.last_row_id = Some(row_id);
+    }
+
+    #[doc(hidden)]
+    pub fn source_finish_run(&mut self) -> bool {
+        self.source_key = None;
+        self.source_cache_key = None;
+        self.source_cache_position = 0;
+        self.source_run_precharged = false;
+        if self.advance_to_next_run() {
+            true
+        } else {
+            self.exhausted = true;
+            false
+        }
+    }
+}
+
+fn run_bound_len(bound: &Bound<IndexKey>) -> usize {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => key.len(),
+        Bound::Unbounded => 0,
+    }
+}
+
+fn run_prefix_len(start: &Bound<IndexKey>, end: &Bound<IndexKey>) -> usize {
+    match (run_bound_len(start), run_bound_len(end)) {
+        (0, 0) => 0,
+        (0, end) => end,
+        (start, 0) => start,
+        (start, end) => start.min(end),
+    }
+}
+
+fn key_prefix_cmp(key: &IndexKey, edge: &IndexKey, prefix_len: usize) -> std::cmp::Ordering {
+    key.get(..prefix_len)
+        .map(|prefix| prefix.cmp(&edge[..prefix_len]))
+        .unwrap_or(std::cmp::Ordering::Less)
 }
 
 /// Owned position in a physical table version vector. The continuation
@@ -375,6 +568,7 @@ pub struct BoundedPhysicalCursor {
     last_inspected: Option<(RowId, TxId)>,
     last_emitted: Option<(RowId, TxId)>,
     exhausted: bool,
+    source_key: Option<Vec<u8>>,
 }
 
 impl BoundedPhysicalCursor {
@@ -388,6 +582,22 @@ impl BoundedPhysicalCursor {
     /// can always resume strictly after the last row the caller consumed.
     pub fn note_emitted(&mut self) {
         self.last_emitted = self.last_inspected;
+    }
+
+    #[doc(hidden)]
+    pub fn source_position(&self) -> Option<&[u8]> {
+        self.source_key.as_deref()
+    }
+
+    #[doc(hidden)]
+    pub fn source_advance(&mut self, key: Vec<u8>, row: &VersionedRow) {
+        self.source_key = Some(key);
+        self.last_inspected = Some((row.row_id, row.created_tx));
+    }
+
+    #[doc(hidden)]
+    pub fn source_exhaust(&mut self) {
+        self.exhausted = true;
     }
 }
 
@@ -437,6 +647,7 @@ pub struct BoundedExactIndexCursor {
     position: usize,
     retained_bytes: usize,
     exhausted: bool,
+    source_key: Option<Vec<u8>>,
 }
 
 impl BoundedExactIndexCursor {
@@ -455,6 +666,7 @@ impl BoundedExactIndexCursor {
             position: 0,
             retained_bytes: 0,
             exhausted: false,
+            source_key: None,
         }
     }
 
@@ -515,6 +727,40 @@ impl BoundedExactIndexCursor {
         self.retained_bytes
     }
 
+    #[doc(hidden)]
+    pub fn source_probe(&self) -> Option<&IndexKey> {
+        self.keys.front()
+    }
+
+    #[doc(hidden)]
+    pub fn source_position(&self) -> Option<&[u8]> {
+        self.source_key.as_deref()
+    }
+
+    #[doc(hidden)]
+    pub fn source_identities_only(&self) -> bool {
+        self.identities_only
+    }
+
+    #[doc(hidden)]
+    pub fn source_advance(&mut self, source_key: Vec<u8>, row_id: RowId) {
+        self.source_key = Some(source_key);
+        self.last_row_id = Some(row_id);
+    }
+
+    #[doc(hidden)]
+    pub fn source_finish_probe(&mut self) -> bool {
+        self.keys.pop_front();
+        self.source_key = None;
+        self.last_row_id = None;
+        if self.keys.is_empty() {
+            self.exhausted = true;
+            false
+        } else {
+            true
+        }
+    }
+
     fn take_retained_bytes(&mut self) -> usize {
         self.postings = Vec::new();
         self.position = 0;
@@ -547,13 +793,20 @@ fn membership_row<E>(
 }
 
 /// What one edge of a declared run holds beyond its own enum slot.
-fn bounded_run_bound_bytes(bound: &Bound<DirectedValue>) -> usize {
+fn bounded_run_bound_bytes(bound: &Bound<IndexKey>) -> usize {
     match bound {
-        Bound::Included(value) | Bound::Excluded(value) => match value {
-            DirectedValue::Asc(TotalOrdAsc(value)) | DirectedValue::Desc(TotalOrdDesc(value)) => {
-                value.estimated_bytes()
-            }
-        },
+        Bound::Included(key) | Bound::Excluded(key) => key.iter().fold(
+            std::mem::size_of::<IndexKey>().saturating_add(
+                key.len()
+                    .saturating_mul(std::mem::size_of::<DirectedValue>()),
+            ),
+            |bytes, value| match value {
+                DirectedValue::Asc(TotalOrdAsc(value))
+                | DirectedValue::Desc(TotalOrdDesc(value)) => {
+                    bytes.saturating_add(value.estimated_bytes())
+                }
+            },
+        ),
         Bound::Unbounded => 0,
     }
 }
@@ -595,6 +848,55 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         }
     }
 
+    /// Delete a row while retiring its staged admission under the same write-set lock.
+    /// Validation happens before that lock, so an error leaves both the row and
+    /// its admission record in place. The callback prices only rows actually removed.
+    #[doc(hidden)]
+    pub fn delete_retiring_staged_charge(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        mut staged_charge: impl FnMut(&VersionedRow, Option<usize>) -> usize,
+    ) -> Result<usize> {
+        self.ensure_table_exists(table)?;
+        if self.store.is_immutable(table) {
+            return Err(Error::ImmutableTable(table.to_string()));
+        }
+
+        let committed_row_exists = self
+            .store
+            .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
+            .is_some();
+
+        self.tx_mgr.with_write_set(tx, |ws| {
+            let admitted = ws.admitted_bytes_for_staged_row(table, row_id);
+            let mut retired = 0usize;
+            let mut removed = false;
+            ws.relational_inserts.retain(|(staged_table, row)| {
+                if staged_table == table && row.row_id == row_id {
+                    removed = true;
+                    retired = retired.saturating_add(staged_charge(row, admitted));
+                    false
+                } else {
+                    true
+                }
+            });
+            if removed {
+                ws.forget_relational_insert_admitted_bytes(table, row_id);
+            }
+            if committed_row_exists
+                && !ws
+                    .relational_deletes
+                    .iter()
+                    .any(|(t, deleted_row_id, _)| t == table && *deleted_row_id == row_id)
+            {
+                ws.relational_deletes.push((table.to_string(), row_id, tx));
+            }
+            retired
+        })
+    }
+
     /// Number of physical versions currently addressable by a pull scan.
     /// Capturing this once gives a cursor a stable end position; later commits
     /// are outside its snapshot and do not extend its source.
@@ -617,6 +919,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             last_inspected: None,
             last_emitted: None,
             exhausted: false,
+            source_key: None,
         })
     }
 
@@ -1025,7 +1328,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
 
         if let Some(Some(image)) = cursor.image.as_ref() {
             let image = image.clone();
-            let seek = cursor.seek_from(cursor.image_components);
+            let seek = cursor.seek_from();
             let after = cursor
                 .key
                 .as_ref()
@@ -1148,7 +1451,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         // The predicate names where the answer starts and where it ends, so
         // the walk seeks to the first key inside the declared run and stops at
         // the first key past it rather than reading the index end to end.
-        let seek_from = cursor.seek_from(storage.columns.len());
+        let seek_from = cursor.seek_from();
         let selected = if let Some(key) = cursor.key.as_ref() {
             let same_key = storage.tree.get(key).and_then(|entries| {
                 next_posting_run(entries, cursor.last_row_id, cursor.reverse)

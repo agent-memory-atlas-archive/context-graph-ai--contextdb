@@ -14,7 +14,7 @@ use contextdb_engine::read_contract::{
 use contextdb_engine::{
     CascadeReport, IndexCandidate, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
     VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
-    VectorSearchScopeShape, VectorSearchTailState,
+    VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
 pub use contextdb_engine::{QueryResult, QueryTrace};
 use serde::Serialize;
@@ -64,6 +64,7 @@ fn result_with_every_value_kind() -> QueryResult {
             query_vector_source: Some(VectorIndexRef::new("events", "embedding")),
             vector_search: None,
             rows_examined: 9,
+            maintained_count: None,
         },
         cascade: Some(CascadeReport {
             dropped_indexes: vec!["events_stale".to_owned()],
@@ -85,6 +86,7 @@ fn materially_different_result() -> QueryResult {
             query_vector_source: None,
             vector_search: None,
             rows_examined: 2,
+            maintained_count: None,
         },
         cascade: None,
     }
@@ -129,6 +131,7 @@ fn expected_result_with_every_value_kind() -> CanonicalQueryResult {
             query_vector_source: Some(VectorIndexRef::new("events", "embedding")),
             vector_search: None,
             rows_examined: 9,
+            maintained_count: None,
         },
         cascade: Some(CanonicalCascadeReport {
             dropped_indexes: vec!["events_stale".to_owned()],
@@ -150,6 +153,7 @@ fn expected_materially_different_result() -> CanonicalQueryResult {
             query_vector_source: None,
             vector_search: None,
             rows_examined: 2,
+            maintained_count: None,
         },
         cascade: None,
     }
@@ -309,6 +313,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
     let mut vector_trace = rich.clone();
     let mut vector_trace_expected = rich_expected.clone();
     vector_trace.trace.vector_search = Some(VectorSearchDisclosure {
+        route_evidence: VectorSearchRouteEvidence::Executed,
         requested_mode: VectorSearchMode::Auto,
         resolved_mode: VectorSearchMode::Exact,
         aggregate_allowed_vectors: Some(3),
@@ -325,8 +330,15 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         refusal: None,
         recovery: None,
         query_source: VectorQuerySourceDisclosure::RedactedRowKey,
+        global_candidate_budget: Some(320),
+        admission_evaluations: Some(12),
+        expansion_evaluations: Some(80),
+        layers_admitted: Some(2),
+        budget_terminal: Some("answer_complete".to_owned()),
         partition_hnsw: vec![VectorPartitionHnswDisclosure {
             partition: "<redacted:1>".to_owned(),
+            route: Some(VectorSearchRoute::Exact),
+            reason: Some("live_count_at_or_below_ef_search".to_owned()),
             hnsw_m: 16,
             hnsw_ef_construction: 100,
             hnsw_ef_search: 32,
@@ -335,6 +347,7 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         }],
     });
     vector_trace_expected.trace.vector_search = Some(CanonicalVectorSearchDisclosure {
+        route_evidence: "executed".to_owned(),
         requested_mode: "AUTO".to_owned(),
         resolved_mode: "EXACT".to_owned(),
         aggregate_allowed_vectors: Some(3),
@@ -351,8 +364,15 @@ fn query_result_codec_mutation_matrix_covers_every_encoded_field() {
         refusal: None,
         recovery: None,
         query_source: "<redacted>".to_owned(),
+        global_candidate_budget: Some(320),
+        admission_evaluations: Some(12),
+        expansion_evaluations: Some(80),
+        layers_admitted: Some(2),
+        budget_terminal: Some("answer_complete".to_owned()),
         partition_hnsw: vec![CanonicalVectorPartitionHnswDisclosure {
             partition: "<redacted:1>".to_owned(),
+            route: Some("exact".to_owned()),
+            reason: Some("live_count_at_or_below_ef_search".to_owned()),
             hnsw_m: 16,
             hnsw_ef_construction: 100,
             hnsw_ef_search: 32,
@@ -474,6 +494,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     query_vector_source: None,
                     vector_search: None,
                     rows_examined: 1,
+                    maintained_count: None,
                 },
                 cascade: None,
             },
@@ -490,6 +511,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     query_vector_source: None,
                     vector_search: None,
                     rows_examined: 1,
+                    maintained_count: None,
                 },
                 cascade: None,
             },
@@ -511,6 +533,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     query_vector_source: None,
                     vector_search: None,
                     rows_examined: 1,
+                    maintained_count: None,
                 },
                 cascade: None,
             },
@@ -530,6 +553,7 @@ fn query_result_codec_rejects_wrong_row_arity_at_every_boundary() {
                     query_vector_source: None,
                     vector_search: None,
                     rows_examined: 1,
+                    maintained_count: None,
                 },
                 cascade: None,
             },

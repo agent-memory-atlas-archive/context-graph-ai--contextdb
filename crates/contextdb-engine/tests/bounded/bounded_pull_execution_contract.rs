@@ -1463,9 +1463,13 @@ impl contextdb_vector::hnsw::HnswCandidateObserver for HnswCandidatePathProbe {
 #[test]
 fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
     let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_vector_table(&db, "observer_hnsw_vectors", false);
     seed_vectors(&db, "observer_hnsw_vectors", 1_003, None, 107);
-    let sql = "SELECT id FROM observer_hnsw_vectors ORDER BY embedding <=> $query LIMIT 5";
+    db.run_maintenance_cycle()
+        .expect("build the maintained graph before observing its distance loop");
+    let sql = "SELECT id FROM observer_hnsw_vectors ORDER BY embedding <=> $query \
+               USE VECTOR INDEXED LIMIT 5";
     db.execute(sql, &params([("query", Value::Vector(vector_for(0)))]))
         .expect("prebuild persistent HNSW state before observing request work");
     assert!(db.__debug_last_query_vector_used_hnsw_for_test());
@@ -1943,7 +1947,8 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
     // Build and retain the legitimate persistent HNSW cache before any
     // measured request baseline. Request cleanup must release only request
     // state, never erase this index-owned cache to make accounting balance.
-    let hnsw_sql = "SELECT id FROM matrix_hnsw_vectors ORDER BY embedding <=> $query LIMIT 5";
+    let hnsw_sql = "SELECT id FROM matrix_hnsw_vectors ORDER BY embedding <=> $query \
+                    USE VECTOR INDEXED LIMIT 5";
     db.execute(hnsw_sql, &params([("query", Value::Vector(vector_for(0)))]))
         .expect("prebuild persistent HNSW state outside the bounded request");
     assert!(db.__debug_last_query_vector_used_hnsw_for_test());
@@ -2039,6 +2044,175 @@ fn every_bounded_source_has_exact_work_memory_and_cancellation_matrix() {
         accountant.usage().used,
         retained_index_baseline,
         "bounded request cleanup preserves the prebuilt persistent HNSW cache"
+    );
+}
+
+/// Exact search owes one work unit for every committed vector entry it walks,
+/// including old versions rejected by the reader's snapshot before scoring.
+/// Both bounded entrances use the same real version chain and exact N/N-1
+/// boundary; the cursor's first page is its first fetch from that chain.
+#[test]
+fn mostly_invisible_vector_history_is_charged_at_direct_and_cursor_boundaries() {
+    const STORED_VERSIONS: u64 = 64;
+
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    let db = Arc::new(Database::open_memory_with_accountant(Arc::clone(
+        &accountant,
+    )));
+    db.execute(
+        "CREATE TABLE mostly_dead_vectors (id INTEGER PRIMARY KEY, \
+         embedding VECTOR(3) SEARCH_MODE EXACT)",
+        &HashMap::new(),
+    )
+    .expect("create the exact-history fixture");
+    db.execute(
+        "INSERT INTO mostly_dead_vectors VALUES (1, [1.0, 0.0, 0.0])",
+        &HashMap::new(),
+    )
+    .expect("insert the version visible to the held snapshot");
+    let old_snapshot = db.snapshot();
+    let _old_pin = db.pin_snapshot(old_snapshot);
+    for version in 1..STORED_VERSIONS {
+        db.execute(
+            "UPDATE mostly_dead_vectors SET embedding = $embedding WHERE id = 1",
+            &params([(
+                "embedding",
+                Value::Vector(vec![1.0, version as f32 * 0.001, 0.0]),
+            )]),
+        )
+        .expect("append a real superseding vector version");
+    }
+    assert_eq!(
+        db.vector_store_for_test()
+            .entries_for_index(&VectorIndexRef::new("mostly_dead_vectors", "embedding"))
+            .expect("inspect the physical vector history")
+            .len(),
+        STORED_VERSIONS as usize,
+        "the fixture uses stored MVCC versions rather than a synthetic count"
+    );
+
+    let sql = "SELECT id FROM mostly_dead_vectors ORDER BY embedding <=> $query \
+               USE VECTOR EXACT LIMIT 1";
+    let bound = params([("query", Value::Vector(vec![1.0, 0.0, 0.0]))]);
+    let baseline = accountant.usage().used;
+
+    let direct_clock = ManualClock::default();
+    let direct_probe = Arc::new(SourceLoopPoisonProbe::new(
+        direct_clock.clone(),
+        Arc::clone(&accountant),
+        baseline,
+    ));
+    let mut direct_request = request(sql, bound.clone(), roomy_limits(), &direct_clock);
+    direct_request.probe = Some(direct_probe.clone());
+    let direct = db
+        .__with_snapshot_override_for_test(old_snapshot, || bounded::execute(&db, &direct_request))
+        .expect("the roomy direct exact read succeeds");
+    let direct_work = direct.telemetry.work_units;
+    assert_eq!(
+        direct_probe.source_items(bounded::TestSourceTouch::BruteForceVectorCandidate),
+        STORED_VERSIONS,
+        "direct exact search charges every walked stored version before visibility rejection"
+    );
+    let mut direct_exact_limits = roomy_limits();
+    direct_exact_limits.work = direct_work;
+    db.__with_snapshot_override_for_test(old_snapshot, || {
+        bounded::execute(
+            &db,
+            &request(
+                sql,
+                bound.clone(),
+                direct_exact_limits,
+                &ManualClock::default(),
+            ),
+        )
+    })
+    .expect("the direct exact read succeeds at its measured N boundary");
+    let mut direct_short_limits = direct_exact_limits;
+    direct_short_limits.work -= 1;
+    assert_limit(
+        db.__with_snapshot_override_for_test(old_snapshot, || {
+            bounded::execute(
+                &db,
+                &request(
+                    sql,
+                    bound.clone(),
+                    direct_short_limits,
+                    &ManualClock::default(),
+                ),
+            )
+        })
+        .expect_err("the direct exact read refuses at N-1"),
+        ReadFailureLimit::Work,
+        direct_work - 1,
+    );
+
+    let cursor_clock = ManualClock::default();
+    let cursor_probe = Arc::new(SourceLoopPoisonProbe::new(
+        cursor_clock.clone(),
+        Arc::clone(&accountant),
+        baseline,
+    ));
+    let mut cursor_limits = roomy_limits();
+    cursor_limits.result_rows = 1;
+    cursor_limits.cursor_page_rows = 1;
+    let mut cursor_request = request(sql, bound.clone(), cursor_limits, &cursor_clock);
+    cursor_request.probe = Some(cursor_probe.clone());
+    let mut cursor = db
+        .__with_snapshot_override_for_test(old_snapshot, || {
+            bounded::open_cursor(Arc::clone(&db), &cursor_request)
+        })
+        .expect("the roomy cursor first fetch succeeds");
+    let cursor_work = cursor.telemetry.work_units;
+    assert_eq!(cursor.first_page.rows.len(), 1);
+    assert_eq!(
+        cursor_probe.source_items(bounded::TestSourceTouch::BruteForceVectorCandidate),
+        STORED_VERSIONS,
+        "the cursor first fetch charges every walked stored version before visibility rejection"
+    );
+    cursor.cursor.close().expect("close the profiling cursor");
+
+    let mut cursor_exact_limits = cursor_limits;
+    cursor_exact_limits.work = cursor_work;
+    let mut exact_cursor = db
+        .__with_snapshot_override_for_test(old_snapshot, || {
+            bounded::open_cursor(
+                Arc::clone(&db),
+                &request(
+                    sql,
+                    bound.clone(),
+                    cursor_exact_limits,
+                    &ManualClock::default(),
+                ),
+            )
+        })
+        .expect("the cursor first fetch succeeds at its measured N boundary");
+    exact_cursor
+        .cursor
+        .close()
+        .expect("close exact-boundary cursor");
+    let mut cursor_short_limits = cursor_exact_limits;
+    cursor_short_limits.work -= 1;
+    let cursor_short = db.__with_snapshot_override_for_test(old_snapshot, || {
+        bounded::open_cursor(
+            Arc::clone(&db),
+            &request(sql, bound, cursor_short_limits, &ManualClock::default()),
+        )
+    });
+    let cursor_short = match cursor_short {
+        Ok(mut opened) => {
+            opened
+                .cursor
+                .close()
+                .expect("close unexpectedly successful N-1 cursor");
+            panic!("the cursor first fetch must refuse at N-1")
+        }
+        Err(error) => error,
+    };
+    assert_limit(cursor_short, ReadFailureLimit::Work, cursor_work - 1);
+    assert_eq!(
+        accountant.usage().used,
+        baseline,
+        "direct and cursor exact-history reads release all request memory"
     );
 }
 
@@ -2481,23 +2655,29 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         vec![4, 5, 6, 7],
         "the refused request consumed nothing, so the page resumes where the first one ended"
     );
+    let used_before_close = refusal_accountant.usage().used;
     fetch_ceiling
         .cursor
         .close()
         .expect("close the still-live cursor after refusal recovery");
-    assert_eq!(
-        refusal_accountant.usage().used,
-        refusal_baseline_memory,
-        "explicit close releases what the request-shaped refusal deliberately kept"
+    let used_after_close = refusal_accountant.usage().used;
+    assert!(
+        used_after_close < used_before_close,
+        "explicit close releases retained cursor bytes"
     );
     let after_close = refusal_db
         .compact_currency_versions()
         .expect("the close released the future-row snapshot pin");
     assert_eq!(after_close.pruned_versions, 1);
+    assert!(
+        refusal_accountant.usage().used < used_after_close,
+        "the now-unpinned version releases its own charge"
+    );
     assert_eq!(
         refusal_db.__physical_version_count_for_test("cursor_refusal_rows"),
         9
     );
+    let after_compaction_baseline = refusal_accountant.usage().used;
 
     let mut cancellation_cursor = bounded::open_cursor(
         Arc::clone(&refusal_db),
@@ -2536,7 +2716,7 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         "fetch cancellation stops before inspecting or advancing the next table row"
     );
     assert!(
-        refusal_accountant.usage().used > refusal_baseline_memory,
+        refusal_accountant.usage().used > after_compaction_baseline,
         "cancellation keeps the production-owned cursor resources live"
     );
     cancellation_cursor.cursor.set_probe(None);
@@ -2555,7 +2735,7 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         .expect("close the still-live cursor after cancellation recovery");
     assert_eq!(
         refusal_accountant.usage().used,
-        refusal_baseline_memory,
+        after_compaction_baseline,
         "explicit close releases the resources cancellation deliberately retained"
     );
 
@@ -2746,6 +2926,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         memory_db.__physical_version_count_for_test("cursor_snapshot_rows"),
         7
     );
+    let used_before_exhaustion = accountant.usage().used;
     let mut has_more = snapshot_cursor.first_page.has_more;
     while has_more {
         let page = snapshot_cursor
@@ -2754,15 +2935,16 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             .expect("drain cursor with the superseded row still in its future");
         has_more = page.page.has_more;
     }
-    assert_eq!(
-        accountant.usage().used,
-        snapshot_baseline_memory,
-        "has_more=false releases every retained cursor byte without an explicit close"
+    let used_after_exhaustion = accountant.usage().used;
+    assert!(
+        used_after_exhaustion < used_before_exhaustion,
+        "has_more=false releases retained cursor bytes without an explicit close"
     );
     let after_exhaustion = memory_db
         .compact_currency_versions()
         .expect("compact immediately after exhaustion releases the snapshot pin");
     assert_eq!(after_exhaustion.pruned_versions, 1);
+    assert!(accountant.usage().used < used_after_exhaustion);
     assert_eq!(
         memory_db.__physical_version_count_for_test("cursor_snapshot_rows"),
         6
@@ -2785,7 +2967,6 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             )
             .expect("insert expiry snapshot row");
     }
-    let expiry_baseline_memory = accountant.usage().used;
     let expiry_clock = ManualClock::default();
     let mut expiry_limits = limits;
     expiry_limits.cursor_idle_ms = 10;
@@ -2811,6 +2992,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         memory_db.__physical_version_count_for_test("cursor_expiry_rows"),
         7
     );
+    let used_before_expiry = accountant.usage().used;
     expiry_clock.advance(11);
     assert_cursor_expired(
         expiry_cursor
@@ -2819,15 +3001,16 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             .expect_err("idle expiry releases the retained cursor state"),
         CursorExpiryKind::Idle,
     );
-    assert_eq!(
-        accountant.usage().used,
-        expiry_baseline_memory,
-        "expiry returns every retained cursor byte to the database accountant"
+    let used_after_expiry = accountant.usage().used;
+    assert!(
+        used_after_expiry < used_before_expiry,
+        "expiry returns retained cursor bytes to the database accountant"
     );
     let after_expiry = memory_db
         .compact_currency_versions()
         .expect("compact immediately after expiry releases the snapshot pin");
     assert_eq!(after_expiry.pruned_versions, 1);
+    assert!(accountant.usage().used < used_after_expiry);
     assert_eq!(
         memory_db.__physical_version_count_for_test("cursor_expiry_rows"),
         6

@@ -1,4 +1,6 @@
-use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory, xxh3_checksum};
+use crate::tree_store::page_store::{
+    Page, PageImpl, PageMemory, PageMut, TransactionalMemory, xxh3_checksum,
+};
 use crate::tree_store::{PageNumber, PageTrackerPolicy};
 use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{Result, StorageError};
@@ -146,7 +148,7 @@ enum EitherPage<'txn> {
     Immutable(PageImpl),
     Mutable(PageMut<'txn>),
     OwnedMemory(Vec<u8>),
-    ArcMemory(Arc<[u8]>),
+    ArcMemory(PageMemory),
 }
 
 impl EitherPage<'_> {
@@ -182,7 +184,7 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
         }
     }
 
-    pub(crate) fn with_arc_page(page: Arc<[u8]>, range: Range<usize>) -> Self {
+    pub(crate) fn with_arc_page(page: PageMemory, range: Range<usize>) -> Self {
         Self {
             page: EitherPage::ArcMemory(page),
             offset: range.start,
@@ -358,6 +360,12 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
         self.len = new_end - new_start;
 
         Ok(())
+    }
+}
+
+impl<V: MutInPlaceValue + 'static> AccessGuardMut<'_, V> {
+    pub(crate) fn value_mut(&mut self) -> &mut V::BaseRefType {
+        V::from_bytes_mut(&mut self.page.memory_mut()[self.offset..self.offset + self.len])
     }
 }
 

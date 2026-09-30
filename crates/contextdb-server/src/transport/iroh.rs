@@ -118,6 +118,10 @@ const REPLY_LARGE_REQUEST_PROGRESS: u8 = 4;
 /// Receipt sent on the request half of the same bidirectional stream only
 /// after the client has read the complete length-delimited reply.
 const REPLY_RECEIVED_ACK: u8 = 0xA5;
+#[cfg(feature = "test-seams")]
+const MAX_PULL_REPLY_TRACE_PREFIX_BYTES: usize = 96;
+#[cfg(feature = "test-seams")]
+const MAX_PULL_REPLY_TRACES: usize = 16;
 
 /// Two exact crash boundaries used only by the separately built installed
 /// release verifier. The feature never ships in an ordinary server build and
@@ -1058,6 +1062,8 @@ pub struct LargeRequestTestObservations {
     pub authenticated_status_probes_after_reset: usize,
     pub accepted_fragment_sequences: Vec<LargeRequestFragmentSequence>,
     pub authenticated_pull_reply_bytes_after_reset: Vec<usize>,
+    pub authenticated_pull_requests_after_reset: usize,
+    pub authenticated_pull_reply_traces_after_reset: Vec<PullReplyTraceObservation>,
     pub staged_response_manifests: Vec<LargeResponseManifestObservation>,
     pub requested_response_chunks: Vec<LargeResponseChunkSequence>,
     pub served_response_chunks: Vec<LargeResponseChunkSequence>,
@@ -1070,6 +1076,19 @@ pub struct LargeRequestTestObservations {
     pub terminal_reply_receipt_failures: usize,
     pub injected_pre_durable_complete_resets: usize,
     pub injected_post_durable_complete_ack_resets: usize,
+}
+
+/// Bounded wire-level observation of an authenticated pull reply after a
+/// test-injected reset. The prefix is at most 96 bytes and at most 16 replies
+/// are retained; the complete application response is never copied here.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullReplyTraceObservation {
+    pub payload_bytes: usize,
+    pub payload_prefix: Vec<u8>,
+    pub frame_status: u8,
+    pub reply_receipt_confirmed: bool,
 }
 
 /// Read-only identity and size data from a real staged oversized response.
@@ -1231,6 +1250,8 @@ struct LargeRequestTestControlState {
     authenticated_status_probes_after_reset: AtomicUsize,
     accepted_fragment_sequences: Mutex<Vec<LargeRequestFragmentSequence>>,
     authenticated_pull_reply_bytes_after_reset: Mutex<Vec<usize>>,
+    authenticated_pull_requests_after_reset: AtomicUsize,
+    authenticated_pull_reply_traces_after_reset: Mutex<Vec<PullReplyTraceObservation>>,
     staged_response_manifests: Mutex<Vec<LargeResponseManifestObservation>>,
     staged_response_manifest_notice: Notify,
     requested_response_chunks: Mutex<Vec<LargeResponseChunkSequence>>,
@@ -1270,6 +1291,8 @@ impl Default for LargeRequestTestControlState {
             authenticated_status_probes_after_reset: AtomicUsize::new(0),
             accepted_fragment_sequences: Mutex::new(Vec::new()),
             authenticated_pull_reply_bytes_after_reset: Mutex::new(Vec::new()),
+            authenticated_pull_requests_after_reset: AtomicUsize::new(0),
+            authenticated_pull_reply_traces_after_reset: Mutex::new(Vec::new()),
             staged_response_manifests: Mutex::new(Vec::new()),
             staged_response_manifest_notice: Notify::new(),
             requested_response_chunks: Mutex::new(Vec::new()),
@@ -1503,6 +1526,18 @@ impl LargeRequestTestController {
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
                 .clone(),
+            authenticated_pull_requests_after_reset: self
+                .stage
+                .control
+                .authenticated_pull_requests_after_reset
+                .load(Ordering::SeqCst),
+            authenticated_pull_reply_traces_after_reset: self
+                .stage
+                .control
+                .authenticated_pull_reply_traces_after_reset
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone(),
             staged_response_manifests: self
                 .stage
                 .control
@@ -1730,6 +1765,47 @@ impl DurableLargeRequestStage {
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
                 .push(bytes);
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    fn record_authenticated_pull_request_after_reset_for_test(&self, subject: &str) {
+        if self.control.reply_reset_injected.load(Ordering::SeqCst)
+            && subject.starts_with("sync.")
+            && subject.ends_with(".pull")
+        {
+            self.control
+                .authenticated_pull_requests_after_reset
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    fn record_authenticated_pull_reply_trace_after_reset_for_test(
+        &self,
+        subject: &str,
+        payload: &[u8],
+        frame_status: u8,
+        reply_receipt_confirmed: bool,
+    ) {
+        if self.control.reply_reset_injected.load(Ordering::SeqCst)
+            && subject.starts_with("sync.")
+            && subject.ends_with(".pull")
+        {
+            let mut traces = self
+                .control
+                .authenticated_pull_reply_traces_after_reset
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if traces.len() < MAX_PULL_REPLY_TRACES {
+                traces.push(PullReplyTraceObservation {
+                    payload_bytes: payload.len(),
+                    payload_prefix: payload[..payload.len().min(MAX_PULL_REPLY_TRACE_PREFIX_BYTES)]
+                        .to_vec(),
+                    frame_status,
+                    reply_receipt_confirmed,
+                });
+            }
         }
     }
 
@@ -2871,6 +2947,24 @@ struct IrohClientTransport {
 }
 
 impl IrohClientTransport {
+    async fn large_request_connection(&self) -> TransportResult<Connection> {
+        // Encoding and signing an over-frame schema unit can take longer than
+        // the lifetime of the connection used by the preceding status probe.
+        // Start its resumable transfer on a fresh connection from the same
+        // authenticated endpoint without interrupting other in-flight work.
+        self.connected_state().await?;
+        let endpoint = self
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .expect("connected_state installed an endpoint")
+            .endpoint
+            .clone();
+        let (target, _) = parse_dial_target(&self.spec)?;
+        connect(&endpoint, target, SYNC_ALPN).await
+    }
+
     async fn connected_state(&self) -> TransportResult<Connection> {
         let mut state = self.state.lock().await;
         if let Some(existing) = state.as_ref() {
@@ -2971,8 +3065,8 @@ impl IrohClientTransport {
         request_bytes: &[u8],
         timeout: Duration,
     ) -> TransportResult<FrameReply> {
-        let connection = self.connected_state().await?;
         let result = if request_bytes.len() > MAX_FRAME_BYTES {
+            let connection = self.large_request_connection().await?;
             let node_id = self
                 .identity
                 .as_ref()
@@ -2980,6 +3074,7 @@ impl IrohClientTransport {
                 .node_id();
             exchange_large_request(&connection, &node_id, subject, request_bytes, timeout).await
         } else {
+            let connection = self.connected_state().await?;
             tokio::time::timeout(
                 timeout,
                 exchange_frame(&connection, Some(subject), request_bytes),
@@ -4010,6 +4105,8 @@ async fn serve_sync_connection(
         production_smoke_push_request_path(&subject, request_digest, completed_stage.is_some());
         #[cfg(feature = "test-seams")]
         large_request_stage.record_authenticated_status_probe_after_reset_for_test(&subject);
+        #[cfg(feature = "test-seams")]
+        large_request_stage.record_authenticated_pull_request_after_reset_for_test(&subject);
         let Some(handler) = routes.get(&subject).cloned() else {
             let _ = write_reply(&mut send, &mut recv, REPLY_NO_HANDLER, subject.as_bytes()).await;
             if let Some(path) = completed_stage {
@@ -4155,25 +4252,49 @@ async fn serve_sync_connection(
                                 let result =
                                     write_reply(&mut send, &mut recv, REPLY_LARGE_RESPONSE, &reply)
                                         .await;
+                                #[cfg(feature = "test-seams")]
+                                large_request_stage
+                                    .record_authenticated_pull_reply_trace_after_reset_for_test(
+                                        &response_subject,
+                                        &reply,
+                                        REPLY_LARGE_RESPONSE,
+                                        result.is_ok(),
+                                    );
                                 let consumed = result.is_ok();
                                 (result, consumed)
                             }
                             Ok(reply) => {
                                 let result =
                                     write_reply(&mut send, &mut recv, REPLY_OK, &reply).await;
+                                #[cfg(feature = "test-seams")]
+                                large_request_stage
+                                    .record_authenticated_pull_reply_trace_after_reset_for_test(
+                                        &response_subject,
+                                        &reply,
+                                        REPLY_OK,
+                                        result.is_ok(),
+                                    );
                                 let consumed = result.is_ok();
                                 (result, consumed)
                             }
                             Err(err) => {
                                 let detail = err.to_string();
-                                let consumed = write_reply(
+                                let write_result = write_reply(
                                     &mut send,
                                     &mut recv,
                                     REPLY_HANDLER_ERROR,
                                     detail.as_bytes(),
                                 )
-                                .await
-                                .is_ok();
+                                .await;
+                                #[cfg(feature = "test-seams")]
+                                large_request_stage
+                                    .record_authenticated_pull_reply_trace_after_reset_for_test(
+                                        &response_subject,
+                                        detail.as_bytes(),
+                                        REPLY_HANDLER_ERROR,
+                                        write_result.is_ok(),
+                                    );
+                                let consumed = write_result.is_ok();
                                 (Err(err), consumed)
                             }
                         };
@@ -4476,7 +4597,7 @@ async fn connect(
         })?
         .map_err(|_| {
             TransportError::Unreachable(
-                "sync endpoint unreachable: connection could not be established; verify both peers use the same ContextDB transport version and upgrade both ends"
+                "sync endpoint unreachable: connection could not be established; both peers must use the same ContextDB transport version"
                     .to_string(),
             )
         })
@@ -4606,27 +4727,12 @@ async fn exchange_large_request(
                 ))
             })?)
             .encode()?;
-        let reply = tokio::time::timeout(
-            fragment_timeout,
+        let reply = await_large_request_fragment_reply(
             exchange_frame(connection, Some(LARGE_REQUEST_CONTROL_SUBJECT), &encoded),
+            fragment_timeout,
+            sequence + 1 == total_fragments,
         )
-        .await
-        .map_err(|_| {
-            if sequence + 1 == total_fragments {
-                TransportError::IndeterminateComplete(
-                    "oversized request final fragment timed out".to_string(),
-                )
-            } else {
-                TransportError::Timeout
-            }
-        })?;
-        let reply = match reply {
-            Ok(reply) => reply,
-            Err(err) if sequence + 1 == total_fragments => {
-                return Err(TransportError::IndeterminateComplete(err.to_string()));
-            }
-            Err(err) => return Err(err),
-        };
+        .await?;
         match reply {
             FrameReply::LargeRequestProgress(reply) => {
                 match LargeRequestControlReply::decode(&reply) {
@@ -4679,6 +4785,30 @@ async fn exchange_large_request(
     Err(TransportError::Other(
         "oversized request contained no fragments".to_string(),
     ))
+}
+
+async fn await_large_request_fragment_reply(
+    exchange: impl std::future::Future<Output = TransportResult<FrameReply>>,
+    fragment_timeout: Duration,
+    final_fragment: bool,
+) -> TransportResult<FrameReply> {
+    let reply = if final_fragment {
+        // The authenticated handler may take longer than fragment_timeout to
+        // apply the complete unit. Keep waiting for its confirmed reply; a
+        // caller cancellation or peer close still ends this exchange.
+        exchange.await
+    } else {
+        tokio::time::timeout(fragment_timeout, exchange)
+            .await
+            .map_err(|_| TransportError::Timeout)?
+    };
+    reply.map_err(|err| {
+        if final_fragment {
+            TransportError::IndeterminateComplete(err.to_string())
+        } else {
+            err
+        }
+    })
 }
 
 fn validate_large_request_progress(
@@ -4828,7 +4958,7 @@ fn durable_large_request_stage_path(identity_path: &Path) -> PathBuf {
 }
 
 /// Remembered bound ports: `(v4, optional v6)`. The file carries `P4` or
-/// `P4,P6`; legacy single-port files stay readable, and the v6 half is
+/// `P4,P6`; a single-port file supplies the v4 port, and the v6 half is
 /// learned and appended on the next bind.
 fn read_sticky_ports(path: &Path) -> Option<(u16, Option<u16>)> {
     let raw = std::fs::read_to_string(path).ok()?;
@@ -4899,15 +5029,15 @@ async fn write_reply(
 #[cfg(test)]
 mod sticky_port_tests {
     use super::{
-        EndpointSpec, IrohServer, LazyBoundServerTransport, MAX_FRAME_BYTES,
+        EndpointSpec, FrameReply, IrohServer, LazyBoundServerTransport, MAX_FRAME_BYTES,
         MAX_RESPONSE_CONTROL_BYTES, MAX_TRACKED_RESPONSE_TRANSFERS, PreAdmissionGuardrails,
         RESPONSE_TRANSFER_IDLE_TIMEOUT, ResponseTransferPaths, Semaphore, ServerResourcePolicy,
-        SyncRouteState, TransportError, client, client_with_lineage_signer,
-        complete_large_response, decode_large_response_control_frame,
-        durable_large_request_stage_path, read_exact_with_progress, read_sticky_ports,
-        stage_large_response, stage_large_response_with_budget, sticky_port_path,
-        sync_client_with_lineage_signer, validate_large_request_progress,
-        validate_large_response_completion,
+        SyncRouteState, TransportError, TransportResult, await_large_request_fragment_reply,
+        client, client_with_lineage_signer, complete_large_response,
+        decode_large_response_control_frame, durable_large_request_stage_path,
+        read_exact_with_progress, read_sticky_ports, stage_large_response,
+        stage_large_response_with_budget, sticky_port_path, sync_client_with_lineage_signer,
+        validate_large_request_progress, validate_large_response_completion,
     };
     use crate::identity::FabricIdentity;
     use crate::transport::large_request_staging::LargeRequestProgress;
@@ -5470,6 +5600,57 @@ mod sticky_port_tests {
         assert!(matches!(
             transport.ensure_single_reply_retry_safe(&payload),
             Err(TransportError::RetryUnsafe(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_oversized_fragment_waits_for_apply_beyond_progress_deadline() {
+        let deadline = std::time::Duration::from_secs(60);
+        let (send_reply, receive_reply) = tokio::sync::oneshot::channel();
+        let final_exchange = tokio::spawn(async move {
+            await_large_request_fragment_reply(
+                async move { receive_reply.await.expect("reply sender remains open") },
+                deadline,
+                true,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(deadline + std::time::Duration::from_secs(1)).await;
+        assert!(!final_exchange.is_finished());
+        assert!(send_reply.send(Ok(FrameReply::Payload(vec![7]))).is_ok());
+        let reply = final_exchange
+            .await
+            .expect("final exchange task joins")
+            .expect("confirmed final reply arrives");
+        assert!(matches!(reply, FrameReply::Payload(bytes) if bytes == [7]));
+
+        let intermediate_exchange = tokio::spawn(async move {
+            await_large_request_fragment_reply(
+                std::future::pending::<TransportResult<FrameReply>>(),
+                deadline,
+                false,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(deadline).await;
+        assert!(matches!(
+            intermediate_exchange
+                .await
+                .expect("intermediate exchange task joins"),
+            Err(TransportError::Timeout)
+        ));
+
+        let closed_peer = await_large_request_fragment_reply(
+            async { Err(TransportError::Unreachable("peer closed".to_string())) },
+            deadline,
+            true,
+        )
+        .await;
+        assert!(matches!(
+            closed_peer,
+            Err(TransportError::IndeterminateComplete(detail)) if detail.contains("peer closed")
         ));
     }
 

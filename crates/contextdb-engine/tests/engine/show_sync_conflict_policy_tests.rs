@@ -174,21 +174,10 @@ const ENGINE_GOVERNED_WORK_LEDGER_TABLES_TRUE_ARBITRATION: [(&str, &str); 7] = [
     ("work_capabilities", "keep_latest"),
 ];
 
-/// Blocker: the cold review proved `work_jobs` (and, by the same gap,
-/// `work_failures`) are engine-governed -- their real arbitration is the
-/// hardcoded override in `work_ledger_conflict_policy_entries_inner`, merged
-/// in unconditionally at every sync chokepoint -- but neither is on the
-/// hub-refereed refusal list (`work_ledger::hub_refereed_engine_owned_conflict_policy_display`
-/// only names the three `ServerWins` tables) NOR on the reserved-shape list
-/// (`executor::ENGINE_OWNED_LEDGER_TABLES` only names `work_inputs`,
-/// `work_capabilities`, `peer_directory`, `work_node_contacts`). So today
-/// `ALTER TABLE work_jobs SET SYNC CONFLICT KEEP LATEST` is silently
-/// ACCEPTED: it rewrites the declared `TableMeta.conflict_policy` that
-/// `SHOW SYNC_CONFLICT_POLICY`'s first (undeclared-table) loop reads, while
-/// the actual sync path keeps arbitrating `keep_first` regardless -- a
-/// declaration that lies about what governs the table. Every one of the
-/// seven engine-governed work-ledger tables must refuse a mismatching local
-/// declaration the same way the three hub-refereed ones already do.
+/// Every engine-governed work-ledger table, including `work_jobs` and
+/// `work_failures`, enforces its engine-selected conflict arbitration and
+/// refuses a mismatching local declaration. `SHOW SYNC_CONFLICT_POLICY`
+/// must report the policy that actually governs sync.
 #[test]
 fn every_engine_governed_work_ledger_table_refuses_a_mismatching_alter() {
     let db = Database::open_memory();

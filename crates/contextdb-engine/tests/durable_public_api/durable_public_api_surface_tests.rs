@@ -1,6 +1,5 @@
 //! External callers may inspect durable state but cannot forge it.
 
-use contextdb_engine::Database;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -231,7 +230,6 @@ fn external_callers_cannot_mutate_sync_progress_or_raw_accounting() {
             "apply_synced_changes_with_receipt",
         ),
         ("role_relative_policy_types", "conflictpolicy"),
-        ("legacy_source_mutation", "execute"),
         ("raw_blob_repository_type", "blob_repository"),
         ("raw_blob_repository_accessor", "blob_repository"),
     ]);
@@ -271,52 +269,6 @@ fn callerless_applied_push_writer_is_absent() {
         "callerless_applied_push_writer",
         "persist_sync_applied_push_watermark_for_node",
     )]);
-}
-
-#[test]
-fn legacy_migration_source_is_read_only_and_current_roots_are_refused_unchanged() {
-    let legacy_methods = method_names(&public_impl_methods(
-        &engine_root().join("src/database.rs"),
-        "LegacyMigrationSource",
-    ));
-    assert_eq!(
-        legacy_methods,
-        BTreeSet::from([
-            "close".to_string(),
-            "copy_locked_source_to".to_string(),
-            "keyless_table_rows".to_string(),
-            "migrate_in_place".to_string(),
-        ]),
-        "the validated legacy source may expose only its fixed read-only snapshot, its untouched \
-         backup copy, its close operation, and the one door that performs a migration whole -- \
-         never the durability-mutating operations that door alone may drive, and never a handle \
-         onto the store it is building"
-    );
-
-    let dir = tempfile::tempdir().expect("current-format tempdir");
-    let path = dir.path().join("current.db");
-    let db = Database::open(&path).expect("create current-format database");
-    db.execute(
-        "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT)",
-        &Default::default(),
-    )
-    .expect("seed current-format schema");
-    db.close().expect("close current-format database");
-    let before = std::fs::read(&path).expect("read current-format bytes before refusal");
-
-    let err = match Database::open_legacy_for_migration(&path) {
-        Ok(_) => panic!("a current-format root must not become a privileged migration source"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("already current-format"),
-        "the typed migration boundary must explain the current-format refusal: {err}"
-    );
-    assert_eq!(
-        std::fs::read(&path).expect("read current-format bytes after refusal"),
-        before,
-        "validating a rejected current-format source must be read-only"
-    );
 }
 
 #[test]

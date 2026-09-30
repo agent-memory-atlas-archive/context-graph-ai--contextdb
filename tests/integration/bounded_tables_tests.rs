@@ -441,38 +441,58 @@ fn c7_prune_report_states_rows_bytes_reclaimed_and_whether_the_file_shrank() {
     );
 }
 
-/// `reclaimed_bytes` must describe the data that actually went. Two populations
-/// with the same row count and materially different payloads must report
-/// materially different reclaim — a constant, or a row-count-derived number,
-/// fails this.
+/// `reclaimed_bytes` is the MEMORY a prune handed back, not the room the file
+/// gave up. A committed body larger than the inline ceiling does not live in
+/// the resident directory at all, so pruning it releases the same resident
+/// bytes a small row does — while the table's size answer, which describes
+/// what is stored, falls by the whole payload. The two numbers mean different
+/// things and this pins both.
 #[test]
-fn c7_reclaimed_bytes_track_the_size_of_what_was_pruned() {
-    fn reclaim_for(dir: &tempfile::TempDir, name: &str, payload_bytes: usize) -> u64 {
+fn c7_reclaimed_bytes_track_the_memory_released_not_the_file_room() {
+    fn prune_report(dir: &tempfile::TempDir, name: &str, payload_bytes: usize) -> (u64, u64, u64) {
         let (clock, _guard) = MockClock::install(T0);
         let db = open_fragmentable_db(&dir.path().join(name));
         insert_rows(&db, "windows", 1..201, &"q".repeat(payload_bytes));
+        let filled = db
+            .table_size_estimate("windows")
+            .expect("size answer before the prune");
         clock.advance(RETENTION_WINDOW_MILLIS * 2);
         let report = db.run_pruning_cycle_checked().expect("prune cycle");
         assert_eq!(
             report.pruned_rows, 200,
             "both populations prune the same row count: {report:?}"
         );
-        report.reclaimed_bytes
+        let pruned = db
+            .table_size_estimate("windows")
+            .expect("size answer after the prune");
+        (
+            report.reclaimed_bytes,
+            filled.estimated_live_bytes,
+            pruned.estimated_live_bytes,
+        )
     }
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let small = reclaim_for(&dir, "small.db", 64);
-    let large = reclaim_for(&dir, "large.db", 8 * 1024);
+    let (small_reclaim, _, _) = prune_report(&dir, "small.db", 64);
+    let (large_reclaim, large_filled, large_pruned) = prune_report(&dir, "large.db", 8 * 1024);
 
     assert!(
-        large > small,
-        "the same number of much larger rows must reclaim more \
-         (small={small}, large={large})"
+        small_reclaim > 0 && large_reclaim > 0,
+        "a prune that removed rows reports the memory it released \
+         (small={small_reclaim}, large={large_reclaim})"
+    );
+    // The control: the stored payload is an order of magnitude larger than the
+    // memory its prune released, because the directory never held it.
+    let stored_release = large_filled.saturating_sub(large_pruned);
+    assert!(
+        stored_release >= 200 * 8 * 1024,
+        "the table's size answer falls by the whole stored payload \
+         (filled={large_filled}, pruned={large_pruned})"
     );
     assert!(
-        large >= small.saturating_mul(4),
-        "and the difference must scale with the payload, not be a token increment \
-         (small={small}, large={large})"
+        stored_release > large_reclaim.saturating_mul(4),
+        "reclaimed memory is not the file's room and must not be read as it \
+         (reclaimed={large_reclaim}, stored={stored_release})"
     );
 }
 

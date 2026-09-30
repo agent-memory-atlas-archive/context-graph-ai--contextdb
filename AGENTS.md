@@ -31,23 +31,11 @@ there, run them freely and without asking.
 | Goal | Sanctioned command | Guardrail |
 |---|---|---|
 | Find out why a store will not open | `contextdb diagnose <path>` | Read-only. Always safe. Start here. |
-| Bring a legacy-format root forward | `contextdb migrate <path>` | Rehearse on a copy first (procedure below). Writes `<path>.bak`. |
 | Recreate a wedged or corrupt store | `contextdb reset <path> --force` | Destroys all data. Recover what you need from a backup or a healthy sync peer first. `--force` is mandatory; without it the CLI refuses and exits `2`. |
-| Take a backup before any of the above | `contextdb snapshot export <path> <dest>` | Purge-fenced; the safe prerequisite for `migrate` and `reset`. |
+| Take a backup before any of the above | `contextdb snapshot export <path> <dest>` | Purge-fenced; the safe prerequisite for `reset`. |
 | Apply declared `RETAIN` windows now instead of waiting for the background cycle | `.maintenance run` (REPL meta-command) | Synchronous; expires rows the table's own DDL already declared expirable. |
 | Erase rows permanently | `contextdb purge <path> --table <t> --force` | Purge-fenced; refuses without `--force` (exit `2`). Only legal on a store that has never connected to a sync hub. |
 | Make a route, sink or schedule actually fire | Run the DDL in a `:memory:` CLI session; inspect with `.events status` | In an ephemeral `:memory:` session the CLI registers default callbacks, so routes deliver and schedules fire observably. On a file-backed store, events queue durably until your own program registers its callbacks (`register_sink` / `register_cron_callback`) — that durable queueing is the contract, not a gap. |
-
-### Migration rehearsal — run these four steps in order, do not add flags
-
-1. `scratch="$(mktemp -d)"; cp ./prod.db "$scratch/rehearsal.db"` — never rehearse in place.
-2. `contextdb migrate "$scratch/rehearsal.db"` — expect `migrated ... in place (N rows ...)`.
-3. `echo ".tables" | contextdb "$scratch/rehearsal.db" --json`, plus the reads your application
-   performs; confirm the rows are present.
-4. Only if step 3 is clean: `contextdb snapshot export ./prod.db <dest>`, then `contextdb migrate ./prod.db`.
-
-If step 2 says the store is already current-format, there is nothing to migrate — stop; do not
-reach for `reset`.
 
 ### One cargo build at a time, and check the disk first
 
@@ -90,10 +78,10 @@ Task-shaped recipes, copy-paste runnable. Read the one matching what you are doi
 
 | Skill | What it's for | Path |
 |---|---|---|
-| `using-contextdb` | Open a database, define tables, run SQL (including multi-line paste), read `--json`, branch on exit codes. | [`skills/using-contextdb/SKILL.md`](skills/using-contextdb/SKILL.md) |
+| `using-contextdb` | Open a database, define tables, run SQL (including multi-line paste), read `--json`, recover after a refused statement, branch on exit codes. | [`skills/using-contextdb/SKILL.md`](skills/using-contextdb/SKILL.md) |
 | `querying-the-graph` | Declare a DAG edge table, traverse it with `GRAPH_TABLE`, get cycle inserts refused, enforce `STATE MACHINE` transitions with `PROPAGATE` cascades. | [`skills/querying-the-graph/SKILL.md`](skills/querying-the-graph/SKILL.md) |
 | `running-triggers-and-schedules` | Declare `CREATE EVENT TYPE`/`SINK`/`ROUTE`/`SCHEDULE`, see them fire observably in `:memory:`, and wire `register_sink`/`register_cron_callback` so a file-backed store's durably-queued events actually deliver. | [`skills/running-triggers-and-schedules/SKILL.md`](skills/running-triggers-and-schedules/SKILL.md) |
-| `sync` | Stand up a hub, enroll an edge with its ticket, push/pull, and read the applied / skipped / conflicts counts correctly. | [`skills/sync/SKILL.md`](skills/sync/SKILL.md) |
+| `sync` | Stand up a hub, enroll an edge with its ticket, push/pull, change synced columns explicitly, and read the applied / skipped / conflicts counts correctly. | [`skills/sync/SKILL.md`](skills/sync/SKILL.md) |
 | `vector-search` | Embedding columns, `<=>` nearest-neighbour search, schema-declared `USE RANK` policies, and the hybrid graph + vector query. | [`skills/vector-search/SKILL.md`](skills/vector-search/SKILL.md) |
 | `work-fabric` | Hand a job to another machine over the work ledger and move the bytes it needs over the blob plane. Library API — no CLI. | [`skills/work-fabric/SKILL.md`](skills/work-fabric/SKILL.md) |
 | `operating-a-store` | Enforce `RETAIN` windows on demand with `.maintenance run`, permanently erase rows with `purge` (never-connected stores only), back up before a destructive op, and read `pull_pages_read` sync liveness. | [`skills/operating-a-store/SKILL.md`](skills/operating-a-store/SKILL.md) |
@@ -105,7 +93,7 @@ Reference docs, when a skill is not enough:
 | [`docs/getting-started.md`](docs/getting-started.md) | Install, first REPL session, embedding as a library, two-machine sync |
 | [`docs/cli.md`](docs/cli.md) | Every flag and meta-command, the `--json` document shapes, the exit-code table |
 | [`docs/query-language.md`](docs/query-language.md) | SQL surface, `GRAPH_TABLE` traversal, vector search, constraints, what is unsupported |
-| [`docs/architecture.md`](docs/architecture.md) | Crate map, MVCC, sync protocol, work ledger and blob plane, upgrades and recovery |
+| [`docs/architecture.md`](docs/architecture.md) | Crate map, MVCC, sync protocol, work ledger and blob plane, store format and recovery |
 | [`docs/usage-scenarios.md`](docs/usage-scenarios.md) | Walkthroughs with SQL |
 | [`docs/why-contextdb.md`](docs/why-contextdb.md) | Problem statement and comparison with alternatives |
 | [`docs/capability-index.md`](docs/capability-index.md) | One page: what contextdb is, is not, and the numbers it stops at |
@@ -135,6 +123,7 @@ Describe the capability, then go to the crate that owns it — do not go looking
 | A new scalar SQL function | ONE match arm in the engine crate's executor (`eval_function`), plus the ORDER BY allowlist (`is_known_scalar_function`), plus tests. The parser takes function calls generically and the planner needs nothing. |
 | A function that works in `SELECT` but is refused in `ORDER BY` | You added it to `eval_function` only. Those two lists are hand-synced with no cross-reference — add every new function to both. |
 | Grammar, DDL clauses, `PROPAGATE` | Parser crate; grammar reference is [`docs/query-language.md`](docs/query-language.md). |
+| Partial synced ALTER, explicit column drop/rename, ordered schema replay | Engine `database.rs` (author markers, schema projection and received-unit replay); durable installation in `persistence.rs`. Never infer a drop or rename from omitted columns. |
 | Sync protocol, conflict arbitration, work ledger | Engine crate owns the implementations; the server crate re-exports them. Never add a mirror module in the server — extend the engine and re-export. |
 | How a bounded read session opens and which route it takes | Engine crate, `read_session.rs` — it assembles the one public `ReadSession` and its two routes. Adding a third route, or a second way to open a store for reading, is out of bounds. |
 | Reading a store nobody owns (the committed-snapshot file route) | Engine crate, `direct_file_reader.rs`. |
@@ -143,9 +132,10 @@ Describe the capability, then go to the crate that owns it — do not go looking
 | How a read is actually executed and charged against its budgets | Engine crate, `executor/bounded.rs` — the one execution kernel both routes share. Never give a consumer its own execution semantics. |
 | The trusted companion, the claim window, reader holds, published reader identities | Engine crate, `persistence.rs`. |
 | A refusal class or kind a reader can branch on | Core crate, `read_contract.rs` — the shared typed vocabulary. Never define a second refusal type downstream of it. |
-| Vector search: routes, partition layouts, the global top-k merge, generation lifecycle, per-column vector policy | Vector crate (`store.rs`, `hnsw.rs`, `mem.rs`). Where generation bytes are stored and when maintenance runs stay in the engine crate. |
+| Vector search: routes, partition layouts, the global top-k merge, generation lifecycle, per-column vector policy | Vector crate (`store.rs`, `hnsw.rs`, `mem.rs`). Raw payload sharing and each column's charge ownership live in `store.rs` / `quantized.rs`; generation persistence and maintenance scheduling stay in the engine crate. |
+| Vector generation admission, catalog inventory, journal cleanup or cancellation | Engine `database.rs`, `database/vector_maintenance_inventory.rs`, `database/vector_source_page_admission.rs` and `persistence.rs`. Vector `store.rs` selects resident frontier-live inputs; cold snapshots and delete-only carriers retain their raw-history path. |
 | A graph primitive vector search cannot build on top of the HNSW fork | HNSW crate, as the smallest upstream-shaped change, plus its `upstream-0.3.4.patch` and `MAINTENANCE.md`. Anything composable goes in the vector crate's `hnsw.rs` instead. |
-| A storage primitive (compaction step, read admission) the engine cannot build on top of redb | redb fork crate, same rule: smallest change, patch and `MAINTENANCE.md` updated. Compaction policy stays in the engine's `persistence.rs`. |
+| A storage primitive (compaction step, read admission, bounded byte-table lookup or cursor) the engine cannot build on top of redb | redb fork crate, same rule: smallest change, patch and `MAINTENANCE.md` updated. Byte-node validation and reject-only windows live in `tree_store/bounded_bytes.rs`; compaction and inventory policy stay in the engine. |
 | A `contextdb-server` flag, exit code, automatic push trigger, or worker poll loop | Server crate (`main.rs`, `exit_codes.rs`, `sync_plugin.rs`, `work_ledger.rs`). |
 | Anything else | [`docs/architecture.md`](docs/architecture.md#crate-map) maps all 11 crates and the dependency direction. |
 

@@ -15,7 +15,9 @@ use contextdb_engine::sync_types::{
 use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -4605,7 +4607,7 @@ async fn cp07_row_update_propagates_through_sync() {
 }
 
 /// Push retry succeeds when server subscribes late.
-/// Start CLI push BEFORE server is running. Server starts during retry window.
+/// Start push BEFORE server is running. Server starts after the first status probe.
 /// Push must succeed, not fail.
 #[tokio::test]
 async fn cp08_push_retry_succeeds_when_server_starts_late() {
@@ -4613,7 +4615,7 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
     let edge_identity = Arc::new(FabricIdentity::generate());
     // A caller knows which hub it is dialing before that hub has registered
     // its routes. Advertise the stable hub identity without starting a server
-    // so the first push exercises retry-after-no-responder, not identity
+    // so the first status probe exercises no-responder recovery, not identity
     // discovery failure.
     let _announced_hub = sync.server();
 
@@ -4641,7 +4643,7 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
         )
         .unwrap();
 
-    // Start push BEFORE server is running — it must retry
+    // Start push BEFORE server is running — its status probe must run first.
     let push_handle = {
         tokio::spawn({
             let fabric = sync.fabric.clone();
@@ -4662,10 +4664,10 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         sync.fabric
-            .wait_for_request_attempt_for_test(&contextdb_server::subjects::push_subject("cp08")),
+            .wait_for_request_attempt_for_test(&contextdb_server::subjects::status_subject("cp08")),
     )
     .await
-    .expect("the first push attempt must happen before the server starts");
+    .expect("the first status attempt must happen before the server starts");
 
     let server = Arc::new(
         SyncServer::with_authenticated_transport_and_identity_for_test(
@@ -4682,7 +4684,7 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
     });
     sync.wait_for_server("cp08").await;
 
-    // Push must succeed (retried and found server)
+    // Push must succeed after the server starts.
     let push_result = tokio::time::timeout(std::time::Duration::from_secs(15), push_handle)
         .await
         .expect("push must complete within 15s")
@@ -4707,9 +4709,193 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
     server_db.close().unwrap();
 }
 
+#[derive(Clone, Copy)]
+enum ExactLookupFault {
+    NoResponder,
+    Status,
+    Timeout,
+    MalformedReply,
+}
+
+struct FaultOnFirstExactStatus {
+    inner: Arc<dyn contextdb_server::transport::ClientTransport>,
+    fault: ExactLookupFault,
+    initial_statuses: AtomicUsize,
+    exact_statuses: AtomicUsize,
+}
+
+impl contextdb_server::transport::ClientTransport for FaultOnFirstExactStatus {
+    fn ensure_connected<'a>(&'a self) -> contextdb_server::transport::TransportFuture<'a, ()> {
+        self.inner.ensure_connected()
+    }
+
+    fn peer_node_id(&self) -> Option<String> {
+        self.inner.peer_node_id()
+    }
+
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
+    }
+
+    fn request<'a>(
+        &'a self,
+        subject: &'a str,
+        request_bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> contextdb_server::transport::TransportFuture<'a, Vec<u8>> {
+        self.inner.request(subject, request_bytes, timeout)
+    }
+
+    fn request_single_reply<'a>(
+        &'a self,
+        subject: &'a str,
+        request_bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> contextdb_server::transport::TransportFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            if subject.ends_with(".status") {
+                let envelope = contextdb_server::protocol::decode(&request_bytes)
+                    .expect("the client sends a framed status probe");
+                let probe: contextdb_server::protocol::SyncStatusRequest =
+                    rmp_serde::from_slice(&envelope.payload)
+                        .expect("the probe exposes exact candidate digests");
+                if probe.refused_schema_unit_digests.is_empty() {
+                    self.initial_statuses.fetch_add(1, Ordering::SeqCst);
+                } else if self.exact_statuses.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return match self.fault {
+                        ExactLookupFault::NoResponder => {
+                            Err(contextdb_server::transport::TransportError::NoResponder)
+                        }
+                        ExactLookupFault::Status => {
+                            Err(contextdb_server::transport::TransportError::Status(
+                                "temporary status channel fault".into(),
+                            ))
+                        }
+                        ExactLookupFault::Timeout => {
+                            Err(contextdb_server::transport::TransportError::Timeout)
+                        }
+                        ExactLookupFault::MalformedReply => Ok(vec![0, 1, 2]),
+                    };
+                }
+            }
+            self.inner
+                .request_single_reply(subject, request_bytes, timeout)
+                .await
+        })
+    }
+
+    fn ensure_single_reply_retry_safe(
+        &self,
+        request_bytes: &[u8],
+    ) -> contextdb_server::transport::TransportResult<()> {
+        self.inner.ensure_single_reply_retry_safe(request_bytes)
+    }
+
+    fn shutdown<'a>(&'a self) -> contextdb_server::transport::TransportFuture<'a, ()> {
+        self.inner.shutdown()
+    }
+}
+
+#[tokio::test]
+async fn exact_authored_refusal_lookup_retries_transient_transport_misses_only() {
+    for fault in [
+        ExactLookupFault::NoResponder,
+        ExactLookupFault::Status,
+        ExactLookupFault::Timeout,
+        ExactLookupFault::MalformedReply,
+    ] {
+        let sync = start_sync_fixture().await;
+        let tenant = "exact-refusal-lookup-retry";
+        let edge_db = Arc::new(Database::open_memory());
+        let hub_db = Arc::new(Database::open_memory());
+        edge_db
+            .execute(
+                "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP FIRST",
+                &HashMap::new(),
+            )
+            .unwrap();
+        let id = Uuid::new_v4();
+        edge_db
+            .execute(
+                "INSERT INTO items (id, name) VALUES ($id, $name)",
+                &HashMap::from([
+                    ("id".into(), Value::Uuid(id)),
+                    ("name".into(), Value::Text("from edge".into())),
+                ]),
+            )
+            .unwrap();
+        let server = Arc::new(
+            SyncServer::with_authenticated_transport_and_identity_for_test(
+                hub_db.clone(),
+                sync.server(),
+                contextdb_core::TenantId::from(tenant),
+                sync.hub_identity().node_id(),
+                sync.hub_identity(),
+            ),
+        );
+        let handle = tokio::spawn({
+            let server = server.clone();
+            async move { server.run().await }
+        });
+        sync.wait_for_server(tenant).await;
+        let transport = Arc::new(FaultOnFirstExactStatus {
+            inner: sync.client(),
+            fault,
+            initial_statuses: AtomicUsize::new(0),
+            exact_statuses: AtomicUsize::new(0),
+        });
+        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+            edge_db,
+            transport.clone(),
+            contextdb_core::TenantId::from(tenant),
+            sync.edge_identity(),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(30), client.push())
+            .await
+            .expect("a status exchange completes");
+        assert!(
+            transport.initial_statuses.load(Ordering::SeqCst) > 0,
+            "the initial empty status probe reached the hub first"
+        );
+        if matches!(fault, ExactLookupFault::MalformedReply) {
+            assert!(
+                result.is_err(),
+                "an invalid authenticated reply refuses push"
+            );
+            assert_eq!(transport.exact_statuses.load(Ordering::SeqCst), 1);
+            assert!(hub_db.table_meta("items").is_none());
+        } else {
+            assert!(
+                result.is_ok(),
+                "a transient exact lookup miss is retried: {result:?}"
+            );
+            assert_eq!(transport.exact_statuses.load(Ordering::SeqCst), 2);
+            assert!(
+                hub_db
+                    .point_lookup("items", "id", &Value::Uuid(id), hub_db.snapshot())
+                    .unwrap()
+                    .is_some(),
+                "the authored schema and its row arrived after the retry"
+            );
+        }
+        handle.abort();
+    }
+}
+
 #[test]
 fn integrity_11_sync_apply_respects_memory_limit() {
-    let accountant = Arc::new(MemoryAccountant::with_budget(8 * 1024));
+    // 2 KiB over the schema, which is less than the 4 KiB row the apply below
+    // must be refused for. The single-column PRIMARY KEY allocates a fixed
+    // 64 KiB exact-probe bitmap for the life of the index; it always did, and
+    // since the charge model was corrected the accountant sees it, so the
+    // headroom this arm depends on has to be stated separately from it.
+    let accountant = Arc::new(MemoryAccountant::with_budget(
+        contextdb_core::EXACT_PROBE_FILTER_BYTES + 2 * 1024,
+    ));
     let db = Database::open_memory_with_accountant(accountant);
     db.execute(
         "CREATE TABLE items (id UUID PRIMARY KEY, data TEXT)",

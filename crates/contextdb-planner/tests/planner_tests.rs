@@ -1,5 +1,5 @@
 use contextdb_core::Error;
-use contextdb_parser::parse;
+use contextdb_parser::{ast::Statement, parse};
 use contextdb_planner::{PhysicalPlan, plan};
 
 #[test]
@@ -64,6 +64,28 @@ fn depth_over_cap_rejected() {
         }
         Err(other) => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn use_rank_requires_vector_order_and_limit() {
+    let without_vector =
+        parse("SELECT id FROM observations ORDER BY id USE RANK score LIMIT 5").unwrap();
+    assert!(matches!(
+        plan(&without_vector),
+        Err(Error::UseRankRequiresVectorOrder)
+    ));
+
+    let mut without_limit =
+        parse("SELECT id FROM observations ORDER BY embedding <=> $vec USE RANK score LIMIT 5")
+            .unwrap();
+    let Statement::Select(select) = &mut without_limit else {
+        panic!("expected SELECT statement");
+    };
+    select.body.limit = None;
+    assert!(matches!(
+        plan(&without_limit),
+        Err(Error::UseRankRequiresLimit)
+    ));
 }
 
 #[test]

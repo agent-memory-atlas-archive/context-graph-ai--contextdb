@@ -1,4 +1,7 @@
-use crate::hnsw::{HnswAllowedSearchIncomplete, HnswAllowedSearchLimits, HnswAllowedSearchStatus};
+use crate::hnsw::{
+    BoundedHnswQuerySelfScores, HnswAllowedSearchIncomplete, HnswAllowedSearchLimits,
+    HnswAllowedSearchStatus,
+};
 use crate::memory_budget::{MemoryBudget, unlimited_memory_budget};
 use crate::{
     HnswIndex,
@@ -50,6 +53,156 @@ pub fn with_search_policy_limit<T>(limit: usize, operation: impl FnOnce() -> T) 
 
 fn search_policy_limit(k: usize) -> usize {
     SEARCH_POLICY_LIMIT.with(|value| value.get().unwrap_or(k))
+}
+
+/// What one graph-walk evaluation costs, in nanoseconds.
+///
+/// Measured, not fitted: release build on the lane host (AMD Ryzen 9 6900HX,
+/// 16 CPUs), file route through a real `ReadSession`, one Context of 12,500
+/// vectors x 768 at `EF_SEARCH = 400`, graph built at `M = 24`, 100 held-out
+/// queries timed on a warm second pass. The walk answered at 51.5 ms warm
+/// p95 over 9,733 evaluations (admission plus expansion, mean); 51.5 ms /
+/// 9,733 = 5.3 us. Raw log:
+/// `logs/f11-step4c-12500-ef400-91a02804.log` (summary line `mode=INDEXED`).
+pub const AUTO_WALK_EVALUATION_NANOS: u64 = 5_300;
+
+/// What one exhaustive comparison costs, in nanoseconds, measured in the same
+/// run as [`AUTO_WALK_EVALUATION_NANOS`]: the exhaustive route over the same
+/// 12,500 vectors answered at 847.7 ms warm p95; 847.7 ms / 12,500 = 67.8 us.
+/// It is this much dearer than a walk evaluation because it reads and
+/// authenticates each row's own stored body rather than the graph's copy.
+/// Raw log: `logs/f11-step4c-12500-ef400-91a02804.log` (summary line
+/// `mode=EXACT`).
+pub const AUTO_EXHAUSTIVE_COMPARISON_NANOS: u64 = 67_800;
+
+/// A resident comparison does not read or authenticate a durable body.
+/// Measured in release on the same Ryzen 9 6900HX host: 2,000 resident
+/// vectors x 32 dimensions, 100 held-out exhaustive queries, 3,395 ns per
+/// comparison including bounded query setup.
+pub const AUTO_IN_MEMORY_EXHAUSTIVE_COMPARISON_NANOS: u64 = 3_400;
+
+/// Why AUTO answered a whole statement by comparing its admitted rows.
+pub const AUTO_STATEMENT_EXHAUSTIVE_REASON: &str = "statement_exhaustive_cheaper_than_walk";
+
+/// The walk budget a statement's one search is given, `cap(ef, k) x
+/// M_max0`, for a caller that knows the widest admitted serving graph only by
+/// its declared degree: the layer-0 maximum degree comes from the build's own
+/// definition of that layer, the same one the loaded graphs report.
+#[doc(hidden)]
+pub fn auto_statement_walk_budget(ef_search: usize, k: usize, serving_hnsw_m: usize) -> usize {
+    crate::hnsw::union_candidate_budget(
+        ef_search,
+        k,
+        hnsw_rs::hnsw::layer0_max_nb_connection(serving_hnsw_m),
+    )
+}
+
+/// The file-route crossover for a statement whose admitted bodies must all
+/// be read and authenticated. The live decision prices each source separately
+/// because some statements mix resident and stored bodies.
+///
+/// The walk's whole budget is one search over every admitted Context. The
+/// comparison side reads every admitted row once, at the file-route cost.
+#[doc(hidden)]
+pub fn auto_statement_prefers_exhaustive(
+    walk_budget: usize,
+    aggregate_allowed_count: usize,
+) -> bool {
+    auto_statement_prefers_exhaustive_at_cost(
+        walk_budget,
+        (aggregate_allowed_count as u128)
+            .saturating_mul(u128::from(AUTO_EXHAUSTIVE_COMPARISON_NANOS)),
+    )
+}
+
+fn auto_statement_prefers_exhaustive_at_cost(walk_budget: usize, exhaustive_nanos: u128) -> bool {
+    exhaustive_nanos <= (walk_budget as u128).saturating_mul(u128::from(AUTO_WALK_EVALUATION_NANOS))
+}
+
+/// Estimate the work a healthy graph search spends before its budget. On a
+/// 2,048-row corpus the measured expansion was 315-1,364 evaluations against
+/// a 3,200 allowance; at 12,500 rows it was about 9,700 against 19,200. The
+/// estimate reaches the full allowance at 20,000 admitted rows. Layer opening
+/// is added separately, so splitting rows can make exhaustive work cheaper.
+fn auto_statement_expected_expansion(budget: usize, allowed: usize) -> usize {
+    budget.saturating_mul(allowed).div_ceil(20_000).min(budget)
+}
+
+/// Price one graph's entry and greedy descent through layer zero. Each
+/// successive level reduces the live population by about its build degree;
+/// the bottom layer can expose up to the stored layer-zero maximum degree.
+fn auto_layer_admission_estimate(live: usize, m: usize, layer_zero_degree: usize) -> usize {
+    let mut remaining = live.max(1);
+    let mut levels = 0usize;
+    while remaining > 1 {
+        remaining = remaining.div_ceil(m.max(2));
+        levels += 1;
+    }
+    layer_zero_degree.max(1).saturating_mul(levels.max(1))
+}
+
+/// What one admitted partition cost this find, in the order it was entered.
+#[allow(clippy::too_many_arguments)]
+fn note_partition_attribution(
+    route: &str,
+    reason: &str,
+    live_count: usize,
+    entry_count: usize,
+    allowed_count: usize,
+    ef_search: usize,
+    exact_comparisons: usize,
+    layers: &std::cell::Cell<u64>,
+    visited: &std::cell::Cell<u64>,
+    evaluations: &std::cell::Cell<u64>,
+    started: std::time::Instant,
+    pages_before: (u64, u64, u64, u64),
+) {
+    use contextdb_core::find_attribution::Field;
+    if !contextdb_core::find_attribution::enabled() {
+        return;
+    }
+    let pages_now = contextdb_core::find_attribution::page_meters();
+    contextdb_core::find_attribution::note_partition(vec![
+        (
+            "page_lookups".to_string(),
+            Field::Count(pages_now.0.saturating_sub(pages_before.0)),
+        ),
+        (
+            "page_hits".to_string(),
+            Field::Count(pages_now.1.saturating_sub(pages_before.1)),
+        ),
+        (
+            "page_fills".to_string(),
+            Field::Count(pages_now.2.saturating_sub(pages_before.2)),
+        ),
+        (
+            "page_fill_bytes".to_string(),
+            Field::Count(pages_now.3.saturating_sub(pages_before.3)),
+        ),
+        ("route".to_string(), Field::Text(route.to_string())),
+        ("reason".to_string(), Field::Text(reason.to_string())),
+        ("live_count".to_string(), Field::Count(live_count as u64)),
+        ("entry_count".to_string(), Field::Count(entry_count as u64)),
+        (
+            "allowed_count".to_string(),
+            Field::Count(allowed_count as u64),
+        ),
+        ("ef_search".to_string(), Field::Count(ef_search as u64)),
+        (
+            "exact_comparisons".to_string(),
+            Field::Count(exact_comparisons as u64),
+        ),
+        ("layers_searched".to_string(), Field::Count(layers.get())),
+        ("visited_nodes".to_string(), Field::Count(visited.get())),
+        (
+            "vector_evaluations".to_string(),
+            Field::Count(evaluations.get()),
+        ),
+        (
+            "ms".to_string(),
+            Field::Millis(started.elapsed().as_nanos() as f64 / 1e6),
+        ),
+    ]);
 }
 
 fn partition_key_has_prefix(key: &VectorPartitionKey, prefix: &VectorPartitionKey) -> bool {
@@ -111,87 +264,6 @@ struct ScoreCredit {
 impl Drop for ScoreCredit {
     fn drop(&mut self) {
         self.budget.release(self.bytes);
-    }
-}
-
-/// Candidate row ids restricted to one partition. The allocation remains
-/// charged while every graph layer in that partition reuses the slice.
-struct SearchCandidateIds {
-    rows: Vec<u64>,
-    credit: ScoreCredit,
-}
-
-impl SearchCandidateIds {
-    fn new(budget: Arc<dyn MemoryBudget>) -> Self {
-        Self {
-            rows: Vec::new(),
-            credit: ScoreCredit { budget, bytes: 0 },
-        }
-    }
-
-    fn try_push(&mut self, row_id: RowId) -> Result<()> {
-        let wanted = self
-            .rows
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| Error::Other("partition candidate capacity overflow".into()))?;
-        if wanted > self.rows.capacity() {
-            let requested_capacity = if self.rows.capacity() == 0 {
-                wanted
-            } else {
-                self.rows
-                    .capacity()
-                    .checked_mul(2)
-                    .ok_or_else(|| Error::Other("partition candidate capacity overflow".into()))?
-                    .max(wanted)
-            };
-            let requested_bytes = requested_capacity
-                .checked_mul(std::mem::size_of::<u64>())
-                .ok_or_else(|| Error::Other("partition candidate capacity overflow".into()))?;
-            let mut replacement = Self::new(self.credit.budget.clone());
-            replacement.credit.budget.try_allocate_for(
-                requested_bytes,
-                "vector_search",
-                "partition_candidates",
-                "Narrow the authorized scope or raise MEMORY_LIMIT.",
-            )?;
-            replacement.credit.bytes = requested_bytes;
-            replacement
-                .rows
-                .try_reserve_exact(requested_capacity)
-                .map_err(|_| Error::Other("partition candidate allocation failed".into()))?;
-            let actual_bytes = replacement
-                .rows
-                .capacity()
-                .checked_mul(std::mem::size_of::<u64>())
-                .ok_or_else(|| Error::Other("partition candidate capacity overflow".into()))?;
-            if actual_bytes > requested_bytes {
-                replacement.credit.budget.try_allocate_for(
-                    actual_bytes - requested_bytes,
-                    "vector_search",
-                    "partition_candidates",
-                    "Narrow the authorized scope or raise MEMORY_LIMIT.",
-                )?;
-                replacement.credit.bytes = actual_bytes;
-            }
-            replacement.rows.extend_from_slice(&self.rows);
-            let old = std::mem::replace(self, replacement);
-            drop(old);
-        }
-        self.rows.push(row_id.0);
-        Ok(())
-    }
-
-    fn sort_unstable(&mut self) {
-        self.rows.sort_unstable();
-    }
-}
-
-impl std::ops::Deref for SearchCandidateIds {
-    type Target = [u64];
-
-    fn deref(&self) -> &Self::Target {
-        &self.rows
     }
 }
 
@@ -445,6 +517,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn bounded_exact_merge_state<E>(
+    index: &VectorIndexRef,
     state: &crate::store::IndexState,
     query: &[f32],
     k: usize,
@@ -452,7 +525,9 @@ fn bounded_exact_merge_state<E>(
     snapshot: SnapshotId,
     scores: &mut Vec<(RowId, f32)>,
     retained_bytes: &mut usize,
+    bodies: &mut crate::store::RawVectorBodyReads,
     before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
+    before_candidate: &mut impl FnMut() -> std::result::Result<(), E>,
     before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     release_retained: &mut impl FnMut(usize),
@@ -460,25 +535,127 @@ fn bounded_exact_merge_state<E>(
 where
     E: From<Error>,
 {
+    // An exhaustive search reads each row's own stored body. It is the route a
+    // caller reaches for when the maintained graph is gone or suspect, so it
+    // never takes its numbers from one -- and it reads those bodies one at a
+    // time through the statement's one open read, admitting each before it is
+    // read, so it never needs room for a whole partition of them.
+    if let Some(candidate_ids) = candidates {
+        let mut compared = 0usize;
+        for raw_row_id in candidate_ids {
+            before_source_entry()?;
+            let row_id = RowId(*raw_row_id);
+            let Some(score) = state.bounded_score_stored_body(
+                index,
+                row_id,
+                snapshot,
+                query,
+                bodies,
+                before_source_entry,
+                before_distance,
+                before_retain,
+                release_retained,
+            )?
+            else {
+                continue;
+            };
+            compared = compared.checked_add(1).ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded exact vector count overflow".to_string(),
+                ))
+            })?;
+            merge_bounded_vector_score(
+                scores,
+                retained_bytes,
+                (row_id, score),
+                k,
+                before_source_entry,
+                before_retain,
+                release_retained,
+            )?;
+        }
+        return Ok(compared);
+    }
     before_source_entry()?;
+    // A partition whose vectors fit is loaded once and compared from memory,
+    // which every later find reuses. Only when the memory to hold it is
+    // refused does the comparison read the bodies one at a time instead, so a
+    // find the reader could not hold is answered rather than refused, and a
+    // find it could hold does not re-read every body on every call.
+    let stream = state.streams_raw_bodies()
+        && match state.ensure_raw_vectors_loaded() {
+            Ok(()) => false,
+            Err(Error::MemoryBudgetExceeded { .. }) => true,
+            Err(error) => return Err(E::from(error)),
+        };
+    if stream {
+        let mut compared = 0usize;
+        let mut position = 0usize;
+        loop {
+            before_source_entry()?;
+            let Some(visible) = state.visible_directory_row_at(position, snapshot) else {
+                break;
+            };
+            position = position.checked_add(1).ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded exact vector position overflow".to_string(),
+                ))
+            })?;
+            // The one exhaustive-scan charge for this directory entry; dead and
+            // future versions consumed the step too.
+            before_candidate()?;
+            let Some(row_id) = visible else {
+                continue;
+            };
+            let Some(score) = state.bounded_score_stored_body(
+                index,
+                row_id,
+                snapshot,
+                query,
+                bodies,
+                before_source_entry,
+                before_distance,
+                before_retain,
+                release_retained,
+            )?
+            else {
+                continue;
+            };
+            compared = compared.checked_add(1).ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded exact vector count overflow".to_string(),
+                ))
+            })?;
+            merge_bounded_vector_score(
+                scores,
+                retained_bytes,
+                (row_id, score),
+                k,
+                before_source_entry,
+                before_retain,
+                release_retained,
+            )?;
+        }
+        return Ok(compared);
+    }
     state.ensure_raw_vectors_loaded().map_err(E::from)?;
     let entry_count = state.entry_count();
     let mut compared = 0usize;
     for position in 0..entry_count {
         before_source_entry()?;
+        before_candidate()?;
         let candidate = state.with_entries(|entries| -> std::result::Result<Option<_>, E> {
             let entry = entries.get(position).ok_or_else(|| {
                 E::from(Error::Other(
                     "bounded exact vector position changed".to_string(),
                 ))
             })?;
-            if !entry.visible_at(snapshot)
-                || candidates
-                    .is_some_and(|candidates| candidates.binary_search(&entry.row_id.0).is_err())
-            {
+            if !entry.visible_at(snapshot) {
                 return Ok(None);
             }
             before_distance()?;
+            #[cfg(feature = "test-seams")]
+            observe_native_vector_score_for_test();
             Ok(Some((entry.row_id, entry.vector.cosine_similarity(query))))
         })?;
         let Some(candidate) = candidate else {
@@ -514,6 +691,22 @@ fn query_has_positive_finite_norm(query: &[f32]) -> bool {
 }
 
 #[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorPartitionSearchRoute {
+    Exact,
+    Indexed,
+}
+
+/// The route and reason selected while one non-empty partition was executed.
+/// Entries stay in selected-partition order; disclosure redacts keys separately.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorPartitionSearchTrace {
+    pub route: VectorPartitionSearchRoute,
+    pub reason: &'static str,
+}
+
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorSearchDebugTrace {
     pub index: VectorIndexRef,
@@ -524,12 +717,26 @@ pub struct VectorSearchDebugTrace {
     pub final_row_ids: Vec<RowId>,
     pub supplemented_row_count: usize,
     pub fallback_reason: Option<&'static str>,
+    /// Actual per-partition choices in selected-partition order.
+    pub partition_routes: Vec<VectorPartitionSearchTrace>,
     /// Maximum per-partition EF_SEARCH used by this maintained-route query.
     /// `None` means the query did not traverse a graph.
     pub hnsw_ef_search: Option<usize>,
     /// Durable generation identities actually searched for this result. The
     /// mutable tail has no durable identity and is deliberately absent.
     pub selected_generations: Vec<crate::store::VectorGraphGeneration>,
+    /// The one union walk's budget and terminal state, when a walk ran.
+    pub budget_receipt: Option<VectorSearchBudgetReceipt>,
+}
+
+/// Work paid by one statement-wide graph walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorSearchBudgetReceipt {
+    pub global_candidate_budget: usize,
+    pub admission_evaluations: usize,
+    pub expansion_evaluations: usize,
+    pub layers_admitted: usize,
+    pub budget_terminal: &'static str,
 }
 
 impl VectorSearchDebugTrace {
@@ -538,6 +745,7 @@ impl VectorSearchDebugTrace {
         rows: &[(RowId, f32)],
         fallback_reason: &'static str,
         hnsw_len: Option<usize>,
+        partition_routes: Vec<VectorPartitionSearchTrace>,
     ) -> Self {
         Self {
             index: index.clone(),
@@ -548,31 +756,10 @@ impl VectorSearchDebugTrace {
             final_row_ids: rows.iter().map(|(row_id, _)| *row_id).collect(),
             supplemented_row_count: 0,
             fallback_reason: Some(fallback_reason),
+            partition_routes,
             hnsw_ef_search: None,
             selected_generations: Vec::new(),
-        }
-    }
-
-    fn hnsw(
-        index: &VectorIndexRef,
-        hnsw_len: usize,
-        hnsw_candidate_row_ids: Vec<RowId>,
-        rows: &[(RowId, f32)],
-        supplemented_row_count: usize,
-        hnsw_ef_search: usize,
-        selected_generations: Vec<crate::store::VectorGraphGeneration>,
-    ) -> Self {
-        Self {
-            index: index.clone(),
-            used_hnsw: true,
-            hnsw_len: Some(hnsw_len),
-            hnsw_candidate_count: hnsw_candidate_row_ids.len(),
-            hnsw_candidate_row_ids,
-            final_row_ids: rows.iter().map(|(row_id, _)| *row_id).collect(),
-            supplemented_row_count,
-            fallback_reason: None,
-            hnsw_ef_search: Some(hnsw_ef_search),
-            selected_generations,
+            budget_receipt: None,
         }
     }
 }
@@ -594,7 +781,7 @@ pub struct BoundedBruteForceCursor {
     _index: VectorIndexRef,
     query: Vec<f32>,
     k: usize,
-    candidates: Option<Vec<u64>>,
+    candidate_filter: bool,
     snapshot: SnapshotId,
     snapshot_sources: Vec<BoundedSnapshotVectorSource>,
     source_position: usize,
@@ -605,6 +792,16 @@ pub struct BoundedBruteForceCursor {
     output_position: usize,
     prepared: bool,
     retained_bytes: usize,
+    /// The one open read this cursor's exhaustive comparisons read stored
+    /// bodies through, across every partition and every resumption.
+    body_reads: crate::store::RawVectorBodyReads,
+    /// A partition whose vectors the memory cannot hold whole is compared one
+    /// stored body at a time instead of refused. Set for automatic exhaustive
+    /// work, and for an exact comparison over a committed image, which has no
+    /// raw-vector cache a later find reuses.
+    stream_when_refused: bool,
+    /// The current partition is being compared one stored body at a time.
+    streaming_source: bool,
 }
 
 /// A store-owned entry source pinned when the cursor is opened. Exact stepping
@@ -616,6 +813,11 @@ pub struct BoundedBruteForceCursor {
 struct BoundedSnapshotVectorSource {
     partition_key: VectorPartitionKey,
     state: Arc<crate::store::IndexState>,
+    candidate_ids: Option<Vec<u64>>,
+    point_load: bool,
+    candidate_ids_cover_all_live: bool,
+    allowed_count: usize,
+    live_count: usize,
 }
 
 impl std::fmt::Debug for BoundedSnapshotVectorSource {
@@ -624,6 +826,109 @@ impl std::fmt::Debug for BoundedSnapshotVectorSource {
             .debug_struct("BoundedSnapshotVectorSource")
             .field("partition_key", &self.partition_key)
             .finish_non_exhaustive()
+    }
+}
+
+/// One admitted snapshot partitioning of the relational candidate set. Every
+/// later route decision and exact/graph consumer borrows these same local
+/// slices, so selected-partition fanout cannot multiply membership work.
+#[derive(Debug)]
+pub struct BoundedVectorCandidateGroups {
+    snapshot: SnapshotId,
+    filtered: bool,
+    sources: Vec<BoundedSnapshotVectorSource>,
+    aggregate_allowed_count: usize,
+    auto_index_at: usize,
+    every_partition_fits_base_ef: bool,
+    retained_bytes: usize,
+}
+
+impl BoundedVectorCandidateGroups {
+    pub fn is_filtered(&self) -> bool {
+        self.filtered
+    }
+
+    pub fn aggregate_allowed_count(&self) -> usize {
+        self.aggregate_allowed_count
+    }
+
+    pub fn auto_uses_only_exact_at_base_ef(&self) -> bool {
+        self.aggregate_allowed_count < self.auto_index_at || self.every_partition_fits_base_ef
+    }
+
+    pub fn partition_allowed_count(&self, key: &VectorPartitionKey) -> usize {
+        self.sources
+            .binary_search_by(|source| source.partition_key.cmp(key))
+            .ok()
+            .and_then(|position| self.sources.get(position))
+            .map_or(0, |source| source.allowed_count)
+    }
+
+    pub fn partition_live_count(&self, key: &VectorPartitionKey) -> usize {
+        self.sources
+            .binary_search_by(|source| source.partition_key.cmp(key))
+            .ok()
+            .and_then(|position| self.sources.get(position))
+            .map_or(0, |source| source.live_count)
+    }
+
+    /// Visit the exact non-empty snapshot sources this grouped search owns.
+    /// The callback receives no partition identity: consumers can publish one
+    /// redacted entry per executed source without reconstructing a newer,
+    /// live-only partition inventory or exposing the typed key.
+    #[doc(hidden)]
+    pub fn visit_nonempty_partitions<E>(
+        &self,
+        mut visit: impl FnMut(
+            usize,
+            usize,
+            Option<crate::store::VectorServingPolicy>,
+        ) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.allowed_count != 0)
+        {
+            visit(
+                source.allowed_count,
+                source.live_count,
+                source.state.snapshot_serving_policy(self.snapshot),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn graph_layer_presence_without_load(&self) -> (bool, bool, bool) {
+        let mut base = false;
+        let mut change = false;
+        let mut tail = false;
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.allowed_count != 0)
+        {
+            let status = source.state.graph_generation_status();
+            let sealed_base = status.base.is_some() || status.dormant_base.is_some();
+            base |= sealed_base
+                || (source.state.has_complete_hnsw_route() && status.fresh_tail_entries != 0);
+            change |= status.change.is_some() || status.dormant_change.is_some();
+            tail |= sealed_base && status.fresh_tail_entries != 0;
+        }
+        (base, change, tail)
+    }
+
+    pub fn into_retained_bytes(self) -> usize {
+        self.retained_bytes
+    }
+
+    fn into_cursor_parts(self) -> (SnapshotId, bool, Vec<BoundedSnapshotVectorSource>, usize) {
+        (
+            self.snapshot,
+            self.filtered,
+            self.sources,
+            self.retained_bytes,
+        )
     }
 }
 
@@ -643,6 +948,31 @@ impl BoundedVectorSearchTrace {
     /// `retained_bytes`.
     pub fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    pub fn partition_routes(&self) -> &[VectorPartitionSearchTrace] {
+        &self.trace.partition_routes
+    }
+
+    pub fn used_hnsw(&self) -> bool {
+        self.trace.used_hnsw
+    }
+
+    pub fn fallback_reason(&self) -> Option<&'static str> {
+        self.trace.fallback_reason
+    }
+
+    pub fn budget_receipt(&self) -> Option<VectorSearchBudgetReceipt> {
+        self.trace.budget_receipt
+    }
+
+    pub fn override_exact_reason(&mut self, reason: &'static str) {
+        self.trace.fallback_reason = Some(reason);
+        for partition in &mut self.trace.partition_routes {
+            if partition.route == VectorPartitionSearchRoute::Exact {
+                partition.reason = reason;
+            }
+        }
     }
 
     /// Take the admitted payload. No borrowing view is offered: the inner
@@ -671,9 +1001,13 @@ pub struct BoundedHnswResult {
 /// a hidden supplement to an indexed search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundedHnswExactReason {
+    /// AUTO weighed the statement's one walk against comparing every admitted
+    /// row, at their measured unit costs, and the comparison was no dearer.
+    StatementExhaustiveCheaperThanWalk,
     ExactMode,
     AggregateBelowIndexedThreshold,
     QuantizedAggregateUsesExact,
+    SmallPartitionCandidateSetUsesExact,
 }
 
 /// Why no complete maintained graph route exists for this request.
@@ -700,6 +1034,7 @@ pub enum BoundedHnswOutcome {
     ExactRequired {
         reason: BoundedHnswExactReason,
         aggregate_allowed_count: usize,
+        trace: BoundedVectorSearchTrace,
     },
     Unavailable {
         reason: BoundedHnswUnavailableReason,
@@ -707,46 +1042,6 @@ pub enum BoundedHnswOutcome {
     Incomplete {
         reason: HnswAllowedSearchIncomplete,
     },
-}
-
-type BoundedHnswLayerSearchResult<E> = std::result::Result<
-    (
-        usize,
-        Vec<(RowId, f32)>,
-        usize,
-        Option<HnswAllowedSearchIncomplete>,
-    ),
-    E,
->;
-
-type HnswStateLayerSearchResult = Result<(usize, bool, SearchScores)>;
-
-struct HnswStateRows {
-    rows: SearchScores,
-    hnsw_len: usize,
-    candidate_row_ids: Vec<RowId>,
-    selected_generations: Vec<crate::store::VectorGraphGeneration>,
-}
-
-enum HnswStateSearch {
-    Ready(HnswStateRows),
-    ExactRequired {
-        reason: &'static str,
-        filtered_route_missing: bool,
-    },
-}
-
-struct HnswStateSearchRequest<'a> {
-    index: &'a VectorIndexRef,
-    query: &'a [f32],
-    k: usize,
-    candidates: Option<&'a RoaringTreemap>,
-    partition_candidate_ids: Option<&'a [u64]>,
-    allowed_count: usize,
-    snapshot: SnapshotId,
-    ef_search: usize,
-    #[cfg(feature = "test-seams")]
-    partition_key: &'a VectorPartitionKey,
 }
 
 impl BoundedBruteForceCursor {
@@ -763,6 +1058,24 @@ impl BoundedBruteForceCursor {
 
     pub fn is_exhausted(&self) -> bool {
         self.prepared && self.output_position >= self.scored.len()
+    }
+
+    /// A committed image reads each stored body when the partition does not
+    /// fit. A writable store does not: its exact search keeps the load.
+    pub fn exact_comparison_streams_when_partition_does_not_fit(&self) -> bool {
+        self.snapshot_sources.iter().any(|source| {
+            source
+                .state
+                .exact_comparison_streams_when_partition_does_not_fit()
+        })
+    }
+
+    /// Compare a partition whose vectors the memory cannot hold whole by
+    /// reading each stored body through its own point read, rather than
+    /// refusing it.
+    pub fn streaming_bodies_it_cannot_hold(mut self) -> Self {
+        self.stream_when_refused = true;
+        self
     }
 }
 
@@ -782,7 +1095,7 @@ fn checked_vector_mul(left: usize, right: usize, operation: &str) -> Result<usiz
     })
 }
 
-fn apply_hnsw_scratch_acquire<E>(
+pub(crate) fn apply_hnsw_scratch_acquire<E>(
     event: HnswSearchScratchEvent,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
 ) -> std::result::Result<(), E>
@@ -831,7 +1144,7 @@ where
     }
 }
 
-fn apply_hnsw_scratch_release(
+pub(crate) fn apply_hnsw_scratch_release(
     event: HnswSearchScratchEvent,
     release_retained: &mut impl FnMut(usize),
 ) {
@@ -1131,98 +1444,6 @@ where
     Ok(actual)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn bounded_visit_partition_candidate_ids<E>(
-    state: &crate::store::IndexState,
-    candidate_ids: &[u64],
-    snapshot: SnapshotId,
-    before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
-    mut visit: impl FnMut(RowId) -> std::result::Result<(), E>,
-) -> std::result::Result<(), E> {
-    if candidate_ids.len() <= state.entry_count() {
-        for raw_row_id in candidate_ids {
-            before_source_entry()?;
-            let row_id = RowId(*raw_row_id);
-            if state.directory_has_visible_row(row_id, snapshot) {
-                visit(row_id)?;
-            }
-        }
-        return Ok(());
-    }
-    state.bounded_visit_visible_ids(snapshot, &mut *before_source_entry, |row_id| {
-        if candidate_ids.binary_search(&row_id.0).is_ok() {
-            visit(row_id)?;
-        }
-        Ok(())
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn bounded_partition_candidate_ids<E>(
-    state: &crate::store::IndexState,
-    candidate_ids: &[u64],
-    snapshot: SnapshotId,
-    before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
-    before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-    release_retained: &mut impl FnMut(usize),
-) -> std::result::Result<(Vec<u64>, usize), E>
-where
-    E: From<Error>,
-{
-    let mut count = 0usize;
-    bounded_visit_partition_candidate_ids(
-        state,
-        candidate_ids,
-        snapshot,
-        before_source_entry,
-        |_| {
-            count = count.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other(
-                    "bounded partition candidate count overflow".to_string(),
-                ))
-            })?;
-            Ok(())
-        },
-    )?;
-    let mut partition_ids = Vec::new();
-    let mut retained_bytes = 0usize;
-    if count != 0 {
-        grow_vector_copy(
-            &mut partition_ids,
-            count,
-            Some(&mut retained_bytes),
-            "partition candidate intersection",
-            before_source_entry,
-            before_retain,
-            release_retained,
-        )?;
-    }
-    let populated = bounded_visit_partition_candidate_ids(
-        state,
-        candidate_ids,
-        snapshot,
-        before_source_entry,
-        |row_id| {
-            partition_ids.push(row_id.0);
-            Ok(())
-        },
-    );
-    if let Err(error) = populated {
-        drop(partition_ids);
-        release_retained(retained_bytes);
-        return Err(error);
-    }
-    if partition_ids.len() != count {
-        drop(partition_ids);
-        release_retained(retained_bytes);
-        return Err(E::from(Error::Other(
-            "bounded partition candidate intersection changed".to_string(),
-        )));
-    }
-    partition_ids.sort_unstable();
-    Ok((partition_ids, retained_bytes))
-}
-
 fn allocate_vector_row_ids<E>(
     source: &[(RowId, f32)],
     operation: &str,
@@ -1298,7 +1519,10 @@ fn bounded_hnsw_trace<E>(
     supplemented_row_count: usize,
     hnsw_ef_search: usize,
     selected_generations: Vec<crate::store::VectorGraphGeneration>,
+    budget_receipt: Option<VectorSearchBudgetReceipt>,
     selected_generation_bytes: usize,
+    partition_routes: Vec<VectorPartitionSearchTrace>,
+    partition_route_bytes: usize,
     before_work: &mut impl FnMut() -> std::result::Result<(), E>,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     release_retained: &mut impl FnMut(usize),
@@ -1311,6 +1535,7 @@ where
             Ok(index) => index,
             Err(error) => {
                 release_retained(selected_generation_bytes);
+                release_retained(partition_route_bytes);
                 return Err(error);
             }
         };
@@ -1324,6 +1549,7 @@ where
         Ok(ids) => ids,
         Err(error) => {
             release_retained(selected_generation_bytes);
+            release_retained(partition_route_bytes);
             release_retained(index_bytes);
             return Err(error);
         }
@@ -1338,6 +1564,7 @@ where
         Ok(ids) => ids,
         Err(error) => {
             release_retained(selected_generation_bytes);
+            release_retained(partition_route_bytes);
             release_retained(candidate_bytes);
             release_retained(index_bytes);
             return Err(error);
@@ -1346,10 +1573,12 @@ where
     let retained_bytes = match checked_vector_add(index_bytes, candidate_bytes, "HNSW trace")
         .and_then(|bytes| checked_vector_add(bytes, final_bytes, "HNSW trace"))
         .and_then(|bytes| checked_vector_add(bytes, selected_generation_bytes, "HNSW trace"))
+        .and_then(|bytes| checked_vector_add(bytes, partition_route_bytes, "HNSW trace"))
     {
         Ok(bytes) => bytes,
         Err(error) => {
             release_retained(selected_generation_bytes);
+            release_retained(partition_route_bytes);
             release_retained(final_bytes);
             release_retained(candidate_bytes);
             release_retained(index_bytes);
@@ -1366,10 +1595,142 @@ where
             final_row_ids,
             supplemented_row_count,
             fallback_reason: None,
+            partition_routes,
             hnsw_ef_search: Some(hnsw_ef_search),
             selected_generations,
+            budget_receipt,
         },
         retained_bytes,
+    })
+}
+
+fn allocate_partition_route_slots<E>(
+    capacity: usize,
+    before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    release_retained: &mut impl FnMut(usize),
+) -> std::result::Result<(Vec<VectorPartitionSearchTrace>, usize), E>
+where
+    E: From<Error>,
+{
+    if capacity == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let requested = checked_vector_mul(
+        capacity,
+        std::mem::size_of::<VectorPartitionSearchTrace>(),
+        "partition route receipt",
+    )
+    .map_err(E::from)?;
+    before_retain(requested)?;
+    let mut routes = Vec::new();
+    if routes.try_reserve_exact(capacity).is_err() {
+        release_retained(requested);
+        return Err(E::from(Error::Other(
+            "bounded vector partition route receipt allocation failed".to_string(),
+        )));
+    }
+    let actual = match checked_vector_mul(
+        routes.capacity(),
+        std::mem::size_of::<VectorPartitionSearchTrace>(),
+        "partition route receipt",
+    ) {
+        Ok(actual) => actual,
+        Err(error) => {
+            release_retained(requested);
+            return Err(E::from(error));
+        }
+    };
+    let actual = reconcile_vector_allocation(requested, actual, before_retain, release_retained)?;
+    Ok((routes, actual))
+}
+
+fn bounded_exact_route_trace<E>(
+    index: &VectorIndexRef,
+    partition_routes: Vec<VectorPartitionSearchTrace>,
+    partition_route_bytes: usize,
+    fallback_reason: &'static str,
+    budget_receipt: Option<VectorSearchBudgetReceipt>,
+    before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    release_retained: &mut impl FnMut(usize),
+) -> std::result::Result<BoundedVectorSearchTrace, E>
+where
+    E: From<Error>,
+{
+    let (owned_index, index_bytes) =
+        match allocate_vector_index(index, before_retain, release_retained) {
+            Ok(index) => index,
+            Err(error) => {
+                release_retained(partition_route_bytes);
+                return Err(error);
+            }
+        };
+    let retained_bytes = match checked_vector_add(
+        index_bytes,
+        partition_route_bytes,
+        "exact partition route receipt",
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            release_retained(index_bytes);
+            release_retained(partition_route_bytes);
+            return Err(E::from(error));
+        }
+    };
+    Ok(BoundedVectorSearchTrace {
+        trace: VectorSearchDebugTrace {
+            index: owned_index,
+            used_hnsw: false,
+            hnsw_len: None,
+            hnsw_candidate_count: 0,
+            hnsw_candidate_row_ids: Vec::new(),
+            final_row_ids: Vec::new(),
+            supplemented_row_count: 0,
+            fallback_reason: Some(fallback_reason),
+            partition_routes,
+            hnsw_ef_search: None,
+            selected_generations: Vec::new(),
+            budget_receipt,
+        },
+        retained_bytes,
+    })
+}
+
+fn bounded_uniform_exact_outcome<E>(
+    index: &VectorIndexRef,
+    groups: &BoundedVectorCandidateGroups,
+    reason: BoundedHnswExactReason,
+    route_reason: &'static str,
+    before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    release_retained: &mut impl FnMut(usize),
+) -> std::result::Result<BoundedHnswOutcome, E>
+where
+    E: From<Error>,
+{
+    let (mut partition_routes, partition_route_bytes) =
+        allocate_partition_route_slots(groups.sources.len(), before_retain, release_retained)?;
+    partition_routes.extend(
+        groups
+            .sources
+            .iter()
+            .filter(|source| source.allowed_count != 0)
+            .map(|_| VectorPartitionSearchTrace {
+                route: VectorPartitionSearchRoute::Exact,
+                reason: route_reason,
+            }),
+    );
+    let trace = bounded_exact_route_trace(
+        index,
+        partition_routes,
+        partition_route_bytes,
+        route_reason,
+        None,
+        before_retain,
+        release_retained,
+    )?;
+    Ok(BoundedHnswOutcome::ExactRequired {
+        reason,
+        aggregate_allowed_count: groups.aggregate_allowed_count(),
+        trace,
     })
 }
 
@@ -1464,10 +1825,86 @@ where
         BoundedSnapshotVectorSource {
             partition_key: key,
             state,
+            candidate_ids: None,
+            point_load: false,
+            candidate_ids_cover_all_live: false,
+            allowed_count: 0,
+            live_count: 0,
         },
     );
     *retained_bytes = next_retained;
     Ok(())
+}
+
+/// How far a stored score may sit from the score its walk distance gives for
+/// the same vector: the two are summed by different float paths, so equal
+/// vectors can differ in the last bits.
+const WALK_SCORE_TOLERANCE: f32 = 1e-5;
+
+/// Whether a row the walk reached at `distance` can no longer enter the best
+/// `required` of `accepted`: at least `required` accepted rows already score
+/// strictly better than its walk score, beyond float noise. A row that would
+/// tie keeps being scored, because an equal score is ordered by row id and
+/// may still take a place.
+fn walk_cannot_beat(accepted: &[(RowId, f32)], required: usize, distance: f32) -> bool {
+    if required == 0 {
+        return true;
+    }
+    let mut better = 0usize;
+    let walk_score = 1.0 - distance;
+    for (_, score) in accepted {
+        if *score - WALK_SCORE_TOLERANCE > walk_score {
+            better += 1;
+            if better >= required {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// One partition a statement answers through its one union search.
+struct UnionPartition<'g> {
+    source_position: usize,
+    candidates: Option<&'g [u64]>,
+    allowed_count: usize,
+    live_count: usize,
+    entry_count: usize,
+    bounded_limits: bool,
+    layers: Vec<crate::store::SnapshotCompatibleLayer<'g>>,
+    /// What this entry and its layer list were charged when admitted.
+    charged_bytes: usize,
+    /// How many partition routes the statement had recorded when this
+    /// partition was admitted, so its own route is recorded in scope order.
+    routes_before: usize,
+    started: std::time::Instant,
+    pages: (u64, u64, u64, u64),
+}
+
+/// What a statement's one union search resolved.
+enum UnionOutcome {
+    /// Every candidate re-scored from its own partition's stored vector, and
+    /// the `(partition, layer)` pairs that contributed one.
+    Answered {
+        accepted: Vec<(RowId, f32)>,
+        accepted_bytes: usize,
+        /// Every row the walk handed back, for the route trace.
+        walked: Vec<(RowId, f32)>,
+        walked_bytes: usize,
+        contributing: Vec<(usize, usize)>,
+        /// Partitions whose graph candidates fell short of what they need,
+        /// answered by comparing their rows instead.
+        short: Vec<bool>,
+        short_bytes: usize,
+    },
+    /// The search could not establish a full answer: its budget ran out, its
+    /// admission alone exceeded the budget, or too few admitted rows came back.
+    Unresolved(HnswAllowedSearchIncomplete),
+}
+
+struct UnionSearchResult {
+    outcome: UnionOutcome,
+    receipt: VectorSearchBudgetReceipt,
 }
 
 pub struct MemVectorExecutor<S: WriteSetApplicator> {
@@ -1550,6 +1987,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     fn bounded_scoped_snapshot_sources<E>(
         &self,
         index: &VectorIndexRef,
+        layout: &crate::store::VectorIndexLayout,
         prefixes: &[VectorPartitionKey],
         before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
@@ -1558,6 +1996,32 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
+        if prefixes
+            .iter()
+            .all(|prefix| prefix.components().len() == layout.partition_key_columns.len())
+        {
+            let (mut selected, mut retained_bytes) =
+                allocate_snapshot_source_slots(prefixes.len(), before_retain, release_retained)?;
+            for prefix in prefixes {
+                let Some(state) = self.store.try_partition_state(index, prefix) else {
+                    continue;
+                };
+                if let Err(error) = retain_snapshot_source(
+                    &mut selected,
+                    prefix.clone(),
+                    state,
+                    &mut retained_bytes,
+                    before_source_entry,
+                    before_retain,
+                    release_retained,
+                ) {
+                    drop(selected);
+                    release_retained(retained_bytes);
+                    return Err(error);
+                }
+            }
+            return Ok((selected, retained_bytes));
+        }
         self.store.with_partition_sources(index, |sources| {
             let mut selected_count = 0usize;
             sources.visit(|key, _| {
@@ -1599,18 +2063,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
-    /// Resolve the physical states a bounded query may need. Candidate row
-    /// ids narrow the set only when current membership also proves that each
-    /// candidate's version visible to this snapshot is in that same state.
-    /// Any missing proof falls back to every retained state, while the
-    /// candidate bitmap remains the row-level filter.
+    /// Resolve the physical states an unfiltered bounded query may need.
+    /// Filtered execution uses `bounded_candidate_groups`, whose snapshot-aware
+    /// row placement retains only the states that own admitted candidates.
     #[allow(clippy::too_many_arguments)]
     fn bounded_snapshot_sources<E>(
         &self,
         index: &VectorIndexRef,
         layout: &crate::store::VectorIndexLayout,
-        candidates: Option<&[u64]>,
-        snapshot: SnapshotId,
         before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         release_retained: &mut impl FnMut(usize),
@@ -1618,89 +2078,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
-        if candidates.is_some_and(<[u64]>::is_empty) {
-            return Ok((Vec::new(), 0));
-        }
         if let Some(prefixes) = self.selected_partition_prefixes(index) {
             return self.bounded_scoped_snapshot_sources(
                 index,
+                layout,
                 &prefixes,
                 before_source_entry,
                 before_retain,
                 release_retained,
             );
         }
-        if !layout.is_partitioned() || candidates.is_none() {
-            return self.all_bounded_snapshot_sources(
-                index,
-                before_source_entry,
-                before_retain,
-                release_retained,
-            );
-        }
-        // One current source per candidate is the largest sound narrowed set.
-        let capacity = candidates.map_or(0, <[u64]>::len);
-        let (mut selected, mut retained_bytes) =
-            allocate_snapshot_source_slots(capacity, before_retain, release_retained)?;
-        let mut narrowing_is_sound = candidates.is_some();
-        let resolved = (|| -> std::result::Result<(), E> {
-            if let Some(candidate_ids) = candidates {
-                let mut position = 0usize;
-                while position < candidate_ids.len() {
-                    before_source_entry()?;
-                    let raw_row_id = *candidate_ids.get(position).ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded vector candidate scope changed".to_string(),
-                        ))
-                    })?;
-                    position = position.checked_add(1).ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded vector candidate-scope position overflow".to_string(),
-                        ))
-                    })?;
-                    let row_id = RowId(raw_row_id);
-                    before_source_entry()?;
-                    let Some(partition_key) = self.store.current_partition_for_row(index, row_id)
-                    else {
-                        narrowing_is_sound = false;
-                        break;
-                    };
-                    before_source_entry()?;
-                    let Some(state) = self.store.try_partition_state(index, &partition_key) else {
-                        narrowing_is_sound = false;
-                        break;
-                    };
-                    before_source_entry()?;
-                    if !state.directory_has_visible_row(row_id, snapshot) {
-                        narrowing_is_sound = false;
-                        break;
-                    }
-                    retain_snapshot_source(
-                        &mut selected,
-                        partition_key,
-                        state,
-                        &mut retained_bytes,
-                        before_source_entry,
-                        before_retain,
-                        release_retained,
-                    )?;
-                }
-            }
-            if narrowing_is_sound {
-                return Ok(());
-            }
-            Ok(())
-        })();
-        if let Err(error) = resolved {
-            drop(selected);
-            release_retained(retained_bytes);
-            return Err(error);
-        }
-        if narrowing_is_sound {
-            return Ok((selected, retained_bytes));
-        }
-        drop(selected);
-        release_retained(retained_bytes);
         self.all_bounded_snapshot_sources(
             index,
             before_source_entry,
@@ -1709,8 +2096,231 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         )
     }
 
-    /// Create a fallible, owned brute-force continuation. Query and candidate
-    /// allocations are admitted and reconciled before their values are copied.
+    /// Resolve every authorized candidate's snapshot-visible partition once,
+    /// retain one local sorted slice per selected source, and charge the one
+    /// placement that makes the candidate available to exact or graph search.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_candidate_groups<E>(
+        &self,
+        index: &VectorIndexRef,
+        candidates: Option<&[u64]>,
+        snapshot: SnapshotId,
+        mut before_checkpoint: impl FnMut() -> std::result::Result<(), E>,
+        mut before_placement: impl FnMut() -> std::result::Result<(), E>,
+        mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release_retained: impl FnMut(usize),
+    ) -> std::result::Result<BoundedVectorCandidateGroups, E>
+    where
+        E: From<Error>,
+    {
+        before_checkpoint()?;
+        let layout = self.store.index_layout(index).map_err(E::from)?;
+        let filtered = candidates.is_some();
+        if candidates.is_some_and(<[u64]>::is_empty) {
+            return Ok(BoundedVectorCandidateGroups {
+                snapshot,
+                filtered,
+                sources: Vec::new(),
+                aggregate_allowed_count: 0,
+                auto_index_at: layout.effective_auto_index_at(),
+                every_partition_fits_base_ef: true,
+                retained_bytes: 0,
+            });
+        }
+
+        let prefixes = self.selected_partition_prefixes(index);
+        let discover_sources = layout.is_partitioned() && filtered && prefixes.is_none();
+        let (mut sources, mut retained_bytes) = if let Some(prefixes) = prefixes.as_deref() {
+            self.bounded_scoped_snapshot_sources(
+                index,
+                &layout,
+                prefixes,
+                &mut before_checkpoint,
+                &mut before_retain,
+                &mut release_retained,
+            )?
+        } else if discover_sources {
+            allocate_snapshot_source_slots(
+                candidates.map_or(0, <[u64]>::len).min(
+                    layout
+                        .max_partitions
+                        .map_or(candidates.map_or(0, <[u64]>::len), |partitions| {
+                            partitions as usize
+                        }),
+                ),
+                &mut before_retain,
+                &mut release_retained,
+            )?
+        } else {
+            self.all_bounded_snapshot_sources(
+                index,
+                &mut before_checkpoint,
+                &mut before_retain,
+                &mut release_retained,
+            )?
+        };
+
+        let repeat_global_candidate_pass =
+            bounded_candidate_grouping_repeats_global_pass_for_test();
+        let suppress_placement_charge =
+            bounded_candidate_grouping_suppresses_placement_charge_for_test();
+        let grouped = (|| -> std::result::Result<(), E> {
+            if let Some(candidate_ids) = candidates {
+                for raw_row_id in candidate_ids {
+                    let row_id = RowId(*raw_row_id);
+                    self.store
+                        .with_snapshot_visible_partition_for_row::<E, (), _>(
+                            index,
+                            row_id,
+                            snapshot,
+                            &mut before_checkpoint,
+                            |key, state, before_checkpoint| {
+                                let position = match sources
+                                    .binary_search_by(|source| source.partition_key.cmp(key))
+                                {
+                                    Ok(position) => position,
+                                    Err(_) if !discover_sources => return Ok(Some(())),
+                                    Err(_) => {
+                                        retain_snapshot_source(
+                                            &mut sources,
+                                            key.clone(),
+                                            state.clone(),
+                                            &mut retained_bytes,
+                                            before_checkpoint,
+                                            &mut before_retain,
+                                            &mut release_retained,
+                                        )?;
+                                        sources
+                                            .binary_search_by(|source| {
+                                                source.partition_key.cmp(key)
+                                            })
+                                            .map_err(|_| {
+                                                E::from(Error::Other(
+                                                    "bounded vector candidate source disappeared"
+                                                        .to_string(),
+                                                ))
+                                            })?
+                                    }
+                                };
+                                if !suppress_placement_charge {
+                                    before_placement()?;
+                                }
+                                let source = sources.get_mut(position).ok_or_else(|| {
+                                    E::from(Error::Other(
+                                        "bounded vector candidate group changed".to_string(),
+                                    ))
+                                })?;
+                                let local = source.candidate_ids.get_or_insert_with(Vec::new);
+                                let required = local.len().checked_add(1).ok_or_else(|| {
+                                    E::from(Error::Other(
+                                        "bounded vector candidate group length overflow"
+                                            .to_string(),
+                                    ))
+                                })?;
+                                grow_vector_copy(
+                                    local,
+                                    required,
+                                    Some(&mut retained_bytes),
+                                    "partition candidate group",
+                                    before_checkpoint,
+                                    &mut before_retain,
+                                    &mut release_retained,
+                                )?;
+                                local.push(row_id.0);
+                                #[cfg(feature = "test-seams")]
+                                observe_bounded_candidate_grouping_for_test(
+                                    BoundedCandidateGroupingEventForTest::Placement,
+                                );
+                                source.allowed_count =
+                                    source.allowed_count.checked_add(1).ok_or_else(|| {
+                                        E::from(Error::Other(
+                                            "bounded vector partition candidate count overflow"
+                                                .to_string(),
+                                        ))
+                                    })?;
+                                Ok(Some(()))
+                            },
+                        )?;
+                }
+                if repeat_global_candidate_pass {
+                    let physical_partition_count = self
+                        .store
+                        .partition_keys_including_historical(index)
+                        .map_err(E::from)?
+                        .len();
+                    for _ in 1..physical_partition_count {
+                        for raw_row_id in candidate_ids {
+                            self.store
+                                .with_snapshot_visible_partition_for_row::<E, (), _>(
+                                    index,
+                                    RowId(*raw_row_id),
+                                    snapshot,
+                                    &mut before_checkpoint,
+                                    |_key, _state, _before_checkpoint| Ok(Some(())),
+                                )?;
+                        }
+                    }
+                }
+                for source in &mut sources {
+                    let candidate_ids = source.candidate_ids.get_or_insert_with(Vec::new);
+                    let candidates_are_unique_and_sorted =
+                        candidate_ids.windows(2).all(|pair| pair[0] < pair[1]);
+                    let live_count = source.state.bounded_directory_visible_entry_count(
+                        snapshot,
+                        None,
+                        &mut before_checkpoint,
+                    )?;
+                    source.live_count = live_count;
+                    source.candidate_ids_cover_all_live = source.allowed_count != 0
+                        && source.allowed_count == live_count
+                        && candidates_are_unique_and_sorted;
+                }
+                return Ok(());
+            }
+
+            for source in &mut sources {
+                let live_count = source.state.bounded_directory_visible_entry_count(
+                    snapshot,
+                    None,
+                    &mut before_checkpoint,
+                )?;
+                source.allowed_count = live_count;
+                source.live_count = live_count;
+                // An unrestricted partition is compared as a whole: EXACT
+                // loads it when the declaration can hold it, and AUTO
+                // streams one stored body at a time only after that load
+                // is refused. Collecting every live identity here would
+                // skip the load and never install a resident partition.
+            }
+            Ok(())
+        })();
+        if let Err(error) = grouped {
+            drop(sources);
+            release_retained(retained_bytes);
+            return Err(error);
+        }
+        let aggregate_allowed_count = sources.iter().fold(0usize, |count, source| {
+            count.saturating_add(source.allowed_count)
+        });
+        let every_partition_fits_base_ef = sources
+            .iter()
+            .filter(|source| source.allowed_count != 0)
+            .all(|source| {
+                source.live_count <= layout.resolve_policy(source.live_count, 0).hnsw_ef_search
+            });
+        Ok(BoundedVectorCandidateGroups {
+            snapshot,
+            filtered,
+            sources,
+            aggregate_allowed_count,
+            auto_index_at: layout.effective_auto_index_at(),
+            every_partition_fits_base_ef,
+            retained_bytes,
+        })
+    }
+
+    /// Compatibility entrypoint for callers that have not already admitted a
+    /// candidate grouping. Engine execution uses the grouped entrypoint below.
     #[allow(clippy::too_many_arguments)]
     pub fn bounded_brute_force_cursor<E>(
         &self,
@@ -1726,11 +2336,61 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
+        let groups = self.bounded_candidate_groups(
+            &index,
+            candidates,
+            snapshot,
+            &mut before_source_entry,
+            || Ok(()),
+            &mut before_retain,
+            &mut release_retained,
+        )?;
+        self.bounded_brute_force_cursor_grouped(
+            index,
+            query,
+            k,
+            groups,
+            before_source_entry,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    /// Create a fallible, owned brute-force continuation from the query's one
+    /// admitted candidate grouping. Query allocation is reconciled before copy;
+    /// partition-local candidate slices transfer directly into the cursor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_brute_force_cursor_grouped<E>(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        groups: BoundedVectorCandidateGroups,
+        mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release_retained: impl FnMut(usize),
+    ) -> std::result::Result<BoundedBruteForceCursor, E>
+    where
+        E: From<Error>,
+    {
+        let aggregate_allowed_count = groups.aggregate_allowed_count();
+        let (snapshot, candidate_filter, snapshot_sources, group_bytes) =
+            groups.into_cursor_parts();
         // Resolving the index handle takes the registry lock, so the control
         // runs before any source state is read or locked.
-        before_source_entry()?;
-        let layout = self.store.index_layout(&index).map_err(E::from)?;
+        if let Err(error) = before_source_entry() {
+            release_retained(group_bytes);
+            return Err(error);
+        }
+        let layout = match self.store.index_layout(&index) {
+            Ok(layout) => layout,
+            Err(error) => {
+                release_retained(group_bytes);
+                return Err(E::from(error));
+            }
+        };
         if query.len() != layout.dimension {
+            release_retained(group_bytes);
             return Err(E::from(Error::VectorIndexDimensionMismatch {
                 index,
                 expected: layout.dimension,
@@ -1738,9 +2398,17 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }));
         }
         let index_bytes =
-            checked_vector_add(index.table.capacity(), index.column.capacity(), "index")
-                .map_err(E::from)?;
-        before_retain(index_bytes)?;
+            match checked_vector_add(index.table.capacity(), index.column.capacity(), "index") {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    release_retained(group_bytes);
+                    return Err(E::from(error));
+                }
+            };
+        if let Err(error) = before_retain(index_bytes) {
+            release_retained(group_bytes);
+            return Err(error);
+        }
         let (owned_query, query_bytes) = match allocate_vector_copy(
             query,
             "query",
@@ -1751,105 +2419,34 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             Ok(query) => query,
             Err(error) => {
                 release_retained(index_bytes);
+                release_retained(group_bytes);
                 return Err(error);
             }
         };
-        let (owned_candidates, candidate_bytes) = match candidates {
-            Some(candidates) => match allocate_vector_copy(
-                candidates,
-                "candidate ids",
-                &mut before_source_entry,
-                &mut before_retain,
-                &mut release_retained,
-            ) {
-                Ok((candidates, bytes)) => (Some(candidates), bytes),
-                Err(error) => {
-                    release_retained(query_bytes);
-                    release_retained(index_bytes);
-                    return Err(error);
-                }
-            },
-            None => (None, 0),
-        };
-        let base_retained_bytes = match checked_vector_add(index_bytes, query_bytes, "query state")
-            .and_then(|bytes| checked_vector_add(bytes, candidate_bytes, "candidate ids"))
+        let mut retained_bytes = match checked_vector_add(index_bytes, query_bytes, "query state")
+            .and_then(|bytes| checked_vector_add(bytes, group_bytes, "candidate groups"))
         {
             Ok(bytes) => bytes,
             Err(error) => {
-                release_retained(candidate_bytes);
                 release_retained(query_bytes);
                 release_retained(index_bytes);
-                return Err(E::from(error));
-            }
-        };
-        let (snapshot_sources, source_bytes) = if k == 0 {
-            (Vec::new(), 0)
-        } else {
-            match self.bounded_snapshot_sources(
-                &index,
-                &layout,
-                owned_candidates.as_deref(),
-                snapshot,
-                &mut before_source_entry,
-                &mut before_retain,
-                &mut release_retained,
-            ) {
-                Ok(scope) => scope,
-                Err(error) => {
-                    release_retained(base_retained_bytes);
-                    return Err(error);
-                }
-            }
-        };
-        let mut retained_bytes = match checked_vector_add(
-            base_retained_bytes,
-            source_bytes,
-            "partitioned exact cursor",
-        ) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                release_retained(source_bytes);
-                release_retained(base_retained_bytes);
+                release_retained(group_bytes);
                 return Err(E::from(error));
             }
         };
         let mut scored = Vec::new();
-        let prepare = (|| {
-            let mut count = 0usize;
-            if let Some(ids) = owned_candidates.as_ref() {
-                for id in ids {
-                    for source in &snapshot_sources {
-                        before_source_entry()?;
-                        if source.state.directory_has_visible_row(RowId(*id), snapshot) {
-                            count = count.saturating_add(1);
-                            break;
-                        }
-                    }
-                }
-            } else {
-                for source in &snapshot_sources {
-                    count =
-                        count.saturating_add(source.state.bounded_directory_visible_entry_count(
-                            snapshot,
-                            None,
-                            &mut before_source_entry,
-                        )?);
-                }
-            }
-            grow_vector_copy(
-                &mut scored,
-                count.min(k),
-                Some(&mut retained_bytes),
-                "exact scores",
-                &mut before_source_entry,
-                &mut before_retain,
-                &mut release_retained,
-            )
-        })();
+        let prepare = grow_vector_copy(
+            &mut scored,
+            aggregate_allowed_count.min(k),
+            Some(&mut retained_bytes),
+            "exact scores",
+            &mut before_source_entry,
+            &mut before_retain,
+            &mut release_retained,
+        );
         if let Err(error) = prepare {
             drop(scored);
             drop(snapshot_sources);
-            drop(owned_candidates);
             drop(owned_query);
             release_retained(retained_bytes);
             return Err(error);
@@ -1858,7 +2455,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             _index: index,
             query: owned_query,
             k,
-            candidates: owned_candidates,
+            candidate_filter,
             snapshot,
             snapshot_sources,
             source_position: 0,
@@ -1869,6 +2466,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             output_position: 0,
             prepared: false,
             retained_bytes,
+            body_reads: crate::store::RawVectorBodyReads::default(),
+            stream_when_refused: false,
+            streaming_source: false,
         })
     }
 
@@ -1876,7 +2476,35 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     pub fn bounded_brute_force_step<E>(
         &self,
         cursor: &mut BoundedBruteForceCursor,
+        before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        before_distance: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
+    ) -> std::result::Result<BoundedVectorStep, E>
+    where
+        E: From<Error>,
+    {
+        let before_source_entry = std::cell::RefCell::new(before_source_entry);
+        self.bounded_brute_force_step_charged(
+            cursor,
+            || (before_source_entry.borrow_mut())(),
+            || (before_source_entry.borrow_mut())(),
+            || (before_source_entry.borrow_mut())(),
+            before_distance,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    /// Advance exactly one candidate/retained-score/output boundary, with a
+    /// distinct callback for the exhaustive physical-entry charge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_brute_force_step_charged<E>(
+        &self,
+        cursor: &mut BoundedBruteForceCursor,
         mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        mut before_precharged_candidate: impl FnMut() -> std::result::Result<(), E>,
+        mut before_exhaustive_candidate: impl FnMut() -> std::result::Result<(), E>,
         mut before_distance: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
         mut release_retained: impl FnMut(usize),
@@ -1913,36 +2541,52 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return Ok(BoundedVectorStep::Pending);
         }
 
-        if let Some(candidate_ids) = cursor.candidates.as_ref() {
-            let Some(raw_row_id) = candidate_ids.get(cursor.position).copied() else {
+        if cursor.candidate_filter
+            || (cursor.stream_when_refused
+                && cursor
+                    .snapshot_sources
+                    .get(cursor.source_position)
+                    .is_some_and(|source| source.point_load))
+        {
+            let Some(source) = cursor.snapshot_sources.get(cursor.source_position) else {
                 sort_vector_scores(&mut cursor.scored);
                 cursor.scored.truncate(cursor.k);
                 cursor.prepared = true;
                 return Ok(BoundedVectorStep::Pending);
             };
+            let candidate_ids = source.candidate_ids.as_deref().ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded filtered vector source lost its candidate group".to_string(),
+                ))
+            })?;
+            let Some(raw_row_id) = candidate_ids.get(cursor.position).copied() else {
+                cursor.source_position =
+                    cursor.source_position.checked_add(1).ok_or_else(|| {
+                        E::from(Error::Other(
+                            "bounded vector partition position overflow".to_string(),
+                        ))
+                    })?;
+                cursor.position = 0;
+                return Ok(BoundedVectorStep::Pending);
+            };
             let row_id = RowId(raw_row_id);
-            for source in &cursor.snapshot_sources {
-                if !source
-                    .state
-                    .directory_has_visible_row(row_id, cursor.snapshot)
-                {
-                    continue;
-                }
-                cursor.pending_score = source
-                    .state
-                    .bounded_score_visible_candidate(
-                        &cursor._index,
-                        row_id,
-                        cursor.snapshot,
-                        &cursor.query,
-                        &mut before_source_entry,
-                        &mut before_distance,
-                        &mut before_retain,
-                        &mut release_retained,
-                    )?
-                    .map(|score| (row_id, score));
-                break;
-            }
+            before_precharged_candidate()?;
+            // Brute force IS the exhaustive route; it reads stored bodies,
+            // through the one read this cursor keeps open.
+            cursor.pending_score = source
+                .state
+                .bounded_score_stored_body(
+                    &cursor._index,
+                    row_id,
+                    cursor.snapshot,
+                    &cursor.query,
+                    &mut cursor.body_reads,
+                    &mut before_source_entry,
+                    &mut before_distance,
+                    &mut before_retain,
+                    &mut release_retained,
+                )?
+                .map(|score| (row_id, score));
             cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
                 E::from(Error::Other(
                     "bounded vector candidate position overflow".to_string(),
@@ -1967,8 +2611,20 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 )));
             };
             before_source_entry()?;
-            source.state.ensure_raw_vectors_loaded().map_err(E::from)?;
-            cursor.state_end = Some(source.state.entry_count());
+            match source.state.ensure_raw_vectors_loaded() {
+                Ok(()) => {
+                    cursor.streaming_source = false;
+                    cursor.state_end = Some(source.state.entry_count());
+                }
+                Err(Error::MemoryBudgetExceeded { .. })
+                    if cursor.stream_when_refused && source.state.streams_raw_bodies() =>
+                {
+                    // The directory's end is found by reading past it.
+                    cursor.streaming_source = true;
+                    cursor.state_end = Some(usize::MAX);
+                }
+                Err(error) => return Err(E::from(error)),
+            }
         }
         if cursor.position >= cursor.state_end.unwrap_or_default() {
             cursor.source_position = cursor.source_position.checked_add(1).ok_or_else(|| {
@@ -1995,6 +2651,53 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 )))
             })?;
         before_source_entry()?;
+        if cursor.streaming_source {
+            let Some(visible) = source
+                .state
+                .visible_directory_row_at(position, cursor.snapshot)
+            else {
+                cursor.source_position =
+                    cursor.source_position.checked_add(1).ok_or_else(|| {
+                        E::from(Error::Other(
+                            "bounded vector partition position overflow".to_string(),
+                        ))
+                    })?;
+                cursor.position = 0;
+                cursor.state_end = None;
+                cursor.streaming_source = false;
+                return Ok(BoundedVectorStep::Pending);
+            };
+            // The same one exhaustive-scan charge per directory entry as the
+            // resident scan below; dead and future versions consume it too.
+            before_exhaustive_candidate()?;
+            cursor.pending_score = match visible {
+                Some(row_id) => source
+                    .state
+                    .bounded_score_stored_body(
+                        &cursor._index,
+                        row_id,
+                        cursor.snapshot,
+                        &cursor.query,
+                        &mut cursor.body_reads,
+                        &mut before_source_entry,
+                        &mut before_distance,
+                        &mut before_retain,
+                        &mut release_retained,
+                    )?
+                    .map(|score| (row_id, score)),
+                None => None,
+            };
+            cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
+                E::from(Error::Other(
+                    "bounded vector candidate position overflow".to_string(),
+                ))
+            })?;
+            return Ok(BoundedVectorStep::Pending);
+        }
+        // This is the one exhaustive-scan charge for the stored entry about
+        // to be read. Visibility is deliberately checked afterwards: dead or
+        // future versions still consumed this physical scan step.
+        before_exhaustive_candidate()?;
         let scored = source
             .state
             .with_entries(|entries| -> std::result::Result<Option<_>, E> {
@@ -2004,14 +2707,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             .to_string(),
                     )))
                 })?;
-                if !entry.visible_at(cursor.snapshot)
-                    || cursor.candidates.as_ref().is_some_and(|candidates| {
-                        candidates.binary_search(&entry.row_id.0).is_err()
-                    })
-                {
+                if !entry.visible_at(cursor.snapshot) {
                     return Ok(None);
                 }
                 before_distance()?;
+                #[cfg(feature = "test-seams")]
+                observe_native_vector_score_for_test();
                 Ok(Some((
                     entry.row_id,
                     entry.vector.cosine_similarity(&cursor.query),
@@ -2045,8 +2746,6 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let (sources, bytes) = self.bounded_snapshot_sources(
             index,
             &layout,
-            None,
-            snapshot,
             &mut before_entry,
             &mut before_retain,
             &mut release_retained,
@@ -2078,88 +2777,23 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
-        before_source_entry()?;
-        let layout = self.store.index_layout(index).map_err(E::from)?;
-        let (snapshot_sources, source_bytes) = self.bounded_snapshot_sources(
+        let groups = self.bounded_candidate_groups(
             index,
-            &layout,
             candidates,
             snapshot,
             &mut before_source_entry,
+            || Ok(()),
             &mut before_retain,
             &mut release_retained,
         )?;
-        let counted = (|| -> std::result::Result<usize, E> {
-            if let Some(candidate_ids) = candidates {
-                let mut count = 0usize;
-                let mut candidate_position = 0usize;
-                while candidate_position < candidate_ids.len() {
-                    before_source_entry()?;
-                    let row_id =
-                        RowId(*candidate_ids.get(candidate_position).ok_or_else(|| {
-                            E::from(Error::Other(
-                                "bounded vector candidate count changed".to_string(),
-                            ))
-                        })?);
-                    candidate_position = candidate_position.checked_add(1).ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded vector candidate-count position overflow".to_string(),
-                        ))
-                    })?;
-                    if snapshot_sources
-                        .iter()
-                        .any(|source| source.state.directory_has_visible_row(row_id, snapshot))
-                    {
-                        count = count.checked_add(1).ok_or_else(|| {
-                            E::from(Error::Other(
-                                "bounded vector aggregate allowed count overflow".to_string(),
-                            ))
-                        })?;
-                    }
-                }
-                return Ok(count);
-            }
-            let mut count = 0usize;
-            let mut partition_position = 0usize;
-            while partition_position < snapshot_sources.len() {
-                before_source_entry()?;
-                let source = snapshot_sources.get(partition_position).ok_or_else(|| {
-                    E::from(Error::Other(
-                        "bounded vector count partition position changed".to_string(),
-                    ))
-                })?;
-                partition_position = partition_position.checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other(
-                        "bounded vector count partition position overflow".to_string(),
-                    ))
-                })?;
-                before_source_entry()?;
-                let state_count = source.state.bounded_directory_visible_entry_count(
-                    snapshot,
-                    candidates,
-                    &mut before_source_entry,
-                )?;
-                count = count.checked_add(state_count).ok_or_else(|| {
-                    E::from(Error::Other(
-                        "bounded vector aggregate allowed count overflow".to_string(),
-                    ))
-                })?;
-            }
-            Ok(count)
-        })();
-        drop(snapshot_sources);
-        release_retained(source_bytes);
-        counted
+        let count = groups.aggregate_allowed_count();
+        release_retained(groups.into_retained_bytes());
+        Ok(count)
     }
 
-    /// Run each selected partition through its snapshot-compatible graph when
-    /// available. AUTO exact-compares only a partition whose maintained route
-    /// is unavailable or incomplete; INDEXED returns one all-or-nothing
-    /// refusal. All retained graph and exact candidates share one global
-    /// score/order/tie-break merge before publication.
-    /// `aggregate_allowed_count` must be the result of
-    /// [`Self::bounded_authorized_visible_count`] for this same index,
-    /// candidate bitmap, and snapshot.
+    /// Compatibility entrypoint for callers that supply the pre-grouping
+    /// shape. It builds the same snapshot-aware groups used by the engine,
+    /// then releases their admitted memory after graph execution completes.
     #[allow(clippy::too_many_arguments)]
     pub fn bounded_hnsw_search<E>(
         &self,
@@ -2169,8 +2803,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         candidates: Option<&[u64]>,
         snapshot: SnapshotId,
         mode: VectorSearchMode,
-        aggregate_allowed_count: usize,
+        _aggregate_allowed_count: usize,
         allowed_search_limits: HnswAllowedSearchLimits,
+        mut before_checkpoint: impl FnMut() -> std::result::Result<(), E>,
         mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
         mut before_distance: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
@@ -2179,6 +2814,59 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
+        let groups = self.bounded_candidate_groups(
+            index,
+            candidates,
+            snapshot,
+            &mut before_checkpoint,
+            || Ok(()),
+            &mut before_retain,
+            &mut release_retained,
+        )?;
+        let result = self.bounded_hnsw_search_grouped(
+            index,
+            query,
+            k,
+            &groups,
+            mode,
+            allowed_search_limits,
+            &mut before_source_entry,
+            &mut before_checkpoint,
+            &mut before_distance,
+            &mut before_retain,
+            &mut release_retained,
+        );
+        release_retained(groups.into_retained_bytes());
+        result
+    }
+
+    /// Run each selected partition through its snapshot-compatible graph when
+    /// available. AUTO exact-compares only a partition whose maintained route
+    /// is unavailable or incomplete; INDEXED returns one all-or-nothing
+    /// refusal. All retained graph and exact candidates share one global
+    /// score/order/tie-break merge before publication.
+    /// Candidate membership and the aggregate count come from `groups`, the
+    /// single admitted partitioning prepared for this query.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_hnsw_search_grouped<E>(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        groups: &BoundedVectorCandidateGroups,
+        mode: VectorSearchMode,
+        allowed_search_limits: HnswAllowedSearchLimits,
+        mut before_source_entry: impl FnMut() -> std::result::Result<(), E>,
+        mut before_exact_candidate: impl FnMut() -> std::result::Result<(), E>,
+        mut before_distance: impl FnMut() -> std::result::Result<(), E>,
+        mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut release_retained: impl FnMut(usize),
+    ) -> std::result::Result<BoundedHnswOutcome, E>
+    where
+        E: From<Error>,
+    {
+        let snapshot = groups.snapshot;
+        let aggregate_allowed_count = groups.aggregate_allowed_count();
         before_source_entry()?;
         let layout = self.store.index_layout(index).map_err(E::from)?;
         if query.len() != layout.dimension {
@@ -2188,58 +2876,219 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 actual: query.len(),
             }));
         }
-        if k == 0 || aggregate_allowed_count == 0 || candidates.is_some_and(<[u64]>::is_empty) {
+        if k == 0 || aggregate_allowed_count == 0 {
+            return Ok(BoundedHnswOutcome::CompleteEmpty);
+        }
+        let snapshot_sources = &groups.sources;
+        if snapshot_sources.is_empty() {
             return Ok(BoundedHnswOutcome::CompleteEmpty);
         }
         if mode == VectorSearchMode::Exact {
-            return Ok(BoundedHnswOutcome::ExactRequired {
-                reason: BoundedHnswExactReason::ExactMode,
-                aggregate_allowed_count,
-            });
+            return bounded_uniform_exact_outcome(
+                index,
+                groups,
+                BoundedHnswExactReason::ExactMode,
+                "exact_requested",
+                &mut before_retain,
+                &mut release_retained,
+            );
         }
         if mode == VectorSearchMode::Auto
             && aggregate_allowed_count < layout.effective_auto_index_at()
         {
-            return Ok(BoundedHnswOutcome::ExactRequired {
-                reason: if matches!(layout.quantization, VectorQuantization::F32) {
-                    BoundedHnswExactReason::AggregateBelowIndexedThreshold
-                } else {
-                    BoundedHnswExactReason::QuantizedAggregateUsesExact
-                },
-                aggregate_allowed_count,
-            });
+            let (reason, route_reason) = if matches!(layout.quantization, VectorQuantization::F32) {
+                (
+                    BoundedHnswExactReason::AggregateBelowIndexedThreshold,
+                    "aggregate_below_auto_index_at",
+                )
+            } else {
+                (
+                    BoundedHnswExactReason::QuantizedAggregateUsesExact,
+                    "quantized_exact_search",
+                )
+            };
+            return bounded_uniform_exact_outcome(
+                index,
+                groups,
+                reason,
+                route_reason,
+                &mut before_retain,
+                &mut release_retained,
+            );
         }
         if !query_has_positive_finite_norm(query) {
+            if mode == VectorSearchMode::Auto {
+                return bounded_uniform_exact_outcome(
+                    index,
+                    groups,
+                    BoundedHnswExactReason::SmallPartitionCandidateSetUsesExact,
+                    "non_positive_query_norm",
+                    &mut before_retain,
+                    &mut release_retained,
+                );
+            }
             return Ok(BoundedHnswOutcome::Unavailable {
                 reason: BoundedHnswUnavailableReason::NonPositiveFiniteQueryNorm,
             });
         }
 
-        let (snapshot_sources, source_bytes) = self.bounded_snapshot_sources(
-            index,
-            &layout,
-            candidates,
-            snapshot,
-            &mut before_source_entry,
-            &mut before_retain,
-            &mut release_retained,
-        )?;
-        if snapshot_sources.is_empty() {
-            release_retained(source_bytes);
-            return Ok(BoundedHnswOutcome::CompleteEmpty);
+        // One search, one breadth. The profile is resolved from what this
+        // statement admits in total rather than from each partition's own live
+        // count, so a narrower scope and a wider one over the same corpus ask
+        // the same question of the same graphs.
+        let statement_live_count = snapshot_sources
+            .iter()
+            .map(|source| source.live_count)
+            .fold(0usize, usize::saturating_add);
+        let statement_policy = layout.resolve_policy(statement_live_count, search_policy_limit(k));
+        if mode == VectorSearchMode::Auto {
+            // One decision for the statement, before any graph is loaded: the
+            // walk this statement would run is one search with one budget over
+            // every admitted Context, so it is weighed against comparing every
+            // admitted row, each side at its measured unit cost. No Context
+            // decides for itself -- a partition with no usable graph still
+            // falls back to comparing its rows below, and that is the only
+            // per-partition exhaustive work AUTO does.
+            let mut serving_hnsw_m = 0usize;
+            let mut exhaustive_nanos = 0u128;
+            let mut admission_estimate = 0usize;
+            for source in snapshot_sources {
+                before_source_entry()?;
+                if source.allowed_count == 0 {
+                    continue;
+                }
+                let comparison_nanos = if source.state.streams_raw_bodies() {
+                    AUTO_EXHAUSTIVE_COMPARISON_NANOS
+                } else {
+                    AUTO_IN_MEMORY_EXHAUSTIVE_COMPARISON_NANOS
+                };
+                exhaustive_nanos = exhaustive_nanos.saturating_add(
+                    (source.allowed_count as u128).saturating_mul(u128::from(comparison_nanos)),
+                );
+                let degree = source.state.snapshot_serving_policy(snapshot).map_or_else(
+                    || {
+                        layout
+                            .resolve_policy(source.live_count, search_policy_limit(k))
+                            .hnsw_m
+                    },
+                    |serving| serving.hnsw_m,
+                );
+                serving_hnsw_m = serving_hnsw_m.max(degree);
+                admission_estimate = admission_estimate.saturating_add(
+                    auto_layer_admission_estimate(
+                        source.live_count,
+                        degree,
+                        hnsw_rs::hnsw::layer0_max_nb_connection(degree),
+                    )
+                    .saturating_mul(
+                        source
+                            .state
+                            .dormant_layer_count_for_snapshot(snapshot)
+                            .max(1),
+                    ),
+                );
+            }
+            let walk_budget =
+                auto_statement_walk_budget(statement_policy.hnsw_ef_search, k, serving_hnsw_m);
+            let expected_walk = admission_estimate.saturating_add(
+                auto_statement_expected_expansion(walk_budget, aggregate_allowed_count),
+            );
+            contextdb_core::find_attribution::count(
+                "auto_statement_walk_budget",
+                walk_budget as u64,
+            );
+            if serving_hnsw_m != 0
+                && auto_statement_prefers_exhaustive_at_cost(expected_walk, exhaustive_nanos)
+            {
+                return bounded_uniform_exact_outcome(
+                    index,
+                    groups,
+                    BoundedHnswExactReason::StatementExhaustiveCheaperThanWalk,
+                    AUTO_STATEMENT_EXHAUSTIVE_REASON,
+                    &mut before_retain,
+                    &mut release_retained,
+                );
+            }
         }
 
         let snapshot_tx = TxId::from_snapshot(snapshot);
+        // Each load makes room for exactly what it reads from its saved
+        // topology, by evicting idle graphs of partitions this statement is
+        // not searching -- never one it is about to search, which would make a
+        // find over several Contexts re-read every graph it had already read.
+        let admitted = snapshot_sources
+            .iter()
+            .map(|source| source.state.as_ref())
+            .collect::<Vec<_>>();
+        let _searched_partitions =
+            crate::store::VectorStore::declare_statement_partitions(&admitted);
+        let _layers_to_load = {
+            let dormant_bytes = snapshot_sources
+                .iter()
+                .map(|source| source.state.dormant_load_bytes_for_snapshot(snapshot))
+                .fold(0usize, usize::saturating_add);
+            contextdb_core::find_attribution::count(
+                "graph_admission_priced_bytes",
+                dormant_bytes as u64,
+            );
+            // Make room once, up front, for what the catalog says these loads
+            // need at least, from idle graphs this statement is not searching.
+            // A load that turns out to need more makes room for the rest
+            // itself, from the same idle graphs and then from serving pages.
+            self.store.reclaim_idle_graphs_for(dormant_bytes, &admitted);
+            // And for the serving pages those loads could use, from idle
+            // partitions outside this statement: they give up pages they can
+            // re-read, never their topology.
+            let dormant_pages = snapshot_sources
+                .iter()
+                .map(|source| source.state.dormant_page_bytes_for_snapshot(snapshot))
+                .fold(0usize, usize::saturating_add);
+            if dormant_bytes != 0
+                && let Some(available) = self.store.memory_available_bytes()
+            {
+                let wanted = dormant_bytes.saturating_add(dormant_pages);
+                if available < wanted {
+                    self.store
+                        .give_back_serving_pages_outside_statement(wanted - available);
+                }
+            }
+            // Every saved layer not already resident will load during this
+            // statement -- a partition's base and its change are a load each,
+            // the same layers whose least loads `dormant_bytes` sums. Each load
+            // keeps room for the least loads of the ones after it and takes
+            // its share of what is free beyond that, rather than all of it.
+            contextdb_core::serving_cache_share::declare_layers_to_load(
+                snapshot_sources
+                    .iter()
+                    .map(|source| source.state.dormant_layer_count_for_snapshot(snapshot))
+                    .fold(0usize, usize::saturating_add),
+                dormant_bytes,
+                dormant_pages,
+            )
+        };
+        let mut query_self_scores = BoundedHnswQuerySelfScores::new(query);
+        // Every partition this statement compares exhaustively reads its
+        // bodies through this one open read.
+        let mut body_reads = crate::store::RawVectorBodyReads::default();
         let mut merged = Some(Vec::<(RowId, f32)>::new());
         let mut merged_bytes = 0usize;
         let mut graph_trace_candidates = Some(Vec::<(RowId, f32)>::new());
         let mut graph_trace_candidate_bytes = 0usize;
         let mut selected_generations = Vec::<crate::store::VectorGraphGeneration>::new();
         let mut selected_generation_bytes = 0usize;
+        let mut union_receipt = None;
         let mut aggregate_hnsw_len = 0usize;
         let mut max_hnsw_ef_search = 0usize;
         let mut exact_candidate_count = 0usize;
-        let mut partition_candidate_bytes = 0usize;
+        let (mut partition_routes, mut partition_route_bytes) = allocate_partition_route_slots(
+            snapshot_sources.len(),
+            &mut before_retain,
+            &mut release_retained,
+        )?;
+        let mut first_fallback_reason = None;
+        // Every partition with a usable graph is answered by one search over
+        // all of their layers together, after the loop.
+        let mut union_partitions = Vec::<UnionPartition<'_>>::new();
         let searched = (|| -> std::result::Result<BoundedHnswOutcome, E> {
             let mut partition_position = 0usize;
             while partition_position < snapshot_sources.len() {
@@ -2255,33 +3104,18 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     ))
                 })?;
                 let state = &source.state;
-                let (partition_candidate_ids, local_candidate_bytes) =
-                    if let Some(candidate_ids) = candidates {
-                        bounded_partition_candidate_ids(
-                            state,
-                            candidate_ids,
-                            snapshot,
-                            &mut before_source_entry,
-                            &mut before_retain,
-                            &mut release_retained,
-                        )?
-                    } else {
-                        (Vec::new(), 0)
-                    };
-                partition_candidate_bytes = match checked_vector_add(
-                    partition_candidate_bytes,
-                    local_candidate_bytes,
-                    "partition candidate intersections",
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        drop(partition_candidate_ids);
-                        release_retained(local_candidate_bytes);
-                        return Err(E::from(error));
-                    }
+                let partition_started = std::time::Instant::now();
+                let partition_pages = contextdb_core::find_attribution::page_meters();
+                let partition_evaluations = std::cell::Cell::new(0u64);
+                let partition_visited = std::cell::Cell::new(0u64);
+                let partition_layers = std::cell::Cell::new(0u64);
+                let candidates = if source.candidate_ids_cover_all_live {
+                    None
+                } else {
+                    source.candidate_ids.as_deref()
                 };
-                let allowed_count = partition_candidate_ids.len();
-                if candidates.is_some() && allowed_count == 0 {
+                let allowed_count = source.allowed_count;
+                if groups.filtered && allowed_count == 0 {
                     continue;
                 }
 
@@ -2291,11 +3125,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // it for every graph layer below.
                 let eligibility =
                     state.bounded_hnsw_eligibility(snapshot_tx, &mut before_source_entry)?;
-                let ef_search = layout
-                    .resolve_policy(eligibility.live_count, search_policy_limit(k))
-                    .hnsw_ef_search;
-                max_hnsw_ef_search = max_hnsw_ef_search.max(ef_search);
-                let allowed_count = if candidates.is_some() {
+                let ef_search = statement_policy.hnsw_ef_search;
+                let allowed_count = if groups.filtered {
                     allowed_count
                 } else {
                     eligibility.live_count
@@ -2304,11 +3135,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     continue;
                 }
 
-                let required = k.min(allowed_count);
-                self.store.reclaim_idle_graphs_for(
-                    state.dormant_load_bytes_for_snapshot(snapshot),
-                    Some(state),
-                );
+                max_hnsw_ef_search = max_hnsw_ef_search.max(ef_search);
+                let every_graph_point_is_allowed =
+                    matches!(layout.quantization, VectorQuantization::F32)
+                        && eligibility.entry_count == eligibility.live_count
+                        && (!groups.filtered || source.candidate_ids_cover_all_live);
+
                 let mut preload_checkpoint =
                     || before_source_entry().map_err(QuarantineAwarePreloadError::Control);
                 let mut preload_retain =
@@ -2327,357 +3159,407 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     }
                     Err(QuarantineAwarePreloadError::Store(_))
                         if state.route_quarantine().is_some() => {}
+                    // A graph this read could not fit in the memory it declared
+                    // is a graph this partition does not have. AUTO answers a
+                    // partition with no usable graph by comparing its rows, so
+                    // it answers this one the same way rather than failing a
+                    // statement it can still complete. INDEXED asked for the
+                    // graph over the whole scope and is refused, unchanged.
+                    Err(QuarantineAwarePreloadError::Store(Error::MemoryBudgetExceeded {
+                        ..
+                    })) if mode == VectorSearchMode::Auto => {}
                     Err(QuarantineAwarePreloadError::Store(error)) => {
                         return Err(E::from(error));
                     }
                 }
-                let (availability, layer_results) = state.with_snapshot_compatible_hnsw_layers(
-                    snapshot,
-                    false,
-                    |hnsw| -> BoundedHnswLayerSearchResult<E> {
-                        before_source_entry()?;
-                        let hnsw_len = hnsw.len();
-                        // An empty fresh tail contributes no candidates. It cannot
-                        // make an otherwise complete sealed route unavailable.
-                        if hnsw_len == 0 {
-                            return Ok((0, Vec::new(), 0, None));
-                        }
-                        if let Some(candidate_ids) = candidates {
-                            let result = hnsw.search_allowed_with_bounded_memory_at_ef(
-                                index,
-                                query,
-                                k,
-                                allowed_count,
-                                allowed_search_limits,
-                                ef_search,
-                                || partition_candidate_ids.iter().copied(),
-                                false,
-                                |row_id| {
-                                    candidate_ids.binary_search(&row_id.0).is_ok()
-                                        && state.directory_has_visible_row(row_id, snapshot)
-                                },
-                                &mut before_source_entry,
-                                &mut before_distance,
-                                |event| apply_hnsw_scratch_acquire(event, &mut before_retain),
-                                |event| apply_hnsw_scratch_release(event, &mut release_retained),
-                            )?;
-                            let incomplete = match result.status {
-                                HnswAllowedSearchStatus::Complete => None,
-                                HnswAllowedSearchStatus::Incomplete(reason) => Some(reason),
-                            };
-                            Ok((hnsw_len, result.rows, result.retained_bytes, incomplete))
-                        } else {
-                            let result = hnsw.search_allowed_with_bounded_memory_at_ef(
-                                index,
-                                query,
-                                k,
-                                allowed_count,
-                                HnswAllowedSearchLimits {
-                                    max_visited_nodes: usize::MAX,
-                                    max_vector_evaluations: usize::MAX,
-                                },
-                                ef_search,
-                                std::iter::empty,
-                                true,
-                                |row_id| state.directory_has_visible_row(row_id, snapshot),
-                                &mut before_source_entry,
-                                &mut before_distance,
-                                |event| apply_hnsw_scratch_acquire(event, &mut before_retain),
-                                |event| apply_hnsw_scratch_release(event, &mut release_retained),
-                            )?;
-                            Ok((hnsw_len, result.rows, result.retained_bytes, None))
-                        }
-                    },
-                )?;
-                if availability != VectorGraphLayerAvailability::Ready {
-                    if mode == VectorSearchMode::Indexed {
-                        return Ok(BoundedHnswOutcome::Unavailable {
-                            reason: BoundedHnswUnavailableReason::MaintainedGraphMissing,
-                        });
-                    }
-                    let scores = merged.as_mut().ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded HNSW merge state was already consumed".to_string(),
-                        ))
-                    })?;
-                    exact_candidate_count =
-                        exact_candidate_count.saturating_add(bounded_exact_merge_state(
-                            state,
-                            query,
-                            k,
-                            candidates,
-                            snapshot,
-                            scores,
-                            &mut merged_bytes,
-                            &mut before_source_entry,
-                            &mut before_distance,
-                            &mut before_retain,
-                            &mut release_retained,
-                        )?);
-                    continue;
-                }
-                self.store.mark_sealed_graph_used(state);
-                let mut raw_candidates = Vec::new();
-                let mut raw_result_bytes = 0usize;
-                // A complete chain has a base and at most one sealed change;
-                // the optional third layer is a mutable tail with no identity.
-                let mut layer_generations = [None, None];
-                let mut layer_generation_count = 0usize;
-                let mut state_hnsw_len = 0usize;
-                let mut incomplete_reason = None;
-                for (generation, (hnsw_len, layer_rows, layer_bytes, incomplete)) in layer_results {
-                    state_hnsw_len = state_hnsw_len.saturating_add(hnsw_len);
-                    if let Some(reason) = incomplete.filter(|reason| {
-                        *reason != HnswAllowedSearchIncomplete::InsufficientAllowedCandidates
-                    }) {
-                        drop(layer_rows);
-                        release_retained(layer_bytes);
-                        incomplete_reason.get_or_insert(reason);
-                        continue;
-                    }
-                    if incomplete_reason.is_some() {
-                        drop(layer_rows);
-                        release_retained(layer_bytes);
-                        continue;
-                    }
-                    let contributes_new_candidate = layer_rows.iter().any(|(row_id, _)| {
-                        !raw_candidates
-                            .iter()
-                            .any(|(existing_row_id, _)| existing_row_id == row_id)
+                // Every non-empty layer this partition's snapshot selects --
+                // sealed base, sealed change and mutable tail, paged or held
+                // in memory -- joins the statement's one union search. No
+                // partition walks its layers on its own: one with no usable
+                // graph (quarantined, an incomplete chain, nothing maintained,
+                // or a chain whose layers hold no point) is refused under
+                // INDEXED and compared row by row under AUTO.
+                let (availability, owned_layers) = state.snapshot_compatible_owned_layers(snapshot);
+                if availability == VectorGraphLayerAvailability::Ready && !owned_layers.is_empty() {
+                    self.store.mark_sealed_graph_used(state);
+                    let charged_bytes = std::mem::size_of::<UnionPartition<'_>>().saturating_add(
+                        owned_layers.capacity().saturating_mul(std::mem::size_of::<
+                            crate::store::SnapshotCompatibleLayer<'_>,
+                        >()),
+                    );
+                    before_retain(charged_bytes)?;
+                    union_partitions.push(UnionPartition {
+                        source_position: partition_position - 1,
+                        candidates,
+                        allowed_count,
+                        live_count: eligibility.live_count,
+                        entry_count: eligibility.entry_count,
+                        bounded_limits: every_graph_point_is_allowed || candidates.is_some(),
+                        layers: owned_layers,
+                        charged_bytes,
+                        routes_before: partition_routes.len(),
+                        started: partition_started,
+                        pages: partition_pages,
                     });
-                    if contributes_new_candidate && let Some(generation) = generation {
-                        let Some(slot) = layer_generations.get_mut(layer_generation_count) else {
-                            drop(layer_rows);
-                            release_retained(layer_bytes);
-                            return Err(E::from(Error::Other(
-                                "snapshot-compatible vector chain has more than two sealed layers"
-                                    .to_string(),
-                            )));
-                        };
-                        *slot = Some(generation);
-                        layer_generation_count += 1;
-                    }
-                    let needed = raw_candidates
-                        .len()
-                        .checked_add(layer_rows.len())
-                        .ok_or_else(|| {
-                            E::from(Error::Other(
-                                "bounded HNSW layer candidate length overflow".to_string(),
-                            ))
-                        })?;
-                    grow_vector_copy(
-                        &mut raw_candidates,
-                        needed,
-                        Some(&mut raw_result_bytes),
-                        "partitioned HNSW layer merge",
-                        &mut before_source_entry,
-                        &mut before_retain,
-                        &mut release_retained,
-                    )?;
-                    raw_candidates.extend(layer_rows);
-                    release_retained(layer_bytes);
-                }
-
-                if let Some(reason) = incomplete_reason {
-                    drop(raw_candidates);
-                    release_retained(raw_result_bytes);
-                    if mode == VectorSearchMode::Indexed {
-                        return Ok(BoundedHnswOutcome::Incomplete { reason });
-                    }
-                    let scores = merged.as_mut().ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded HNSW merge state was already consumed".to_string(),
-                        ))
-                    })?;
-                    exact_candidate_count =
-                        exact_candidate_count.saturating_add(bounded_exact_merge_state(
-                            state,
-                            query,
-                            k,
-                            candidates,
-                            snapshot,
-                            scores,
-                            &mut merged_bytes,
-                            &mut before_source_entry,
-                            &mut before_distance,
-                            &mut before_retain,
-                            &mut release_retained,
-                        )?);
                     continue;
                 }
-
-                #[cfg(feature = "test-seams")]
-                self.store.graph_candidate_caps().cap_graph_candidates(
-                    index,
-                    Some(&source.partition_key),
-                    &mut raw_candidates,
-                );
-                let incomplete = (raw_candidates.len() < required)
-                    .then_some(HnswAllowedSearchIncomplete::InsufficientAllowedCandidates);
-                if let Some(reason) = incomplete {
-                    drop(raw_candidates);
-                    release_retained(raw_result_bytes);
-                    if mode == VectorSearchMode::Indexed {
-                        return Ok(BoundedHnswOutcome::Incomplete { reason });
-                    }
-                    let scores = merged.as_mut().ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded HNSW merge state was already consumed".to_string(),
-                        ))
-                    })?;
-                    exact_candidate_count =
-                        exact_candidate_count.saturating_add(bounded_exact_merge_state(
-                            state,
-                            query,
-                            k,
-                            candidates,
-                            snapshot,
-                            scores,
-                            &mut merged_bytes,
-                            &mut before_source_entry,
-                            &mut before_distance,
-                            &mut before_retain,
-                            &mut release_retained,
-                        )?);
-                    continue;
-                }
-
-                let mut accepted = 0usize;
-                for raw_position in 0..raw_candidates.len() {
-                    before_source_entry()?;
-                    let (row_id, _) = raw_candidates[raw_position];
-                    before_source_entry()?;
-                    if !state.directory_has_visible_row(row_id, snapshot)
-                        || candidates
-                            .is_some_and(|candidates| candidates.binary_search(&row_id.0).is_err())
-                    {
-                        continue;
-                    }
-                    // Layer identities can overlap. Score each logical row once,
-                    // using its native snapshot-visible body and the original query.
-                    if raw_candidates[..accepted]
-                        .iter()
-                        .any(|(id, _)| *id == row_id)
-                    {
-                        continue;
-                    }
-                    // Cleanup can leave one directory version while an immutable
-                    // graph still contains an older point. Directory cardinality
-                    // cannot certify that point's score. Resolve only this row's
-                    // visible native body, with the caller's work and memory budget.
-                    let Some(score) = state.bounded_score_visible_candidate(
-                        index,
-                        row_id,
-                        snapshot,
-                        query,
-                        &mut before_source_entry,
-                        &mut before_distance,
-                        &mut before_retain,
-                        &mut release_retained,
-                    )?
-                    else {
-                        continue;
-                    };
-                    raw_candidates[accepted] = (row_id, score);
-                    accepted = accepted.checked_add(1).ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded HNSW accepted-row count overflow".to_string(),
-                        ))
-                    })?;
-                }
-                raw_candidates.truncate(accepted);
-                if accepted < required {
-                    drop(raw_candidates);
-                    release_retained(raw_result_bytes);
-                    if mode == VectorSearchMode::Indexed {
-                        return Ok(BoundedHnswOutcome::Incomplete {
+                drop(owned_layers);
+                let graph_ready = availability == VectorGraphLayerAvailability::Ready;
+                if mode == VectorSearchMode::Indexed {
+                    return Ok(if graph_ready {
+                        BoundedHnswOutcome::Incomplete {
                             reason: HnswAllowedSearchIncomplete::InsufficientAllowedCandidates,
-                        });
+                        }
+                    } else {
+                        BoundedHnswOutcome::Unavailable {
+                            reason: BoundedHnswUnavailableReason::MaintainedGraphMissing,
+                        }
+                    });
+                }
+                let reason = if graph_ready {
+                    "maintained_graph_incomplete"
+                } else {
+                    "maintained_graph_unavailable"
+                };
+                let scores = merged.as_mut().ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW merge state was already consumed".to_string(),
+                    ))
+                })?;
+                let partition_compared = bounded_exact_merge_state(
+                    index,
+                    state,
+                    query,
+                    k,
+                    candidates,
+                    snapshot,
+                    scores,
+                    &mut merged_bytes,
+                    &mut body_reads,
+                    &mut before_source_entry,
+                    &mut before_exact_candidate,
+                    &mut before_distance,
+                    &mut before_retain,
+                    &mut release_retained,
+                )?;
+                exact_candidate_count = exact_candidate_count.saturating_add(partition_compared);
+                note_partition_attribution(
+                    "exact",
+                    reason,
+                    eligibility.live_count,
+                    eligibility.entry_count,
+                    allowed_count,
+                    ef_search,
+                    partition_compared,
+                    &partition_layers,
+                    &partition_visited,
+                    &partition_evaluations,
+                    partition_started,
+                    partition_pages,
+                );
+                first_fallback_reason.get_or_insert(reason);
+                partition_routes.push(VectorPartitionSearchTrace {
+                    route: VectorPartitionSearchRoute::Exact,
+                    reason,
+                });
+            }
+
+            if !union_partitions.is_empty() {
+                let outcome = self.bounded_union_search(
+                    index,
+                    query,
+                    k,
+                    snapshot,
+                    snapshot_sources,
+                    &mut union_partitions,
+                    statement_policy.hnsw_ef_search,
+                    allowed_search_limits,
+                    &mut query_self_scores,
+                    &mut before_source_entry,
+                    &mut before_distance,
+                    &mut before_retain,
+                    &mut release_retained,
+                )?;
+                union_receipt = Some(outcome.receipt);
+                let resolved = match outcome.outcome {
+                    UnionOutcome::Answered {
+                        accepted,
+                        accepted_bytes,
+                        walked,
+                        walked_bytes,
+                        contributing,
+                        short,
+                        short_bytes,
+                    } => Some((
+                        accepted,
+                        accepted_bytes,
+                        walked,
+                        walked_bytes,
+                        contributing,
+                        short,
+                        short_bytes,
+                    )),
+                    UnionOutcome::Unresolved(reason) => {
+                        if mode == VectorSearchMode::Indexed {
+                            return Ok(BoundedHnswOutcome::Incomplete { reason });
+                        }
+                        None
                     }
-                    let scores = merged.as_mut().ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded HNSW merge state was already consumed".to_string(),
-                        ))
-                    })?;
-                    exact_candidate_count =
-                        exact_candidate_count.saturating_add(bounded_exact_merge_state(
-                            state,
-                            query,
-                            k,
-                            candidates,
-                            snapshot,
-                            scores,
-                            &mut merged_bytes,
-                            &mut before_source_entry,
-                            &mut before_distance,
-                            &mut before_retain,
-                            &mut release_retained,
-                        )?);
-                    continue;
-                }
-                aggregate_hnsw_len = aggregate_hnsw_len.saturating_add(state_hnsw_len);
-                {
-                    let trace_candidates = graph_trace_candidates.as_mut().ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded HNSW trace candidate state was already consumed".to_string(),
-                        ))
-                    })?;
-                    let required_capacity = trace_candidates
-                        .len()
-                        .checked_add(raw_candidates.len())
-                        .ok_or_else(|| {
-                            E::from(Error::Other(
-                                "bounded HNSW trace candidate length overflow".to_string(),
-                            ))
-                        })?;
-                    grow_vector_copy(
-                        trace_candidates,
-                        required_capacity,
-                        Some(&mut graph_trace_candidate_bytes),
-                        "HNSW trace graph candidates",
-                        &mut before_source_entry,
-                        &mut before_retain,
-                        &mut release_retained,
-                    )?;
-                    trace_candidates.extend(raw_candidates.iter().copied());
-                }
-                {
-                    let scores = merged.as_mut().ok_or_else(|| {
-                        E::from(Error::Other(
-                            "bounded HNSW merge state was already consumed".to_string(),
-                        ))
-                    })?;
-                    for candidate in raw_candidates.iter().copied() {
-                        merge_bounded_vector_score(
-                            scores,
-                            &mut merged_bytes,
-                            candidate,
-                            k,
-                            &mut before_source_entry,
-                            &mut before_retain,
-                            &mut release_retained,
-                        )?;
+                };
+                match resolved {
+                    Some((
+                        accepted,
+                        accepted_bytes,
+                        walked,
+                        walked_bytes,
+                        contributing,
+                        short,
+                        short_bytes,
+                    )) => {
+                        let merge = (|| -> std::result::Result<(), E> {
+                            let trace_candidates =
+                                graph_trace_candidates.as_mut().ok_or_else(|| {
+                                    E::from(Error::Other(
+                                        "bounded HNSW trace candidate state was already consumed"
+                                            .to_string(),
+                                    ))
+                                })?;
+                            let required_capacity = trace_candidates
+                                .len()
+                                .checked_add(walked.len())
+                                .ok_or_else(|| {
+                                    E::from(Error::Other(
+                                        "bounded HNSW trace candidate length overflow".to_string(),
+                                    ))
+                                })?;
+                            grow_vector_copy(
+                                trace_candidates,
+                                required_capacity,
+                                Some(&mut graph_trace_candidate_bytes),
+                                "HNSW trace graph candidates",
+                                &mut before_source_entry,
+                                &mut before_retain,
+                                &mut release_retained,
+                            )?;
+                            trace_candidates.extend(walked.iter().copied());
+                            let scores = merged.as_mut().ok_or_else(|| {
+                                E::from(Error::Other(
+                                    "bounded HNSW merge state was already consumed".to_string(),
+                                ))
+                            })?;
+                            for candidate in accepted.iter().copied() {
+                                merge_bounded_vector_score(
+                                    scores,
+                                    &mut merged_bytes,
+                                    candidate,
+                                    k,
+                                    &mut before_source_entry,
+                                    &mut before_retain,
+                                    &mut release_retained,
+                                )?;
+                            }
+                            Ok(())
+                        })();
+                        drop(accepted);
+                        release_retained(accepted_bytes);
+                        drop(walked);
+                        release_retained(walked_bytes);
+                        if let Err(error) = merge {
+                            drop(short);
+                            release_retained(short_bytes);
+                            return Err(error);
+                        }
+                        let answered =
+                            (|| -> std::result::Result<Option<BoundedHnswOutcome>, E> {
+                                for (position, partition) in union_partitions.iter().enumerate() {
+                                    if short.get(position).copied().unwrap_or(false) {
+                                        if mode == VectorSearchMode::Indexed {
+                                            return Ok(Some(BoundedHnswOutcome::Incomplete {
+                                        reason:
+                                            HnswAllowedSearchIncomplete::InsufficientAllowedCandidates,
+                                    }));
+                                        }
+                                        before_source_entry()?;
+                                        let source = snapshot_sources
+                                            .get(partition.source_position)
+                                            .ok_or_else(|| {
+                                                E::from(Error::Other(
+                                                    "bounded HNSW union partition position changed"
+                                                        .to_string(),
+                                                ))
+                                            })?;
+                                        let scores = merged.as_mut().ok_or_else(|| {
+                                            E::from(Error::Other(
+                                                "bounded HNSW merge state was already consumed"
+                                                    .to_string(),
+                                            ))
+                                        })?;
+                                        let partition_compared = bounded_exact_merge_state(
+                                            index,
+                                            &source.state,
+                                            query,
+                                            k,
+                                            partition.candidates,
+                                            snapshot,
+                                            scores,
+                                            &mut merged_bytes,
+                                            &mut body_reads,
+                                            &mut before_source_entry,
+                                            &mut before_exact_candidate,
+                                            &mut before_distance,
+                                            &mut before_retain,
+                                            &mut release_retained,
+                                        )?;
+                                        exact_candidate_count = exact_candidate_count
+                                            .saturating_add(partition_compared);
+                                        note_partition_attribution(
+                                            "exact",
+                                            "maintained_graph_incomplete",
+                                            partition.live_count,
+                                            partition.entry_count,
+                                            partition.allowed_count,
+                                            statement_policy.hnsw_ef_search,
+                                            partition_compared,
+                                            &Cell::new(partition.layers.len() as u64),
+                                            &Cell::new(0),
+                                            &Cell::new(0),
+                                            partition.started,
+                                            partition.pages,
+                                        );
+                                        first_fallback_reason
+                                            .get_or_insert("maintained_graph_incomplete");
+                                        partition_routes.insert(
+                                            partition.routes_before + position,
+                                            VectorPartitionSearchTrace {
+                                                route: VectorPartitionSearchRoute::Exact,
+                                                reason: "maintained_graph_incomplete",
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                    for (layer_position, layer) in
+                                        partition.layers.iter().enumerate()
+                                    {
+                                        aggregate_hnsw_len =
+                                            aggregate_hnsw_len.saturating_add(layer.len());
+                                        let Some(generation) = layer.identity else {
+                                            continue;
+                                        };
+                                        if !contributing.contains(&(position, layer_position)) {
+                                            continue;
+                                        }
+                                        let required_capacity = selected_generations
+                                            .len()
+                                            .checked_add(1)
+                                            .ok_or_else(|| {
+                                                E::from(Error::Other(
+                                            "bounded HNSW selected-generation length overflow"
+                                                .to_string(),
+                                        ))
+                                            })?;
+                                        grow_vector_copy(
+                                            &mut selected_generations,
+                                            required_capacity,
+                                            Some(&mut selected_generation_bytes),
+                                            "HNSW trace selected generations",
+                                            &mut before_source_entry,
+                                            &mut before_retain,
+                                            &mut release_retained,
+                                        )?;
+                                        selected_generations.push(generation);
+                                    }
+                                    note_partition_attribution(
+                                        "indexed",
+                                        "maintained_graph_ready",
+                                        partition.live_count,
+                                        partition.entry_count,
+                                        partition.allowed_count,
+                                        statement_policy.hnsw_ef_search,
+                                        0,
+                                        &Cell::new(partition.layers.len() as u64),
+                                        &Cell::new(0),
+                                        &Cell::new(0),
+                                        partition.started,
+                                        partition.pages,
+                                    );
+                                    // In scope order, among the routes the loop
+                                    // recorded, inside the slots already charged.
+                                    partition_routes.insert(
+                                        partition.routes_before + position,
+                                        VectorPartitionSearchTrace {
+                                            route: VectorPartitionSearchRoute::Indexed,
+                                            reason: "maintained_graph_ready",
+                                        },
+                                    );
+                                }
+                                Ok(None)
+                            })();
+                        drop(short);
+                        release_retained(short_bytes);
+                        if let Some(outcome) = answered? {
+                            return Ok(outcome);
+                        }
                     }
-                }
-                drop(raw_candidates);
-                release_retained(raw_result_bytes);
-                for generation in layer_generations.into_iter().flatten() {
-                    let required_capacity =
-                        selected_generations.len().checked_add(1).ok_or_else(|| {
-                            E::from(Error::Other(
-                                "bounded HNSW selected-generation length overflow".to_string(),
-                            ))
-                        })?;
-                    grow_vector_copy(
-                        &mut selected_generations,
-                        required_capacity,
-                        Some(&mut selected_generation_bytes),
-                        "HNSW trace selected generations",
-                        &mut before_source_entry,
-                        &mut before_retain,
-                        &mut release_retained,
-                    )?;
-                    selected_generations.push(generation);
+                    None => {
+                        // AUTO answers what the one search could not resolve by
+                        // comparing those partitions' rows, inside the same
+                        // budget, through the statement's one open body read.
+                        for (position, partition) in union_partitions.iter().enumerate() {
+                            before_source_entry()?;
+                            let source = snapshot_sources
+                                .get(partition.source_position)
+                                .ok_or_else(|| {
+                                    E::from(Error::Other(
+                                        "bounded HNSW union partition position changed".to_string(),
+                                    ))
+                                })?;
+                            let scores = merged.as_mut().ok_or_else(|| {
+                                E::from(Error::Other(
+                                    "bounded HNSW merge state was already consumed".to_string(),
+                                ))
+                            })?;
+                            let partition_compared = bounded_exact_merge_state(
+                                index,
+                                &source.state,
+                                query,
+                                k,
+                                partition.candidates,
+                                snapshot,
+                                scores,
+                                &mut merged_bytes,
+                                &mut body_reads,
+                                &mut before_source_entry,
+                                &mut before_exact_candidate,
+                                &mut before_distance,
+                                &mut before_retain,
+                                &mut release_retained,
+                            )?;
+                            exact_candidate_count =
+                                exact_candidate_count.saturating_add(partition_compared);
+                            note_partition_attribution(
+                                "exact",
+                                "maintained_graph_incomplete",
+                                partition.live_count,
+                                partition.entry_count,
+                                partition.allowed_count,
+                                statement_policy.hnsw_ef_search,
+                                partition_compared,
+                                &Cell::new(partition.layers.len() as u64),
+                                &Cell::new(0),
+                                &Cell::new(0),
+                                partition.started,
+                                partition.pages,
+                            );
+                            first_fallback_reason.get_or_insert("maintained_graph_incomplete");
+                            partition_routes.insert(
+                                partition.routes_before + position,
+                                VectorPartitionSearchTrace {
+                                    route: VectorPartitionSearchRoute::Exact,
+                                    reason: "maintained_graph_incomplete",
+                                },
+                            );
+                        }
+                    }
                 }
             }
 
@@ -2692,23 +3574,43 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             sort_vector_scores(rows);
             let trace_generations = std::mem::take(&mut selected_generations);
             let trace_generation_bytes = std::mem::take(&mut selected_generation_bytes);
-            let trace = bounded_hnsw_trace(
-                index,
-                aggregate_hnsw_len,
-                graph_trace_candidates.as_deref().ok_or_else(|| {
-                    E::from(Error::Other(
-                        "bounded HNSW trace candidates disappeared before publication".to_string(),
-                    ))
-                })?,
-                rows,
-                exact_candidate_count,
-                max_hnsw_ef_search,
-                trace_generations,
-                trace_generation_bytes,
-                &mut before_source_entry,
-                &mut before_retain,
-                &mut release_retained,
-            )?;
+            let trace_routes = std::mem::take(&mut partition_routes);
+            let trace_route_bytes = std::mem::take(&mut partition_route_bytes);
+            let trace = if aggregate_hnsw_len == 0 {
+                drop(trace_generations);
+                release_retained(trace_generation_bytes);
+                bounded_exact_route_trace(
+                    index,
+                    trace_routes,
+                    trace_route_bytes,
+                    first_fallback_reason.unwrap_or("maintained_graph_unavailable"),
+                    union_receipt,
+                    &mut before_retain,
+                    &mut release_retained,
+                )?
+            } else {
+                bounded_hnsw_trace(
+                    index,
+                    aggregate_hnsw_len,
+                    graph_trace_candidates.as_deref().ok_or_else(|| {
+                        E::from(Error::Other(
+                            "bounded HNSW trace candidates disappeared before publication"
+                                .to_string(),
+                        ))
+                    })?,
+                    rows,
+                    exact_candidate_count,
+                    max_hnsw_ef_search,
+                    trace_generations,
+                    union_receipt,
+                    trace_generation_bytes,
+                    trace_routes,
+                    trace_route_bytes,
+                    &mut before_source_entry,
+                    &mut before_retain,
+                    &mut release_retained,
+                )?
+            };
             drop(graph_trace_candidates.take());
             release_retained(graph_trace_candidate_bytes);
             graph_trace_candidate_bytes = 0;
@@ -2736,8 +3638,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 retained_bytes,
             }))
         })();
-        release_retained(partition_candidate_bytes);
-        release_retained(source_bytes);
+        let union_bytes = union_partitions
+            .iter()
+            .map(|partition| partition.charged_bytes)
+            .fold(0usize, usize::saturating_add);
+        drop(union_partitions);
+        release_retained(union_bytes);
         match searched {
             Ok(outcome @ BoundedHnswOutcome::Complete(_)) => Ok(outcome),
             Ok(outcome) => {
@@ -2746,6 +3652,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 drop(graph_trace_candidates.take());
                 release_retained(graph_trace_candidate_bytes);
                 release_retained(selected_generation_bytes);
+                release_retained(partition_route_bytes);
                 Ok(outcome)
             }
             Err(error) => {
@@ -2754,9 +3661,504 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 drop(graph_trace_candidates.take());
                 release_retained(graph_trace_candidate_bytes);
                 release_retained(selected_generation_bytes);
+                release_retained(partition_route_bytes);
                 Err(error)
             }
         }
+    }
+
+    /// One best-first search over every admitted layer of every partition in
+    /// `partitions`, with one frontier, one result heap and one candidate
+    /// budget, followed by re-scoring each candidate from its own partition's
+    /// stored vector. Expansion work is the budget's, not the scope's.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::drop_non_drop)] // Explicitly end callback borrows before partition publication.
+    fn bounded_union_search<E>(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        snapshot: SnapshotId,
+        sources: &[BoundedSnapshotVectorSource],
+        partitions: &mut [UnionPartition<'_>],
+        ef_search: usize,
+        allowed_search_limits: HnswAllowedSearchLimits,
+        query_self_scores: &mut BoundedHnswQuerySelfScores<'_>,
+        before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: &mut impl FnMut(usize),
+    ) -> std::result::Result<UnionSearchResult, E>
+    where
+        E: From<Error>,
+    {
+        let serving_layer0_degree = partitions
+            .iter()
+            .flat_map(|partition| partition.layers.iter())
+            .filter_map(|layer| layer.graph())
+            .map(|graph| graph.layer0_max_degree())
+            .max()
+            .unwrap_or(1);
+        let budget = crate::hnsw::union_candidate_budget(ef_search, k, serving_layer0_degree);
+        let limits = if partitions.iter().any(|partition| partition.bounded_limits) {
+            allowed_search_limits
+        } else {
+            HnswAllowedSearchLimits {
+                max_visited_nodes: usize::MAX,
+                max_vector_evaluations: usize::MAX,
+            }
+        };
+        let layer_count = partitions
+            .iter()
+            .map(|partition| partition.layers.len())
+            .sum::<usize>();
+        let layer_bytes = layer_count
+            .saturating_mul(std::mem::size_of::<crate::hnsw::HnswUnionLayer<'_>>())
+            .saturating_add(layer_count.saturating_mul(std::mem::size_of::<(usize, usize)>()));
+        before_retain(layer_bytes)?;
+        let mut layers = Vec::with_capacity(layer_count);
+        // Which (partition, layer) each union layer is.
+        let mut layer_owner = Vec::with_capacity(layer_count);
+        for (position, partition) in partitions.iter().enumerate() {
+            for (layer_position, layer) in partition.layers.iter().enumerate() {
+                // Every layer is held until this search ends; a released one
+                // here would be a search over fewer layers than its snapshot
+                // selected, so it is refused rather than skipped.
+                let Some(graph) = layer.graph() else {
+                    drop(layers);
+                    drop(layer_owner);
+                    release_retained(layer_bytes);
+                    return Err(E::from(Error::Other(
+                        "a union search layer was released before its search ran".to_string(),
+                    )));
+                };
+                layers.push(crate::hnsw::HnswUnionLayer {
+                    graph,
+                    partition: position,
+                    allowed_count: partition.allowed_count,
+                    live_count: partition.live_count,
+                    seed_rows: partition.candidates,
+                });
+                layer_owner.push((position, layer_position));
+            }
+        }
+        // A superseded point can have a better graph distance than its
+        // current stored vector. When a graph row has more than one version,
+        // certify a possible stop from visible stored scores instead.
+        let graph_scores_are_current = partitions
+            .iter()
+            .all(|partition| partition.entry_count == partition.live_count);
+        let started = std::time::Instant::now();
+        let retained = std::cell::RefCell::new(&mut *before_retain);
+        let released = std::cell::RefCell::new(&mut *release_retained);
+        let searched = crate::hnsw::search_union_allowed_bounded(
+            &layers,
+            query,
+            k,
+            ef_search,
+            budget,
+            limits,
+            graph_scores_are_current,
+            true,
+            query_self_scores,
+            |position, row_id| {
+                partitions.get(position).is_some_and(|partition| {
+                    partition
+                        .candidates
+                        .is_none_or(|candidates| candidates.binary_search(&row_id.0).is_ok())
+                        && sources
+                            .get(partition.source_position)
+                            .is_some_and(|source| {
+                                source.state.directory_has_visible_row(row_id, snapshot)
+                            })
+                })
+            },
+            |position, row_id, source_entry, distance| {
+                let partition = &partitions[position];
+                let state = &sources[partition.source_position].state;
+                state.bounded_score_visible_candidate(
+                    index,
+                    row_id,
+                    snapshot,
+                    query,
+                    None,
+                    source_entry,
+                    distance,
+                    &mut |bytes| (*retained.borrow_mut())(bytes),
+                    &mut |bytes| (*released.borrow_mut())(bytes),
+                )
+            },
+            &mut *before_source_entry,
+            &mut *before_distance,
+            |event| apply_hnsw_scratch_acquire(event, &mut |bytes| (*retained.borrow_mut())(bytes)),
+            |event| apply_hnsw_scratch_release(event, &mut |bytes| (*released.borrow_mut())(bytes)),
+        );
+        drop(retained);
+        drop(released);
+        drop(layers);
+        // The walk is over. A held tail's read lock goes back now, before
+        // resolving takes each partition's publication lock: a publication
+        // waiting for that tail's write side already holds it.
+        for partition in partitions.iter_mut() {
+            for layer in &mut partition.layers {
+                layer.release_tail();
+            }
+        }
+        let partitions = &*partitions;
+        let searched = match searched {
+            Ok(searched) => searched,
+            Err(error) => {
+                drop(layer_owner);
+                release_retained(layer_bytes);
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "test-seams")]
+        crate::hnsw::record_union_search(crate::hnsw::UnionSearchReceipt {
+            budget: searched.budget,
+            resolved_ef_search: ef_search,
+            admission_evaluations: searched.admission_evaluations,
+            expansion_evaluations: searched.expansion_evaluations,
+            layers_admitted: searched.layers_admitted,
+            partitions: partitions.len(),
+            frontier_exhausted: searched.frontier_exhausted,
+            terminal: searched.terminal.as_str(),
+            below_admission_floor: searched.below_admission_floor.is_some(),
+            expansion_cap: searched.expansion_cap,
+            // What one expanded point can reach: the widest admitted
+            // graph's layer-0 maximum degree, read from the graphs.
+            layer_zero_degree: serving_layer0_degree,
+        });
+        if contextdb_core::find_attribution::enabled() {
+            use contextdb_core::find_attribution::count;
+            count("union_searches", 1);
+            count("union_candidate_budget", searched.budget as u64);
+            count(
+                "union_admission_evaluations",
+                searched.admission_evaluations as u64,
+            );
+            count(
+                "union_expansion_evaluations",
+                searched.expansion_evaluations as u64,
+            );
+            count("union_layers_admitted", searched.layers_admitted as u64);
+            count(
+                match searched.terminal {
+                    crate::hnsw::UnionTerminal::AnswerComplete => "union_terminal_answer_complete",
+                    crate::hnsw::UnionTerminal::FrontierExhausted => {
+                        "union_terminal_frontier_exhausted"
+                    }
+                    crate::hnsw::UnionTerminal::Refused => "union_terminal_refused",
+                },
+                1,
+            );
+            count(
+                "union_frontier_exhausted",
+                u64::from(searched.frontier_exhausted),
+            );
+            count("union_partitions", partitions.len() as u64);
+            count(
+                "union_walk_micros",
+                started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            );
+        }
+        let receipt = VectorSearchBudgetReceipt {
+            global_candidate_budget: searched.budget,
+            admission_evaluations: searched.admission_evaluations,
+            expansion_evaluations: searched.expansion_evaluations,
+            layers_admitted: searched.layers_admitted,
+            budget_terminal: searched.terminal.as_str(),
+        };
+        let resolved = self.resolve_union_candidates(
+            index,
+            query,
+            k,
+            snapshot,
+            sources,
+            partitions,
+            &searched,
+            &layer_owner,
+            before_source_entry,
+            before_distance,
+            before_retain,
+            release_retained,
+        );
+        let result_bytes = searched.retained_bytes;
+        drop(searched);
+        release_retained(result_bytes);
+        drop(layer_owner);
+        release_retained(layer_bytes);
+        resolved.map(|outcome| UnionSearchResult {
+            receipt: if matches!(outcome, UnionOutcome::Unresolved(_)) {
+                VectorSearchBudgetReceipt {
+                    budget_terminal: "refused",
+                    ..receipt
+                }
+            } else {
+                receipt
+            },
+            outcome,
+        })
+    }
+
+    /// Re-score the union's kept rows from their stored vectors, nearest by
+    /// walk distance first, until the `k` best accepted rows cannot be beaten
+    /// by the next row's walk distance. On rows whose graph point is the
+    /// version the snapshot reads, the walk distance is the stored score, so
+    /// this stops after exactly `k`. A row the walk reached through a
+    /// superseded point, or through a coarser representation, scores lower
+    /// than its walk distance promised, and the next row is scored in its
+    /// place instead of the page going out short or out of order.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_union_candidates<E>(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        snapshot: SnapshotId,
+        sources: &[BoundedSnapshotVectorSource],
+        partitions: &[UnionPartition<'_>],
+        searched: &crate::hnsw::HnswUnionSearchResult,
+        layer_owner: &[(usize, usize)],
+        before_source_entry: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: &mut impl FnMut(usize),
+    ) -> std::result::Result<UnionOutcome, E>
+    where
+        E: From<Error>,
+    {
+        // A walk over F32 layers reaches a row at the distance its stored
+        // vector scores, so the next row's walk distance bounds what it can
+        // still score and scoring stops once the page cannot change. A
+        // quantized layer's walk distance is its code's, which sits on either
+        // side of the score of the vector the row stores: every kept row is
+        // scored, and the page is the best of those scores.
+        let walk_distance_is_score = matches!(
+            self.store
+                .index_layout(index)
+                .map_err(E::from)?
+                .quantization,
+            VectorQuantization::F32
+        ) && partitions
+            .iter()
+            .all(|partition| partition.entry_count == partition.live_count);
+        if searched.below_admission_floor.is_some() {
+            return Ok(UnionOutcome::Unresolved(
+                HnswAllowedSearchIncomplete::VectorEvaluationLimitReached,
+            ));
+        }
+        if let HnswAllowedSearchStatus::Incomplete(reason) = searched.status {
+            return Ok(UnionOutcome::Unresolved(reason));
+        }
+        if searched.terminal == crate::hnsw::UnionTerminal::Refused {
+            return Ok(UnionOutcome::Unresolved(
+                HnswAllowedSearchIncomplete::InsufficientAllowedCandidates,
+            ));
+        }
+        // A partition whose graph handed back fewer candidates than it needs
+        // cannot be answered from the graph; it is compared exhaustively,
+        // as the per-partition route compared a partition whose walk fell
+        // short. Only the candidate-cap proof seam produces one today.
+        let short_bytes = partitions.len().saturating_mul(std::mem::size_of::<bool>());
+        before_retain(short_bytes)?;
+        #[allow(unused_mut)]
+        let mut short = vec![false; partitions.len()];
+        #[cfg(feature = "test-seams")]
+        for (position, partition) in partitions.iter().enumerate() {
+            if let Some(source) = sources.get(partition.source_position)
+                && let Some(cap) = self
+                    .store
+                    .graph_candidate_caps()
+                    .graph_candidate_cap(index, Some(&source.partition_key))
+            {
+                short[position] = cap < k.min(partition.allowed_count);
+            }
+        }
+        let required = partitions
+            .iter()
+            .zip(&short)
+            .filter(|(_, short)| !**short)
+            .map(|(partition, _)| partition.allowed_count)
+            .fold(0usize, usize::saturating_add)
+            .min(k);
+        // Each partition's candidates are scored against the serving pages
+        // its walk already read, opened when its first candidate is scored.
+        // Beside it, how many of that partition's candidates were considered.
+        let slot_bytes = partitions.len().saturating_mul(std::mem::size_of::<(
+            Option<Option<crate::store::SealedPageScoring>>,
+            usize,
+        )>());
+        before_retain(slot_bytes)?;
+        let mut scoring = partitions
+            .iter()
+            .map(|_| (None::<Option<crate::store::SealedPageScoring>>, 0usize))
+            .collect::<Vec<_>>();
+        let mut accepted = Vec::<(RowId, f32)>::new();
+        let mut accepted_bytes = 0usize;
+        // Every row the walk handed back, for the route trace: scored rows at
+        // their stored score, the rest at the score their walk distance gives.
+        let mut walked = Vec::<(RowId, f32)>::new();
+        let mut walked_bytes = 0usize;
+        let mut contributing = Vec::<(usize, usize)>::new();
+        let resolved = (|| -> std::result::Result<(), E> {
+            let mut scoring_open = true;
+            for (position, candidate) in searched.candidates.iter().enumerate() {
+                before_source_entry()?;
+                // A short partition's candidates are neither scored nor
+                // reported: its rows are compared instead.
+                if short.get(candidate.partition).copied().unwrap_or(false) {
+                    continue;
+                }
+                if scoring_open
+                    && walk_distance_is_score
+                    && accepted.len() >= required
+                    && walk_cannot_beat(&accepted, required, candidate.distance)
+                {
+                    scoring_open = false;
+                }
+                let required_capacity = walked.len().checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW union walked-row count overflow".to_string(),
+                    ))
+                })?;
+                grow_vector_copy(
+                    &mut walked,
+                    required_capacity,
+                    Some(&mut walked_bytes),
+                    "HNSW union walked rows",
+                    before_source_entry,
+                    before_retain,
+                    release_retained,
+                )?;
+                let walk_score = 1.0 - candidate.distance;
+                if !scoring_open {
+                    if !walked.iter().any(|(id, _)| *id == candidate.row_id) {
+                        walked.push((
+                            candidate.row_id,
+                            candidate.resolved_score.unwrap_or(walk_score),
+                        ));
+                    }
+                    continue;
+                }
+                let partition = partitions.get(candidate.partition).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW union partition position changed".to_string(),
+                    ))
+                })?;
+                let source = sources.get(partition.source_position).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW union partition position changed".to_string(),
+                    ))
+                })?;
+                let state = &source.state;
+                let (page_scoring, considered) = &mut scoring[candidate.partition];
+                *considered += 1;
+                #[cfg(feature = "test-seams")]
+                if self
+                    .store
+                    .graph_candidate_caps()
+                    .graph_candidate_cap(index, Some(&source.partition_key))
+                    .is_some_and(|cap| *considered > cap)
+                {
+                    continue;
+                }
+                if !state.directory_has_visible_row(candidate.row_id, snapshot)
+                    || partition.candidates.is_some_and(|candidates| {
+                        candidates.binary_search(&candidate.row_id.0).is_err()
+                    })
+                {
+                    continue;
+                }
+                // Layer identities can overlap. Score each logical row once.
+                if searched.candidates[..position].iter().any(|earlier| {
+                    earlier.partition == candidate.partition && earlier.row_id == candidate.row_id
+                }) {
+                    continue;
+                }
+                if page_scoring.is_none() && candidate.resolved_score.is_none() {
+                    *page_scoring = Some(state.sealed_page_scoring(
+                        snapshot,
+                        query,
+                        before_source_entry,
+                        before_retain,
+                        release_retained,
+                    )?);
+                }
+                let score = match candidate.resolved_score {
+                    Some(score) => Some(score),
+                    None => state.bounded_score_visible_candidate(
+                        index,
+                        candidate.row_id,
+                        snapshot,
+                        query,
+                        page_scoring.as_mut().and_then(Option::as_mut),
+                        before_source_entry,
+                        before_distance,
+                        before_retain,
+                        release_retained,
+                    )?,
+                };
+                let Some(score) = score else {
+                    walked.push((candidate.row_id, walk_score));
+                    continue;
+                };
+                walked.push((candidate.row_id, score));
+                let required_capacity = accepted.len().checked_add(1).ok_or_else(|| {
+                    E::from(Error::Other(
+                        "bounded HNSW union accepted-row count overflow".to_string(),
+                    ))
+                })?;
+                grow_vector_copy(
+                    &mut accepted,
+                    required_capacity,
+                    Some(&mut accepted_bytes),
+                    "HNSW union accepted rows",
+                    before_source_entry,
+                    before_retain,
+                    release_retained,
+                )?;
+                accepted.push((candidate.row_id, score));
+                let owner = layer_owner.get(candidate.layer).copied();
+                if let Some(owner) = owner
+                    && !contributing.contains(&owner)
+                {
+                    contributing.push(owner);
+                }
+            }
+            Ok(())
+        })();
+        drop(scoring);
+        release_retained(slot_bytes);
+        if let Err(error) = resolved {
+            drop(accepted);
+            release_retained(accepted_bytes);
+            drop(walked);
+            release_retained(walked_bytes);
+            drop(short);
+            release_retained(short_bytes);
+            return Err(error);
+        }
+        if accepted.len() < required {
+            drop(accepted);
+            release_retained(accepted_bytes);
+            drop(walked);
+            release_retained(walked_bytes);
+            drop(short);
+            release_retained(short_bytes);
+            return Ok(UnionOutcome::Unresolved(
+                HnswAllowedSearchIncomplete::InsufficientAllowedCandidates,
+            ));
+        }
+        Ok(UnionOutcome::Answered {
+            accepted,
+            accepted_bytes,
+            walked,
+            walked_bytes,
+            contributing,
+            short,
+            short_bytes,
+        })
     }
 
     fn all_partition_states(
@@ -2789,6 +4191,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return Ok(vec![BoundedSnapshotVectorSource {
                 partition_key: VectorPartitionKey::unpartitioned(),
                 state: self.store.state(index)?,
+                candidate_ids: None,
+                point_load: false,
+                candidate_ids_cover_all_live: false,
+                allowed_count: 0,
+                live_count: 0,
             }]);
         }
         Ok(self
@@ -2801,6 +4208,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     .map(|state| BoundedSnapshotVectorSource {
                         partition_key,
                         state,
+                        candidate_ids: None,
+                        point_load: false,
+                        candidate_ids_cover_all_live: false,
+                        allowed_count: 0,
+                        live_count: 0,
                     })
             })
             .collect())
@@ -2824,6 +4236,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return Ok(vec![BoundedSnapshotVectorSource {
                 partition_key: VectorPartitionKey::unpartitioned(),
                 state: self.store.state(index)?,
+                candidate_ids: None,
+                point_load: false,
+                candidate_ids_cover_all_live: false,
+                allowed_count: 0,
+                live_count: 0,
             }]);
         }
         if let Some(prefixes) = self.selected_partition_prefixes(index) {
@@ -2841,6 +4258,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         BoundedSnapshotVectorSource {
                             partition_key: key,
                             state,
+                            candidate_ids: None,
+                            point_load: false,
+                            candidate_ids_cover_all_live: false,
+                            allowed_count: 0,
+                            live_count: 0,
                         }
                     })
                 })
@@ -2857,6 +4279,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         .map(|state| BoundedSnapshotVectorSource {
                             partition_key,
                             state,
+                            candidate_ids: None,
+                            point_load: false,
+                            candidate_ids_cover_all_live: false,
+                            allowed_count: 0,
+                            live_count: 0,
                         })
                 })
                 .collect());
@@ -2886,10 +4313,21 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             .map(|(partition_key, state)| BoundedSnapshotVectorSource {
                 partition_key,
                 state,
+                candidate_ids: None,
+                point_load: false,
+                candidate_ids_cover_all_live: false,
+                allowed_count: 0,
+                live_count: 0,
             })
             .collect())
     }
 
+    /// `stream_when_refused` is set for AUTO's exhaustive work: a partition
+    /// whose vectors the database's memory cannot hold whole is then compared
+    /// by reading each stored vector through its own point read, one at a
+    /// time, instead of being refused. An exhaustive search the caller asked
+    /// for outright keeps its whole-partition load and its typed refusal.
+    #[allow(clippy::too_many_arguments)]
     fn brute_force_search_sources(
         &self,
         index: &VectorIndexRef,
@@ -2898,6 +4336,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
+        stream_when_refused: bool,
     ) -> Result<SearchScores> {
         let mut scored = SearchScores::new(index.clone(), self._accountant.clone()).for_exact();
         // Directory metadata is snapshot-visible and already narrowed to the
@@ -2923,14 +4362,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         if let Some(candidates) = candidates {
             for id in candidates.iter() {
                 let row_id = RowId(id);
-                for source in sources {
+                for source in sources.iter() {
                     if !source.state.directory_has_visible_row(row_id, snapshot) {
                         continue;
                     }
-                    if let Some(score) = source
-                        .state
-                        .score_visible_candidate(index, row_id, snapshot, query)?
-                    {
+                    if let Some(score) = source.state.score_visible_candidate(
+                        index, row_id, snapshot, query,
+                        // The exhaustive route reads each row's own body.
+                        None,
+                    )? {
                         consider((row_id, score))?;
                     }
                     break;
@@ -2941,7 +4381,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return Ok(scored);
         }
         for source in sources {
-            source.state.ensure_raw_vectors_loaded()?;
+            match source.state.ensure_raw_vectors_loaded() {
+                Ok(()) => {}
+                Err(Error::MemoryBudgetExceeded { .. })
+                    if stream_when_refused && source.state.streams_raw_bodies() =>
+                {
+                    self.stream_source_bodies(index, source, query, snapshot, &mut consider)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             source.state.with_entries(|entries| {
                 for entry in entries {
                     if !entry.visible_at(snapshot) {
@@ -2952,6 +4401,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     {
                         continue;
                     }
+                    #[cfg(feature = "test-seams")]
+                    observe_native_vector_score_for_test();
                     consider((entry.row_id, entry.vector.cosine_similarity(query)))?;
                 }
                 Ok::<(), Error>(())
@@ -2960,6 +4411,54 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         sort_vector_scores(&mut scored);
         scored.truncate(k);
         Ok(scored)
+    }
+
+    /// Compare every row one partition's snapshot shows by reading each
+    /// row's own stored vector through a point read, admitting each body
+    /// against the database's memory before it is read and returning it
+    /// straight after, so the comparison never needs room for the partition.
+    fn stream_source_bodies(
+        &self,
+        index: &VectorIndexRef,
+        source: &BoundedSnapshotVectorSource,
+        query: &[f32],
+        snapshot: SnapshotId,
+        consider: &mut impl FnMut((RowId, f32)) -> Result<()>,
+    ) -> Result<()> {
+        let accountant = self._accountant.clone();
+        let mut before_retain = |bytes: usize| -> Result<()> {
+            accountant.try_allocate_for(
+                bytes,
+                "vector_search",
+                "exhaustive_body_read",
+                "Reduce the query scope, or raise MEMORY_LIMIT.",
+            )
+        };
+        let mut release_retained = |bytes: usize| accountant.release(bytes);
+        let mut bodies = crate::store::RawVectorBodyReads::default();
+        let mut position = 0usize;
+        while let Some(visible) = source.state.visible_directory_row_at(position, snapshot) {
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("exhaustive vector position overflow".to_string()))?;
+            let Some(row_id) = visible else {
+                continue;
+            };
+            if let Some(score) = source.state.bounded_score_stored_body(
+                index,
+                row_id,
+                snapshot,
+                query,
+                &mut bodies,
+                &mut || Ok::<(), Error>(()),
+                &mut || Ok(()),
+                &mut before_retain,
+                &mut release_retained,
+            )? {
+                consider((row_id, score))?;
+            }
+        }
+        Ok(())
     }
 
     fn aggregate_authorized_source_count(
@@ -3004,8 +4503,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
-    /// Resolve the global rank pool from the same selected partition policies
-    /// as the graph walk, charging source selection to the active reader.
+    /// Compatibility entrypoint that admits and releases its own candidate
+    /// grouping. Engine execution keeps one grouping across all vector stages.
     #[allow(clippy::too_many_arguments)]
     pub fn bounded_rank_candidate_k<E>(
         &self,
@@ -3020,234 +4519,56 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
-        let layout = self.store.index_layout(index).map_err(E::from)?;
-        let (sources, bytes) = self.bounded_snapshot_sources(
+        let groups = self.bounded_candidate_groups(
             index,
-            &layout,
             candidates,
             snapshot,
             &mut before_source,
+            || Ok(()),
             &mut acquire,
             &mut release,
         )?;
-        let result = (|| {
-            let mut breadth = limit;
-            let mut allowed = 0usize;
-            for source in &sources {
-                let count = source.state.bounded_directory_visible_entry_count(
-                    snapshot,
-                    candidates,
-                    &mut before_source,
-                )?;
-                if count == 0 {
-                    continue;
-                }
-                allowed = allowed.saturating_add(count);
-                breadth = breadth.max(
-                    layout
-                        .resolve_policy(
-                            source.state.directory_visible_entry_count(snapshot, None),
-                            limit,
-                        )
-                        .hnsw_ef_search,
-                );
-            }
-            Ok(breadth.min(allowed).max(limit))
-        })();
-        drop(sources);
-        release(bytes);
+        let result = self.bounded_rank_candidate_k_grouped(index, limit, &groups, before_source);
+        release(groups.into_retained_bytes());
         result
     }
 
-    fn search_hnsw_state(
+    /// Resolve the global rank pool from the same selected partition policies
+    /// as the graph walk, charging source selection to the active reader.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_rank_candidate_k_grouped<E>(
         &self,
-        state: &crate::store::IndexState,
-        request: HnswStateSearchRequest<'_>,
-    ) -> Result<HnswStateSearch> {
-        let HnswStateSearchRequest {
-            index,
-            query,
-            k,
-            candidates,
-            partition_candidate_ids,
-            allowed_count,
-            snapshot,
-            ef_search,
-            #[cfg(feature = "test-seams")]
-            partition_key,
-        } = request;
-        #[cfg(feature = "test-seams")]
-        self.store
-            .pause_registry()
-            .maybe_pause(index, crate::test_seam::PauseWindow::Search);
-
-        let layers = state.with_snapshot_compatible_hnsw_layers(
-            snapshot,
-            true,
-            |hnsw| -> HnswStateLayerSearchResult {
-                let hnsw_len = hnsw.len();
-                if hnsw_len == 0 {
-                    return Ok((
-                        0,
-                        true,
-                        SearchScores::new(index.clone(), self._accountant.clone()),
-                    ));
-                }
-                let credit = RefCell::new(ScoreCredit {
-                    budget: self._accountant.clone(),
-                    bytes: 0,
-                });
-                let searched = hnsw.search_allowed_at_ef(
-                    index,
-                    query,
-                    k,
-                    allowed_count,
-                    ef_search,
-                    || {
-                        partition_candidate_ids
-                            .into_iter()
-                            .flat_map(|ids| ids.iter().copied())
-                    },
-                    candidates.is_none(),
-                    |row_id| {
-                        candidates.is_none_or(|ids| ids.contains(row_id.0))
-                            && state.directory_has_visible_row(row_id, snapshot)
-                    },
-                    |event| {
-                        apply_hnsw_scratch_acquire(event, &mut |bytes| {
-                            let mut credit = credit.borrow_mut();
-                            credit.budget.try_allocate_for(
-                                bytes,
-                                "vector_search",
-                                "graph_scratch",
-                                "Reduce EF_SEARCH or query scope, or raise MEMORY_LIMIT.",
-                            )?;
-                            credit.bytes += bytes;
-                            Ok::<_, Error>(())
-                        })
-                    },
-                    |event| {
-                        apply_hnsw_scratch_release(event, &mut |bytes| {
-                            let mut credit = credit.borrow_mut();
-                            credit.budget.release(bytes);
-                            credit.bytes -= bytes;
-                        })
-                    },
-                )?;
-                let complete = matches!(
-                    searched.status,
-                    HnswAllowedSearchStatus::Complete
-                        | HnswAllowedSearchStatus::Incomplete(
-                            HnswAllowedSearchIncomplete::InsufficientAllowedCandidates
-                        )
-                );
-                let rows = SearchScores {
-                    rows: searched.rows,
-                    credit: credit.into_inner(),
-                    index: index.clone(),
-                    exact_budget: false,
-                };
-                Ok((hnsw_len, complete, rows))
-            },
-        );
-        let (availability, searched_layers) = match layers {
-            Ok(layers) => layers,
-            Err(error @ Error::ReadCancelled) => return Err(error),
-            Err(_error) if state.route_quarantine().is_some() => {
-                return Ok(HnswStateSearch::ExactRequired {
-                    reason: state
-                        .route_quarantine()
-                        .map_or("maintained_hnsw_unavailable", |reason| reason.as_str()),
-                    filtered_route_missing: false,
-                });
+        index: &VectorIndexRef,
+        limit: usize,
+        groups: &BoundedVectorCandidateGroups,
+        mut before_source: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<usize, E>
+    where
+        E: From<Error>,
+    {
+        before_source()?;
+        let layout = self.store.index_layout(index).map_err(E::from)?;
+        let mut breadth = limit;
+        let mut allowed = 0usize;
+        for source in &groups.sources {
+            before_source()?;
+            let count = source.allowed_count;
+            if count == 0 {
+                continue;
             }
-            Err(error) => return Err(error),
-        };
-        if availability != VectorGraphLayerAvailability::Ready {
-            return Ok(HnswStateSearch::ExactRequired {
-                reason: if availability == VectorGraphLayerAvailability::Dormant {
-                    "maintained_hnsw_dormant"
-                } else {
-                    "maintained_hnsw_unavailable"
-                },
-                filtered_route_missing: false,
-            });
-        }
-        self.store.mark_sealed_graph_used(state);
-        let mut hnsw_len = 0usize;
-        let mut allowed_traversal_complete = true;
-        let mut raw_candidates = SearchScores::new(index.clone(), self._accountant.clone());
-        let mut selected_generations = Vec::new();
-        for (generation, (layer_len, layer_complete, rows)) in searched_layers {
-            let contributes_new_candidate = rows.iter().any(|(row_id, _)| {
-                !raw_candidates
-                    .iter()
-                    .any(|(existing_row_id, _)| existing_row_id == row_id)
-            });
-            if contributes_new_candidate && let Some(generation) = generation {
-                selected_generations.push(generation);
-            }
-            hnsw_len = hnsw_len.saturating_add(layer_len);
-            allowed_traversal_complete &= layer_complete;
-            raw_candidates.try_extend(rows)?;
-        }
-        #[cfg(feature = "test-seams")]
-        let raw_candidates = {
-            let mut raw_candidates = raw_candidates;
-            self.store.graph_candidate_caps().cap_graph_candidates(
-                index,
-                Some(partition_key),
-                &mut raw_candidates.rows,
+            allowed = allowed.saturating_add(count);
+            breadth = breadth.max(
+                layout
+                    .resolve_policy(
+                        source
+                            .state
+                            .directory_visible_entry_count(groups.snapshot, None),
+                        limit,
+                    )
+                    .hnsw_ef_search,
             );
-            raw_candidates
-        };
-        if candidates.is_some() && !allowed_traversal_complete {
-            return Ok(HnswStateSearch::ExactRequired {
-                reason: "bounded_allowed_candidates_incomplete",
-                filtered_route_missing: true,
-            });
         }
-
-        let candidate_row_ids = raw_candidates
-            .iter()
-            .map(|(row_id, _)| *row_id)
-            .collect::<Vec<_>>();
-        let mut visible = SearchScores::new(index.clone(), self._accountant.clone());
-        visible.reserve(raw_candidates.len())?;
-        for (row_id, _) in raw_candidates {
-            if let Some(candidates) = candidates
-                && !candidates.contains(row_id.0)
-            {
-                continue;
-            }
-            if !state.directory_has_visible_row(row_id, snapshot) {
-                continue;
-            }
-            if visible.iter().any(|(id, _)| *id == row_id) {
-                continue;
-            }
-            // An immutable graph may still name a pruned version. Publish the
-            // snapshot-visible native score once per logical candidate, regardless
-            // of how many versions cleanup left in its directory.
-            let Some(score) = state.score_visible_candidate(index, row_id, snapshot, query)? else {
-                continue;
-            };
-            visible.try_push((row_id, score))?;
-        }
-        sort_vector_scores(&mut visible);
-        if visible.len() < k.min(allowed_count) && candidates.is_some() {
-            return Ok(HnswStateSearch::ExactRequired {
-                reason: "bounded_allowed_candidates_incomplete",
-                filtered_route_missing: true,
-            });
-        }
-        visible.truncate(k);
-        Ok(HnswStateSearch::Ready(HnswStateRows {
-            rows: visible,
-            hnsw_len,
-            candidate_row_ids,
-            selected_generations,
-        }))
+        Ok(breadth.min(allowed).max(limit))
     }
 
     pub fn search_with_mode(
@@ -3276,7 +4597,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             if k == 0 {
                 return Ok((
                     SearchScores::new(index.clone(), self._accountant.clone()),
-                    VectorSearchDebugTrace::brute_force(&index, &[], "empty_limit", None),
+                    VectorSearchDebugTrace::brute_force(
+                        &index,
+                        &[],
+                        "empty_limit",
+                        None,
+                        Vec::new(),
+                    ),
                 ));
             }
             let layout = self.store.index_layout(&index)?;
@@ -3290,22 +4617,62 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             if candidates.is_some_and(|candidates| candidates.is_empty()) {
                 return Ok((
                     SearchScores::new(index.clone(), self._accountant.clone()),
-                    VectorSearchDebugTrace::brute_force(&index, &[], "empty_candidates", None),
+                    VectorSearchDebugTrace::brute_force(
+                        &index,
+                        &[],
+                        "empty_candidates",
+                        None,
+                        Vec::new(),
+                    ),
                 ));
             }
             let sources = self.selected_partition_sources(&index, candidates, snapshot)?;
             if sources.is_empty() {
                 return Ok((
                     SearchScores::new(index.clone(), self._accountant.clone()),
-                    VectorSearchDebugTrace::brute_force(&index, &[], "empty_index", None),
+                    VectorSearchDebugTrace::brute_force(
+                        &index,
+                        &[],
+                        "empty_index",
+                        None,
+                        Vec::new(),
+                    ),
                 ));
             }
             let exact = |reason: &'static str,
                          hnsw_len: Option<usize>|
              -> Result<(SearchScores, VectorSearchDebugTrace)> {
-                let rows = self
-                    .brute_force_search_sources(&index, &sources, query, k, candidates, snapshot)?;
-                let trace = VectorSearchDebugTrace::brute_force(&index, &rows, reason, hnsw_len);
+                // AUTO's exhaustive work streams what the database's memory
+                // cannot hold whole; EXACT keeps its whole-partition load.
+                let rows = self.brute_force_search_sources(
+                    &index,
+                    &sources,
+                    query,
+                    k,
+                    candidates,
+                    snapshot,
+                    mode == contextdb_core::VectorSearchMode::Auto,
+                )?;
+                let partition_routes = sources
+                    .iter()
+                    .filter(|source| {
+                        source
+                            .state
+                            .directory_visible_entry_count(snapshot, candidates)
+                            != 0
+                    })
+                    .map(|_| VectorPartitionSearchTrace {
+                        route: VectorPartitionSearchRoute::Exact,
+                        reason,
+                    })
+                    .collect();
+                let trace = VectorSearchDebugTrace::brute_force(
+                    &index,
+                    &rows,
+                    reason,
+                    hnsw_len,
+                    partition_routes,
+                );
                 #[cfg(feature = "test-seams")]
                 observe_exact_scores_for_test(
                     ExactScorePhaseForTest::Scored,
@@ -3332,7 +4699,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 if authorized_count < layout.effective_auto_index_at() {
                     return exact(
                         if matches!(layout.quantization, VectorQuantization::F32) {
-                            "below_hnsw_threshold"
+                            "aggregate_below_auto_index_at"
                         } else {
                             "quantized_exact_search"
                         },
@@ -3341,139 +4708,161 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 }
             }
 
-            let mut merged = SearchScores::new(index.clone(), self._accountant.clone());
-            let mut candidate_row_ids = Vec::<RowId>::new();
-            let mut selected_generations = Vec::new();
-            let mut aggregate_hnsw_len = 0usize;
-            let mut max_hnsw_ef_search = 0usize;
-            let mut exact_candidate_count = 0usize;
-            let mut first_fallback_reason = None;
-            let mut searched_nonempty_partition = false;
-            for source in &sources {
-                let visible_partition_count =
-                    source.state.directory_visible_entry_count(snapshot, None);
-                let mut partition_candidate_ids =
-                    candidates.map(|_| SearchCandidateIds::new(self._accountant.clone()));
-                if let (Some(candidate_ids), Some(partition_ids)) =
-                    (candidates, partition_candidate_ids.as_mut())
-                {
-                    if usize::try_from(candidate_ids.len()).unwrap_or(usize::MAX)
-                        <= source.state.entry_count()
-                    {
-                        for raw_row_id in candidate_ids.iter() {
-                            let row_id = RowId(raw_row_id);
-                            if source.state.directory_has_visible_row(row_id, snapshot) {
-                                partition_ids.try_push(row_id)?;
-                            }
-                        }
-                    } else {
-                        source.state.bounded_visit_visible_ids(
-                            snapshot,
-                            || Ok::<_, Error>(()),
-                            |row_id| {
-                                if candidate_ids.contains(row_id.0) {
-                                    partition_ids.try_push(row_id)?;
-                                }
-                                Ok(())
-                            },
-                        )?;
+            // One search over every non-empty layer of every admitted
+            // partition -- the one a SQL find runs, with the same snapshot
+            // pinning, the same per-partition fallback for a partition with no
+            // usable graph, the same current-row and candidate recheck and the
+            // same memory charges. No owner door walks a partition or a layer
+            // on its own.
+            // A search pauses here, inside its bulk read and before it has
+            // charged anything, so a test can hold it in progress.
+            #[cfg(feature = "test-seams")]
+            self.store
+                .pause_registry()
+                .maybe_pause(&index, crate::test_seam::PauseWindow::Search);
+            let accountant = self._accountant.clone();
+            let mut before_retain = |bytes: usize| -> Result<()> {
+                accountant.try_allocate_for(
+                    bytes,
+                    "vector_search",
+                    "graph_scratch",
+                    "Reduce EF_SEARCH or query scope, or raise MEMORY_LIMIT.",
+                )
+            };
+            let mut release_retained = |bytes: usize| accountant.release(bytes);
+            // The authorized candidates, as the sorted identity list the
+            // grouping places into partitions, charged while it is held.
+            let candidate_ids = match candidates {
+                Some(candidates) => {
+                    let len = usize::try_from(candidates.len())
+                        .map_err(|_| Error::Other("vector candidate count overflow".to_string()))?;
+                    let bytes = len
+                        .checked_mul(std::mem::size_of::<u64>())
+                        .ok_or_else(|| Error::Other("vector candidate count overflow".into()))?;
+                    before_retain(bytes)?;
+                    let mut ids = Vec::<u64>::new();
+                    if ids.try_reserve_exact(len).is_err() {
+                        release_retained(bytes);
+                        return Err(Error::Other("vector candidate allocation failed".into()));
                     }
-                    partition_ids.sort_unstable();
+                    ids.extend(candidates.iter());
+                    Some((ids, bytes))
                 }
-                let allowed_count = partition_candidate_ids
-                    .as_deref()
-                    .map_or(visible_partition_count, <[u64]>::len);
-                if allowed_count == 0 {
-                    continue;
-                }
-                searched_nonempty_partition = true;
-                let ef_search = layout
-                    .resolve_policy(visible_partition_count, search_policy_limit(k))
-                    .hnsw_ef_search;
-                max_hnsw_ef_search = max_hnsw_ef_search.max(ef_search);
-                self.store.reclaim_idle_graphs_for(
-                    source.state.dormant_load_bytes_for_snapshot(snapshot),
-                    Some(&source.state),
+                None => None,
+            };
+            let searched = (|| -> Result<BoundedHnswOutcome> {
+                let groups = self.bounded_candidate_groups(
+                    &index,
+                    candidate_ids.as_ref().map(|(ids, _)| ids.as_slice()),
+                    snapshot,
+                    || Ok::<(), Error>(()),
+                    || Ok(()),
+                    &mut before_retain,
+                    &mut release_retained,
+                )?;
+                let outcome = self.bounded_hnsw_search_grouped(
+                    &index,
+                    query,
+                    k,
+                    &groups,
+                    mode,
+                    HnswAllowedSearchLimits {
+                        max_visited_nodes: usize::MAX,
+                        max_vector_evaluations: usize::MAX,
+                    },
+                    || Ok::<(), Error>(()),
+                    || Ok(()),
+                    || Ok(()),
+                    &mut before_retain,
+                    &mut release_retained,
                 );
-                match self.search_hnsw_state(
-                    &source.state,
-                    HnswStateSearchRequest {
-                        index: &index,
+                release_retained(groups.into_retained_bytes());
+                outcome
+            })();
+            if let Some((ids, bytes)) = candidate_ids {
+                drop(ids);
+                release_retained(bytes);
+            }
+            let unavailable = |filtered_route_missing: bool| {
+                if filtered_route_missing {
+                    Error::VectorFilteredRouteUnavailable {
+                        predicate_columns: Vec::new(),
+                        index: index.clone(),
+                    }
+                } else {
+                    Error::VectorIndexedRouteUnavailable {
+                        index: index.clone(),
+                    }
+                }
+            };
+            match searched? {
+                BoundedHnswOutcome::CompleteEmpty => Ok((
+                    SearchScores::new(index.clone(), self._accountant.clone()),
+                    VectorSearchDebugTrace::brute_force(
+                        &index,
+                        &[],
+                        "empty_index",
+                        None,
+                        Vec::new(),
+                    ),
+                )),
+                BoundedHnswOutcome::Complete(BoundedHnswResult {
+                    mut rows,
+                    trace,
+                    retained_bytes,
+                }) => {
+                    // The rows keep their charge and carry it out; the trace
+                    // leaves bounded accounting here, as the SQL find's does.
+                    let trace_bytes = trace.retained_bytes();
+                    let trace = trace.into_trace();
+                    release_retained(trace_bytes);
+                    rows.truncate(k);
+                    let scores = SearchScores {
+                        rows,
+                        credit: ScoreCredit {
+                            budget: self._accountant.clone(),
+                            bytes: retained_bytes.saturating_sub(trace_bytes),
+                        },
+                        index: index.clone(),
+                        exact_budget: false,
+                    };
+                    Ok((scores, trace))
+                }
+                BoundedHnswOutcome::ExactRequired { trace, .. } => {
+                    let trace_bytes = trace.retained_bytes();
+                    let mut trace = trace.into_trace();
+                    release_retained(trace_bytes);
+                    let rows = self.brute_force_search_sources(
+                        &index,
+                        &sources,
                         query,
                         k,
                         candidates,
-                        partition_candidate_ids: partition_candidate_ids.as_deref(),
-                        allowed_count,
                         snapshot,
-                        ef_search,
-                        #[cfg(feature = "test-seams")]
-                        partition_key: &source.partition_key,
-                    },
-                )? {
-                    HnswStateSearch::Ready(result) => {
-                        aggregate_hnsw_len = aggregate_hnsw_len.saturating_add(result.hnsw_len);
-                        candidate_row_ids.extend(result.candidate_row_ids);
-                        selected_generations.extend(result.selected_generations);
-                        merged.try_extend(result.rows)?;
+                        mode == contextdb_core::VectorSearchMode::Auto,
+                    )?;
+                    trace.final_row_ids = rows.iter().map(|(row_id, _)| *row_id).collect();
+                    #[cfg(feature = "test-seams")]
+                    observe_exact_scores_for_test(
+                        ExactScorePhaseForTest::Scored,
+                        rows.rows.capacity(),
+                        rows.rows.len(),
+                    );
+                    Ok((rows, trace))
+                }
+                BoundedHnswOutcome::Unavailable { .. } => {
+                    if mode == contextdb_core::VectorSearchMode::Indexed {
+                        return Err(unavailable(false));
                     }
-                    HnswStateSearch::ExactRequired {
-                        reason,
-                        filtered_route_missing,
-                    } => {
-                        if mode == contextdb_core::VectorSearchMode::Indexed {
-                            return Err(if filtered_route_missing {
-                                Error::VectorFilteredRouteUnavailable {
-                                    predicate_columns: Vec::new(),
-                                    index: index.clone(),
-                                }
-                            } else {
-                                Error::VectorIndexedRouteUnavailable {
-                                    index: index.clone(),
-                                }
-                            });
-                        }
-                        let exact_rows = self.brute_force_search_sources(
-                            &index,
-                            std::slice::from_ref(source),
-                            query,
-                            k,
-                            candidates,
-                            snapshot,
-                        )?;
-                        exact_candidate_count =
-                            exact_candidate_count.saturating_add(exact_rows.len());
-                        first_fallback_reason.get_or_insert(reason);
-                        merged.try_extend(exact_rows)?;
+                    exact("maintained_graph_unavailable", None)
+                }
+                BoundedHnswOutcome::Incomplete { .. } => {
+                    if mode == contextdb_core::VectorSearchMode::Indexed {
+                        return Err(unavailable(candidates.is_some()));
                     }
+                    exact("maintained_graph_incomplete", None)
                 }
             }
-            if !searched_nonempty_partition {
-                return Ok((
-                    SearchScores::new(index.clone(), self._accountant.clone()),
-                    VectorSearchDebugTrace::brute_force(&index, &[], "empty_index", None),
-                ));
-            }
-            sort_vector_scores(&mut merged);
-            merged.truncate(k);
-            if aggregate_hnsw_len == 0 {
-                let trace = VectorSearchDebugTrace::brute_force(
-                    &index,
-                    &merged,
-                    first_fallback_reason.unwrap_or("maintained_hnsw_unavailable"),
-                    None,
-                );
-                return Ok((merged, trace));
-            }
-            let trace = VectorSearchDebugTrace::hnsw(
-                &index,
-                aggregate_hnsw_len,
-                candidate_row_ids,
-                &merged,
-                exact_candidate_count,
-                max_hnsw_ef_search,
-                selected_generations,
-            );
-            Ok((merged, trace))
         })
     }
 
@@ -3892,5 +5281,214 @@ fn observe_exact_scores_for_test(phase: ExactScorePhaseForTest, capacity: usize,
     let observer = EXACT_SCORE_OBSERVER.with(|slot| slot.borrow().clone());
     if let Some(observer) = observer {
         observer(phase, capacity, len);
+    }
+}
+
+/// Proof-only observer for native-vector scoring. The event is emitted at the
+/// cosine calculation itself, including exact fallback and graph reranking.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub trait NativeVectorScoreObserver: Send + Sync {
+    fn before_native_vector_score(&self);
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static NATIVE_VECTOR_SCORE_OBSERVER: RefCell<Option<Arc<dyn NativeVectorScoreObserver>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_native_vector_score_observer_for_test<T>(
+    observer: Arc<dyn NativeVectorScoreObserver>,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<dyn NativeVectorScoreObserver>>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NATIVE_VECTOR_SCORE_OBSERVER.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    let _restore = Restore(NATIVE_VECTOR_SCORE_OBSERVER.with(|slot| slot.replace(Some(observer))));
+    action()
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn observe_native_vector_score_for_test() {
+    let observer = NATIVE_VECTOR_SCORE_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer.before_native_vector_score();
+    }
+}
+
+/// Independent proof events at the physical candidate-to-partition boundary.
+/// The row-directory and visibility events are emitted by the store primitives
+/// that perform those lookups. Placement is emitted only after the candidate is
+/// appended to a partition-local search group.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedCandidateGroupingEventForTest {
+    RowDirectoryLookup,
+    SnapshotVisibilityProbe,
+    Placement,
+}
+
+/// Production-dead faults used to prove that the fixed-candidate assertions
+/// reject both partition-multiplied lookup work and an omitted placement
+/// charge while the returned rows remain unchanged.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedCandidateGroupingFaultForTest {
+    RepeatGlobalCandidatePassPerPartition,
+    SuppressPlacementCharge,
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub trait BoundedCandidateGroupingObserverForTest: Send + Sync {
+    fn observe(&self, event: BoundedCandidateGroupingEventForTest);
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static BOUNDED_CANDIDATE_GROUPING_OBSERVER: RefCell<Option<Arc<dyn BoundedCandidateGroupingObserverForTest>>> =
+        const { RefCell::new(None) };
+    static BOUNDED_CANDIDATE_GROUPING_FAULT: Cell<Option<BoundedCandidateGroupingFaultForTest>> =
+        const { Cell::new(None) };
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_bounded_candidate_grouping_observer_for_test<T>(
+    observer: Arc<dyn BoundedCandidateGroupingObserverForTest>,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<dyn BoundedCandidateGroupingObserverForTest>>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOUNDED_CANDIDATE_GROUPING_OBSERVER.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    let _restore =
+        Restore(BOUNDED_CANDIDATE_GROUPING_OBSERVER.with(|slot| slot.replace(Some(observer))));
+    action()
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn with_bounded_candidate_grouping_fault_for_test<T>(
+    fault: BoundedCandidateGroupingFaultForTest,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<BoundedCandidateGroupingFaultForTest>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOUNDED_CANDIDATE_GROUPING_FAULT.with(|slot| slot.set(self.0));
+        }
+    }
+
+    let _restore = Restore(BOUNDED_CANDIDATE_GROUPING_FAULT.with(|slot| slot.replace(Some(fault))));
+    action()
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn observe_bounded_candidate_grouping_for_test(
+    event: BoundedCandidateGroupingEventForTest,
+) {
+    let observer = BOUNDED_CANDIDATE_GROUPING_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer.observe(event);
+    }
+}
+
+#[cfg(feature = "test-seams")]
+fn bounded_candidate_grouping_repeats_global_pass_for_test() -> bool {
+    BOUNDED_CANDIDATE_GROUPING_FAULT.with(|slot| {
+        slot.get()
+            == Some(BoundedCandidateGroupingFaultForTest::RepeatGlobalCandidatePassPerPartition)
+    })
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn bounded_candidate_grouping_repeats_global_pass_for_test() -> bool {
+    false
+}
+
+#[cfg(feature = "test-seams")]
+fn bounded_candidate_grouping_suppresses_placement_charge_for_test() -> bool {
+    BOUNDED_CANDIDATE_GROUPING_FAULT.with(|slot| {
+        slot.get() == Some(BoundedCandidateGroupingFaultForTest::SuppressPlacementCharge)
+    })
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn bounded_candidate_grouping_suppresses_placement_charge_for_test() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod route_cost_tests {
+    use crate::store::VectorIndexLayout;
+    use contextdb_core::VectorQuantization;
+
+    const K: usize = 10;
+
+    /// The automatic route walks a partition it can walk, at the sizes the
+    /// find lane measured end to end (release, one Context, 768 dimensions,
+    /// 100 held-out queries, warm: 32.0 ms p95 for the graph against 630.0 ms
+    /// exhaustive at 10,000 vectors, 36.0 ms against 838.0 ms at 12,500).
+    /// The undeclared profile's breadth and degree fix the walk's budget, and
+    /// the measured unit costs make that budget cheaper than comparing every
+    /// row.
+    #[test]
+    fn the_statement_crossover_walks_a_partition_larger_than_one_walk_over_it() {
+        let layout = VectorIndexLayout::unpartitioned(768, VectorQuantization::F32);
+        for live in [1_250_usize, 10_000, 12_500] {
+            let policy = layout.resolve_policy(live, K);
+            assert_eq!(
+                policy.ef_search_source, "compatibility_profile",
+                "these cells declare no breadth of their own"
+            );
+            let budget = super::auto_statement_walk_budget(policy.hnsw_ef_search, K, policy.hnsw_m);
+            assert!(
+                !super::auto_statement_prefers_exhaustive(budget, live),
+                "a {live}-vector statement is walked with a budget of {budget}, not compared \
+                 vector by vector"
+            );
+        }
+        // And the other side of the crossover: a statement whose rows cost no
+        // more to compare than the walk over them is compared outright.
+        let small = layout.resolve_policy(64, K);
+        let budget = super::auto_statement_walk_budget(small.hnsw_ef_search, K, small.hnsw_m);
+        assert!(super::auto_statement_prefers_exhaustive(budget, 64));
+    }
+
+    /// The decision reads only the statement's aggregate admitted rows and its
+    /// one walk budget, and weighs each side by its measured unit cost: the
+    /// crossover sits where the admitted rows' comparisons cost exactly what
+    /// the walk's budget costs.
+    #[test]
+    fn the_statement_crossover_weighs_both_routes_at_their_measured_unit_costs() {
+        let budget = super::auto_statement_walk_budget(400, K, 16);
+        assert_eq!(
+            budget,
+            400 * 32,
+            "the layer-0 maximum degree of an M = 16 graph is 32"
+        );
+        let walk_nanos = budget as u128 * u128::from(super::AUTO_WALK_EVALUATION_NANOS);
+        let crossover = (walk_nanos / u128::from(super::AUTO_EXHAUSTIVE_COMPARISON_NANOS)) as usize;
+        assert!(super::auto_statement_prefers_exhaustive(budget, crossover));
+        assert!(!super::auto_statement_prefers_exhaustive(
+            budget,
+            crossover + 1
+        ));
     }
 }

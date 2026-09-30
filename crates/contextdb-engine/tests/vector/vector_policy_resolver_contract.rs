@@ -288,7 +288,7 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
     let omitted_ef = db
         .explain("SELECT id FROM resolver_defaults ORDER BY f32 <=> $query LIMIT 3")
         .expect("explain silent F32 EF_SEARCH");
-    assert_explain_fact(&omitted_ef, "effective_ef_search", "200");
+    assert_explain_fact(&omitted_ef, "effective_ef_search", "30");
     assert_explain_fact(&omitted_ef, "ef_search_source", "compatibility_profile");
 
     for (id, scope, vector) in [
@@ -327,16 +327,13 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
         "the declared aggregate F32 route has stable nearest ids"
     );
     assert!(
-        db.__debug_last_query_vector_used_hnsw_for_test(),
-        "four selected F32 vectors at declared AUTO_INDEX_AT 4 take INDEXED"
+        !db.__debug_last_query_vector_used_hnsw_for_test(),
+        "the aggregate crossover resolves INDEXED, then the statement compares its four rows because that costs less than one walk"
     );
     let bounded = bounded::execute(&db, &bounded_request(sql, bound.clone()))
         .expect("bounded reader honors the declared F32 threshold");
     assert_eq!(bounded.result.rows, ordinary.rows);
-    assert!(
-        db.__debug_last_query_vector_used_hnsw_for_test(),
-        "bounded reader keeps the declared aggregate INDEXED route"
-    );
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     let rust = db
         .semantic_search(SemanticQuery::new(
             "resolver_policy_docs",
@@ -353,15 +350,14 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
         })
         .collect::<Vec<_>>();
     assert_eq!(rust_ids, ids(&ordinary));
-    assert!(
-        db.__debug_last_query_vector_used_hnsw_for_test(),
-        "Rust AUTO keeps the declared aggregate INDEXED route"
-    );
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     let explain = db.explain(sql).expect("explain the declared AUTO route");
     assert_explain_fact(&explain, "aggregate_allowed_vectors", "4");
     assert_explain_fact(&explain, "effective_auto_index_at", "4");
     assert_explain_fact(&explain, "auto_index_at_source", "declared");
     assert_explain_fact(&explain, "resolved_mode", "INDEXED");
+    assert!(explain.contains("route=exact"));
+    assert!(explain.contains("fallback=statement_exhaustive_cheaper_than_walk"));
     assert_explain_fact(&explain, "effective_ef_search", "17");
     assert_explain_fact(&explain, "ef_search_source", "declared");
 
@@ -375,7 +371,7 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
     // 5,000/5,001 or 50,000/50,001 count without constructing that dataset.
     // Once the declaration above is accepted, this same production .explain
     // and SHOW path must report one resolver's F32 build/admission/search
-    // values: (16, 200, max(200, n)) at 5,000; (24, 400, 400) at 5,001 through
+    // values: (16, 200, 20) at 5,000; (24, 400, 400) at 5,001 through
     // 50,000; and (16, 200, 200) at 50,001. The held-out recall matrix owns
     // the large datasets; this normal contract deliberately has no fake count
     // override or copied private profile table.
@@ -412,11 +408,12 @@ fn declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor(
     }
 
     let query = params([("query", Value::Vector(vec![1.0, 120.0, 1.0]))]);
-    db.execute(
-        "SELECT id FROM breadth_docs ORDER BY declared <=> $query LIMIT 10",
-        &query,
-    )
-    .expect("search with the declared breadth");
+    let declared_result = db
+        .execute(
+            "SELECT id FROM breadth_docs ORDER BY declared <=> $query LIMIT 10",
+            &query,
+        )
+        .expect("search with the declared breadth");
     let declared = db
         .__debug_last_query_vector_trace_for_test()
         .expect("declared route publishes candidate accounting");
@@ -424,6 +421,21 @@ fn declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor(
     assert_eq!(
         declared.hnsw_candidate_count, 32,
         "a hidden 10*k floor would widen this declared graph result to at least 100 candidates"
+    );
+    let exact_result = db
+        .execute(
+            "SELECT id FROM breadth_docs ORDER BY declared <=> $query USE VECTOR EXACT LIMIT 10",
+            &query,
+        )
+        .expect("establish the exact quality reference");
+    let exact_ids = ids(&exact_result);
+    let overlap = ids(&declared_result)
+        .into_iter()
+        .filter(|id| exact_ids.contains(id))
+        .count();
+    assert!(
+        overlap >= 8,
+        "the larger-than-breadth graph route must preserve useful top-10 quality: overlap={overlap}"
     );
 
     db.execute(
@@ -448,7 +460,7 @@ fn declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor(
     let silent_explain = db
         .explain("SELECT id FROM breadth_docs ORDER BY silent <=> $query LIMIT 10")
         .expect("explain silent breadth");
-    assert_explain_fact(&silent_explain, "effective_ef_search", "200");
+    assert_explain_fact(&silent_explain, "effective_ef_search", "100");
     assert_explain_fact(&silent_explain, "ef_search_source", "compatibility_profile");
 }
 
@@ -457,6 +469,7 @@ fn assert_executed_default_boundary(
     column_name: &str,
     count: usize,
     threshold: usize,
+    auto_uses_indexed: bool,
     expected_id: u128,
 ) {
     use contextdb_core::VectorIndexRef;
@@ -466,7 +479,7 @@ fn assert_executed_default_boundary(
         .__debug_vector_hnsw_build_serial_for_test(index.clone())
         .expect("a maintained graph exists below the automatic crossover");
     for override_mode in [None, Some(VectorSearchMode::Indexed)] {
-        let indexed = override_mode.is_some() || count >= threshold;
+        let indexed = override_mode.is_some() || auto_uses_indexed;
         let mode_clause = if override_mode.is_some() {
             " USE VECTOR INDEXED"
         } else {
@@ -480,7 +493,8 @@ fn assert_executed_default_boundary(
         let ordinary = db
             .execute(&sql, &bound)
             .expect("SQL executes the boundary search");
-        assert_eq!(ids(&ordinary), vec![Uuid::from_u128(expected_id)]);
+        let ordinary_ids = ids(&ordinary);
+        assert_eq!(ordinary_ids, vec![Uuid::from_u128(expected_id)]);
         assert_eq!(
             db.__debug_last_query_vector_used_hnsw_for_test(),
             indexed,
@@ -505,7 +519,7 @@ fn assert_executed_default_boundary(
         assert_eq!(rust.len(), 1);
         assert_eq!(
             rust[0].values.get("id"),
-            Some(&Value::Uuid(Uuid::from_u128(expected_id)))
+            Some(&Value::Uuid(ordinary_ids[0]))
         );
         assert_eq!(
             db.__debug_last_query_vector_used_hnsw_for_test(),
@@ -540,6 +554,8 @@ fn assert_executed_default_boundary(
             explain.fallback.as_deref(),
             if indexed {
                 None
+            } else if count >= threshold {
+                Some("statement_exhaustive_cheaper_than_walk")
             } else {
                 Some("aggregate_below_auto_index_at")
             }
@@ -589,7 +605,7 @@ fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap
     for _ in 0..8 {
         db.run_maintenance_cycle().unwrap();
     }
-    assert_executed_default_boundary(&db, "f32", 999, 1_000, 1);
+    assert_executed_default_boundary(&db, "f32", 999, 1_000, false, 1);
     let f32_serial = db
         .__debug_vector_hnsw_build_serial_for_test(VectorIndexRef::new("boundary_defaults", "f32"));
     db.execute(
@@ -608,7 +624,7 @@ fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap
         )),
         f32_serial
     );
-    assert_executed_default_boundary(&db, "f32", 1_000, 1_000, 1_000);
+    assert_executed_default_boundary(&db, "f32", 1_000, 1_000, true, 1_000);
 
     let tx = db.begin_or_panic();
     for ordinal in 1_001..=5_000_u128 {
@@ -630,7 +646,7 @@ fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap
         db.run_maintenance_cycle().unwrap();
     }
     for column_name in ["sq8", "sq4"] {
-        assert_executed_default_boundary(&db, column_name, 5_000, 5_001, 1);
+        assert_executed_default_boundary(&db, column_name, 5_000, 5_001, false, 1);
     }
     let serials = ["sq8", "sq4"].map(|column_name| {
         db.__debug_vector_hnsw_build_serial_for_test(VectorIndexRef::new(
@@ -654,6 +670,6 @@ fn default_crossovers_execute_both_sides_without_a_normal_write_availability_gap
             )),
             serial
         );
-        assert_executed_default_boundary(&db, column_name, 5_001, 5_001, 5_001);
+        assert_executed_default_boundary(&db, column_name, 5_001, 5_001, true, 5_001);
     }
 }

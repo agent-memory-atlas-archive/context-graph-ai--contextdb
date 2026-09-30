@@ -168,6 +168,16 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
             "CREATE TABLE t (id UUID PRIMARY KEY, created_at TIMESTAMP EXPIRES) RETAIN 1 SECONDS"
                 .to_string(),
         ),
+        (
+            "crates/contextdb-engine/tests/fixtures/pinned_cg_startup/mod.rs".to_string(),
+            "CREATE TABLE blueprints (id UUID PRIMARY KEY, canonical_description TEXT NOT NULL, category TEXT NOT NULL, slots JSON NOT NULL, default_config_shape JSON, version TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMP NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST"
+                .to_string(),
+        ),
+        (
+            "crates/contextdb-engine/tests/fixtures/pinned_cg_startup/mod.rs".to_string(),
+            "CREATE TABLE blueprints (id UUID PRIMARY KEY, canonical_description TEXT NOT NULL, category TEXT NOT NULL, slots JSON NOT NULL, default_config_shape JSON, version TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMP NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST"
+                .to_string(),
+        ),
     ]
     .into_iter()
     .fold(BTreeMap::new(), |mut counts, key| {

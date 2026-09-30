@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)] // Existing compatibility and test seam shape.
 use super::*;
 use crate::database::CursorIdleWindow;
 use crate::memory_accounting::OwnedMemoryReservation;
@@ -17,6 +18,104 @@ use std::fmt::Write as _;
 use std::ops::Bound;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+// One public continuation fetch may replay several internal kernel pages.
+// Their work and deadlines belong to the same caller request.
+struct CursorReplayBudget {
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    started_ms: u64,
+    created_ms: u64,
+    last_used_ms: u64,
+    work: Cell<u64>,
+}
+
+std::thread_local! {
+    static CURSOR_REPLAY_BUDGET: std::cell::RefCell<Option<std::rc::Rc<CursorReplayBudget>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_cursor_replay_budget<T>(
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    started_ms: u64,
+    created_ms: u64,
+    last_used_ms: u64,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::rc::Rc<CursorReplayBudget>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURSOR_REPLAY_BUDGET.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let budget = std::rc::Rc::new(CursorReplayBudget {
+        limits,
+        clock,
+        started_ms,
+        created_ms,
+        last_used_ms,
+        work: Cell::new(0),
+    });
+    let _restore = Restore(CURSOR_REPLAY_BUDGET.with(|slot| slot.replace(Some(budget))));
+    operation()
+}
+
+pub(crate) fn cursor_replay_work_available() -> bool {
+    CURSOR_REPLAY_BUDGET.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_none_or(|budget| budget.work.get() < budget.limits.work)
+    })
+}
+
+pub(crate) fn cursor_replay_checkpoint() -> std::result::Result<(), BoundedExecutionError> {
+    charge_cursor_replay(0)
+}
+
+fn charge_cursor_replay(units: u64) -> std::result::Result<(), BoundedExecutionError> {
+    let budget = CURSOR_REPLAY_BUDGET.with(|slot| slot.borrow().clone());
+    let Some(budget) = budget else {
+        return Ok(());
+    };
+    let now = budget.clock.now_ms();
+    for (started, limit, kind) in [
+        (
+            budget.created_ms,
+            budget.limits.cursor_lifetime_ms,
+            CursorExpiryKind::Lifetime,
+        ),
+        (
+            budget.last_used_ms,
+            budget.limits.cursor_idle_ms,
+            CursorExpiryKind::Idle,
+        ),
+    ] {
+        if now.saturating_sub(started) > limit {
+            return Err(BoundedExecutionError::Refused(ReadFailure::cursor_expired(
+                kind,
+            )));
+        }
+    }
+    let elapsed = now.saturating_sub(budget.started_ms);
+    if elapsed > budget.limits.active_ms || (units > 0 && elapsed == budget.limits.active_ms) {
+        return Err(RequestContext::limit_failure(
+            ReadFailureLimit::ActiveMs,
+            budget.limits.active_ms,
+        ));
+    }
+    if units > 0 {
+        let work = budget
+            .work
+            .get()
+            .checked_add(units)
+            .filter(|work| *work <= budget.limits.work)
+            .ok_or_else(|| {
+                RequestContext::limit_failure(ReadFailureLimit::Work, budget.limits.work)
+            })?;
+        budget.work.set(work);
+    }
+    Ok(())
+}
 
 struct RequestState {
     started_ms: u64,
@@ -72,8 +171,35 @@ struct RequestContext {
     transaction: Option<TxId>,
     clock: Arc<dyn DeadlineClock>,
     state: Mutex<RequestState>,
+    /// Storage pages this read was admitted to hold that are still alive
+    /// outside the store's page cache. Each such page carries its own charge
+    /// (`SourcePageCharge`) and gives these bytes back when its last holder
+    /// drops it, so the read's memory ceiling counts them for exactly as long
+    /// as they exist.
+    live_source_pages: Arc<std::sync::atomic::AtomicUsize>,
+    /// The accountant this read's charges are made against; a live page's
+    /// charge is held here.
+    page_accountant: Arc<crate::memory_accounting::MemoryAccountant>,
     #[cfg(feature = "test-seams")]
     probe: Mutex<Option<Arc<dyn BoundedExecutionProbe>>>,
+}
+
+/// The charge one storage page carries for as long as it lives outside the
+/// store's page cache. Dropping it -- which happens when the last holder of
+/// the page drops it -- returns the bytes to the accountant and to the read
+/// that admitted the page.
+struct SourcePageCharge {
+    accountant: Arc<crate::memory_accounting::MemoryAccountant>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for SourcePageCharge {
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes);
+        self.live
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl RequestContext {
@@ -88,6 +214,7 @@ impl RequestContext {
     ) -> std::result::Result<Arc<Self>, BoundedExecutionError> {
         Self::check_effective_limits(&limits)?;
         let started_ms = clock.now_ms();
+        let page_accountant = db.bounded_read_accountant();
         Ok(Arc::new(Self {
             limits,
             resumption,
@@ -99,7 +226,7 @@ impl RequestContext {
                 cancellation,
                 telemetry: BoundedExecutionTelemetry::default(),
                 touches: BTreeMap::new(),
-                memory: OwnedMemoryReservation::new(db.bounded_read_accountant()),
+                memory: OwnedMemoryReservation::new(Arc::clone(&page_accountant)),
                 membership_bytes: 0,
                 rows_so_far: 0,
                 bytes_so_far: 0,
@@ -107,6 +234,8 @@ impl RequestContext {
                 reported_rows: 0,
                 release_fault: None,
             }),
+            live_source_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            page_accountant,
             #[cfg(feature = "test-seams")]
             probe: Mutex::new(probe),
         }))
@@ -376,6 +505,7 @@ impl RequestContext {
         if let Some(cancelled) = self.pending_failure() {
             return Err(cancelled);
         }
+        cursor_replay_checkpoint()?;
         let started_ms = self.state().started_ms;
         if self.elapsed_since(started_ms)? > self.limits.active_ms {
             return Err(Self::limit_failure(
@@ -384,6 +514,40 @@ impl RequestContext {
             ));
         }
         Ok(())
+    }
+
+    fn publication_scope(
+        &self,
+        snapshot_lsn: Lsn,
+        tables: BTreeSet<String>,
+    ) -> ReadPublicationScope {
+        let state = self.state();
+        ReadPublicationScope::bounded(
+            snapshot_lsn,
+            tables,
+            self.limits,
+            Arc::clone(&self.clock),
+            state.cancellation.clone(),
+            state.started_ms,
+        )
+    }
+
+    fn registration_budget(&self) -> crate::database::ReadRegistrationBudget {
+        let started_ms = self.state().started_ms;
+        crate::database::ReadRegistrationBudget::new(
+            Arc::clone(&self.clock),
+            started_ms,
+            self.limits.active_ms,
+        )
+    }
+
+    /// Check cancellation and the active deadline at an internal boundary
+    /// whose work was already charged to the candidate or distance that owns
+    /// it. A vector point score crosses several locks and allocation gates;
+    /// each must still be interruptible without turning bookkeeping into a
+    /// second unit of candidate work.
+    fn checkpoint(&self) -> std::result::Result<(), BoundedExecutionError> {
+        self.check_final_boundary()
     }
 
     /// Count one thing the read looked at, without charging for looking.
@@ -395,6 +559,59 @@ impl RequestContext {
         let mut state = self.state();
         let counted = state.touches.entry(touch).or_default();
         *counted = counted.saturating_add(1);
+    }
+
+    /// Observe a source item whose placement work was already charged while
+    /// candidate groups were built. This preserves cancellation and probe
+    /// visibility without billing the same candidate a second time at score.
+    fn observe_precharged_touch(
+        &self,
+        touch: BoundedSourceTouch,
+    ) -> std::result::Result<(), BoundedExecutionError> {
+        if let Some(cancelled) = self.pending_failure() {
+            return Err(cancelled);
+        }
+        #[allow(
+            unused_variables,
+            reason = "The source position also feeds the optional read probe"
+        )]
+        let (completed_source, started_ms) = {
+            let state = self.state();
+            let elapsed = self.elapsed_since(state.started_ms)?;
+            if elapsed >= self.limits.active_ms {
+                return Err(Self::limit_failure(
+                    ReadFailureLimit::ActiveMs,
+                    self.limits.active_ms,
+                ));
+            }
+            (
+                state.touches.get(&touch).copied().unwrap_or(0),
+                state.started_ms,
+            )
+        };
+        #[cfg(not(feature = "test-seams"))]
+        let _ = completed_source;
+        #[cfg(feature = "test-seams")]
+        if let Some(probe) = self.probe() {
+            probe.before_source_touch(touch, completed_source);
+        }
+        if self.elapsed_since(started_ms)? > self.limits.active_ms {
+            return Err(Self::limit_failure(
+                ReadFailureLimit::ActiveMs,
+                self.limits.active_ms,
+            ));
+        }
+        if let Some(cancelled) = self.pending_failure() {
+            return Err(cancelled);
+        }
+        self.note_touch(touch);
+        #[cfg(feature = "test-seams")]
+        {
+            crate::read_probe::note_bounded_source_touch();
+            crate::read_probe::note_session_source_touch();
+        }
+        self.report_progress();
+        Ok(())
     }
 
     fn charge(
@@ -451,6 +668,7 @@ impl RequestContext {
             return Err(cancelled);
         }
 
+        charge_cursor_replay(1)?;
         let mut state = self.state();
         state.telemetry.work_units = state
             .telemetry
@@ -524,6 +742,7 @@ impl RequestContext {
         if let Some(cancelled) = self.pending_failure() {
             return Err(cancelled);
         }
+        charge_cursor_replay(1)?;
         let mut state = self.state();
         state.telemetry.work_units = state
             .telemetry
@@ -554,7 +773,7 @@ impl RequestContext {
         )]
         let held = {
             let state = self.state();
-            let held = u64::try_from(state.memory.bytes())
+            let held = u64::try_from(self.held_memory_bytes(&state))
                 .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
             if held
                 .checked_add(requested_u64)
@@ -590,7 +809,7 @@ impl RequestContext {
                     "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.",
                 )
                 .map_err(BoundedExecutionError::from)?;
-            let held_after = u64::try_from(state.memory.bytes())
+            let held_after = u64::try_from(self.held_memory_bytes(&state))
                 .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
             state.telemetry.peak_temporary_bytes =
                 state.telemetry.peak_temporary_bytes.max(held_after);
@@ -618,6 +837,107 @@ impl RequestContext {
             .map_err(BoundedExecutionError::from)
     }
 
+    /// What this read holds against its memory ceiling: its own reservation
+    /// plus the storage pages it read that are still alive outside the page
+    /// cache.
+    fn held_memory_bytes(&self, state: &RequestState) -> usize {
+        state.memory.bytes().saturating_add(
+            self.live_source_pages
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// Admit one storage page before its buffer is allocated, against the
+    /// same ceiling and the same accountant every other charge of this read
+    /// uses, and hand back the charge the page will carry.
+    fn admit_source_page(
+        &self,
+        source: BoundedWorkSource,
+        bytes: usize,
+    ) -> std::result::Result<SourcePageCharge, BoundedExecutionError> {
+        self.check_final_boundary()?;
+        let mut state = self.state();
+        let held = self.held_memory_bytes(&state);
+        let within = held
+            .checked_add(bytes)
+            .and_then(|after| u64::try_from(after).ok())
+            .is_some_and(|after| after <= self.limits.memory);
+        if !within {
+            return Err(Self::limit_failure(
+                ReadFailureLimit::Memory,
+                self.limits.memory,
+            ));
+        }
+        self.page_accountant
+            .try_allocate_for(
+                bytes,
+                "bounded_read",
+                "read_storage_page",
+                "Lower the statement's LIMIT or width, or raise MEMORY_LIMIT.",
+            )
+            .map_err(BoundedExecutionError::from)?;
+        self.live_source_pages
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        let held_after = u64::try_from(held.saturating_add(bytes)).unwrap_or(u64::MAX);
+        state.telemetry.peak_temporary_bytes = state.telemetry.peak_temporary_bytes.max(held_after);
+        state
+            .telemetry
+            .source_peak_temporary_bytes
+            .entry(source)
+            .and_modify(|peak| *peak = (*peak).max(held_after))
+            .or_insert(held_after);
+        Ok(SourcePageCharge {
+            accountant: Arc::clone(&self.page_accountant),
+            live: Arc::clone(&self.live_source_pages),
+            bytes,
+        })
+    }
+
+    /// Run one row-source call with every storage page it has to read
+    /// admitted against this read's memory before the page buffer exists.
+    ///
+    /// A stored row is read as the whole storage page that holds it, and the
+    /// page's length is known from the page address before any byte of it is
+    /// allocated. A value too large for the read's memory is therefore refused
+    /// at that point, with the same typed memory refusal the row's own charge
+    /// would have produced -- not after its page, its decoded copy and its
+    /// authentication encoding already exist.
+    ///
+    /// An admitted page carries its charge for as long as it lives. A page
+    /// the store's page cache keeps is paid for by the cache's own reserved
+    /// budget and gives its charge back at once; a page the cache does not
+    /// keep -- one larger than the cache -- keeps its charge until the last
+    /// thing holding it (this call, a retained scan, a cursor) drops it. Pages
+    /// served from the cache allocate nothing and are not charged.
+    fn with_source_page_admission<T>(
+        self: &Arc<Self>,
+        source: BoundedWorkSource,
+        read: impl FnOnce() -> std::result::Result<T, BoundedExecutionError>,
+    ) -> std::result::Result<T, BoundedExecutionError> {
+        let refusal = Arc::new(parking_lot::Mutex::new(None::<BoundedExecutionError>));
+        let admission = {
+            let context = Arc::clone(self);
+            let refusal = Arc::clone(&refusal);
+            Arc::new(
+                move |bytes: usize| match context.admit_source_page(source, bytes) {
+                    Ok(charge) => Ok(Box::new(charge) as redb::ReadPageCharge),
+                    Err(error) => {
+                        *refusal.lock() = Some(error);
+                        Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory))
+                    }
+                },
+            )
+                as Arc<dyn Fn(usize) -> std::io::Result<redb::ReadPageCharge> + Send + Sync>
+        };
+        let result = redb::with_read_page_charge(admission, read);
+        // The storage layer reports a refused page as an I/O failure; the
+        // caller is owed the memory refusal that caused it.
+        if let Some(refusal) = refusal.lock().take() {
+            return Err(refusal);
+        }
+        result
+    }
+
     fn transfer_vector_load_reservation(&self, bytes: usize) -> Result<()> {
         self.state().memory.try_transfer_to_store(bytes)
     }
@@ -627,7 +947,7 @@ impl RequestContext {
     }
 
     fn can_charge_more_work(&self) -> bool {
-        self.state().telemetry.work_units < self.limits.work
+        self.state().telemetry.work_units < self.limits.work && cursor_replay_work_available()
     }
 
     /// Give the graph traversal a finite ceiling derived from the work this
@@ -921,6 +1241,80 @@ enum PullKind {
     Union(UnionState),
 }
 
+/// What one plan layer of a BOUNDED CTE build costs in stack, pinned.
+///
+/// Scope: `PullKind`, `PullNode` and `ScanState` exist only inside the
+/// bounded kernel, which serves `ReadSession` and the owner read channel.
+/// `Database::execute` does NOT enter it -- it runs the eager
+/// `executor::execute_plan_once` -- so this ceiling does not bound eager
+/// recursive CTE execution through `Database::execute_at_snapshot`.
+/// The eager frame on that path is pinned by
+/// `executor::eager_plan_layer_frame`.
+///
+/// What this one protects is real on its own terms. `build_kernel_with_ctes`
+/// recurses one frame per plan layer; it already returns `Box<PullNode>` for
+/// that reason, but the node each layer BUILDS is materialized by value in
+/// that layer's own frame first, and an unoptimised build elides none of
+/// those copies. So a deep CTE read taken through the bounded kernel pays the
+/// widest `PullKind` arm once per layer, and a field added to `TableMeta`
+/// used to widen every one of them.
+#[cfg(test)]
+mod plan_layer_frame_size {
+    use super::{PullKind, PullNode, ScanState};
+    use contextdb_core::table_meta::TableMeta;
+
+    /// What one layer of a bounded deep-CTE read may cost. A scan that owned
+    /// its `TableMeta` by value measured 1848 bytes here; carrying a handle
+    /// to it instead leaves room under this number for the ordinary growth of
+    /// a scan's own state.
+    const PLAN_LAYER_CEILING_BYTES: usize = 1600;
+
+    /// What one ANSWER may cost. `QueryResult` carries `QueryTrace` inline and
+    /// `execute_plan_once` returns it by value out of every recursive plan
+    /// layer, so a rarely-populated disclosure added here is paid by every
+    /// layer of a deep statement. The four-CTE query exercises eight layers.
+    // The executed union receipt adds four optional counters and a terminal
+    // word to the inline trace. Keep this bound close to the observed 784-byte
+    // answer; the separate plan-layer bound still forbids copying TableMeta.
+    const ANSWER_CEILING_BYTES: usize = 800;
+
+    #[test]
+    fn one_plan_layer_never_scales_with_the_table_catalog() {
+        let pull_kind = std::mem::size_of::<PullKind>();
+        let pull_node = std::mem::size_of::<PullNode>();
+        let scan_state = std::mem::size_of::<ScanState>();
+        let table_meta = std::mem::size_of::<TableMeta>();
+        eprintln!(
+            "plan layer frame: PullKind={pull_kind} PullNode={pull_node} \
+             ScanState={scan_state} TableMeta={table_meta}"
+        );
+        let query_trace = std::mem::size_of::<crate::database::QueryTrace>();
+        let query_result = std::mem::size_of::<crate::database::QueryResult>();
+        eprintln!("answer frame: QueryTrace={query_trace} QueryResult={query_result}");
+        assert!(
+            query_result <= ANSWER_CEILING_BYTES,
+            "one answer slot is {query_result} bytes, over the {ANSWER_CEILING_BYTES} a recursive \
+             plan layer may spend on it; `execute_plan_once` returns `QueryResult` BY VALUE \
+             through every layer of a deep statement, so each byte here is paid once per layer"
+        );
+        assert!(
+            pull_kind <= PLAN_LAYER_CEILING_BYTES,
+            "one layer of a bounded CTE read is {pull_kind} bytes, over the \
+             {PLAN_LAYER_CEILING_BYTES} this kernel is sized for; a deep bounded read pays this \
+             once per plan layer"
+        );
+        // And the ceiling stays tight enough to catch the way this broke:
+        // if a scan could own its table's metadata by value again and still
+        // fit, the ceiling has been raised into uselessness.
+        assert!(
+            scan_state + table_meta > PLAN_LAYER_CEILING_BYTES,
+            "a scan could carry its {table_meta}-byte TableMeta by value again \
+             ({scan_state} + {table_meta}) and still fit under {PLAN_LAYER_CEILING_BYTES}; that \
+             is the regression this test exists to catch, so the ceiling is too slack"
+        );
+    }
+}
+
 /// Historical membership allocations live with their cursor and count against
 /// both this request and its engine until the last owned node is released.
 struct MembershipBudget(Arc<RequestContext>);
@@ -976,6 +1370,9 @@ fn capture_scan_membership(
     if matches!(mode, ScanMode::Physical { .. } | ScanMode::Empty) {
         return Ok(());
     }
+    if db.retained_relational_membership_source() {
+        return Ok(());
+    }
     context.reserve(
         BoundedWorkSource::IndexRange,
         std::mem::size_of::<MembershipBudget>() + 2 * std::mem::size_of::<usize>(),
@@ -1011,9 +1408,28 @@ fn capture_scan_membership(
 
 struct ScanState {
     identities_only: bool,
+    /// Whether this candidate source's own index range already keeps the read
+    /// inside every restriction its reader carries, so the row gate has
+    /// nothing left to decide about a candidate.
+    gate_answered_by_candidate_range: bool,
     vector_candidate_source: bool,
     table: String,
-    meta: TableMeta,
+    /// An 8-byte handle to this scan's OWN clone of the catalog entry, not a
+    /// share of the catalog's.
+    ///
+    /// `db.table_meta(table)` hands back an owned clone taken when the plan
+    /// was built, exactly as before; the `Arc` wraps that private clone. So
+    /// this buys size and nothing else -- `build_kernel_with_ctes`
+    /// materializes the node each layer builds in that layer's own frame, and
+    /// a `TableMeta` by value here made the frame scale with the catalog's
+    /// shape. It is never mutated and `ScanState` is not `Clone`, so the
+    /// refcount never leaves this state.
+    ///
+    /// Do NOT "close the gap" by handing out the live catalog's own `Arc`:
+    /// that would replace this per-statement snapshot with a handle into the
+    /// map a concurrent DDL rewrites, which is a staleness hazard this scan
+    /// does not have today.
+    meta: Arc<TableMeta>,
     schema_columns: Vec<String>,
     filter: Option<Expr>,
     params: Arc<HashMap<String, Value>>,
@@ -1021,6 +1437,12 @@ struct ScanState {
     mode: ScanMode,
     cursor_key_bytes: usize,
     residual_pick: Option<IndexPick>,
+    /// Set when an exact whole-key probe over a single-column AUTOMATIC index
+    /// was re-planned onto the authenticated ordered route. The source is an
+    /// ordinary index run now, but the STATEMENT is still one that names the
+    /// rows its keys identify, so refuse-vs-hide is decided the way an exact
+    /// probe decides it and not the way a run does.
+    authenticated_exact_index: Option<String>,
     /// Whether the committed source offers EVERY committed row of the table.
     /// A physical walk does. An index run offers only the rows its predicate
     /// names, so it cannot answer "did this identity have a committed
@@ -1059,9 +1481,10 @@ struct ScanState {
 /// already charged, so they are put in this read's order once and folded into
 /// the run as it walks.
 struct OrderedMerge {
-    /// The column the run is ordered on, and the direction it is walked in.
-    column: String,
-    direction: contextdb_core::SortDirection,
+    /// Every SQL ordering key, in precedence order and with its requested
+    /// direction. Pinned and tied leading keys still participate so the next
+    /// key decides exactly as a full sort would.
+    keys: Vec<(String, contextdb_core::SortDirection)>,
     /// The staged rows in this read's order. `None` until they have been read.
     staged: Option<VecDeque<(VersionedRow, usize)>>,
     /// A committed row already pulled and then held back, because a staged
@@ -1071,9 +1494,7 @@ struct OrderedMerge {
     held_bytes: usize,
 }
 
-/// Where one row sits in an ordered walk, in the same total order the index
-/// itself is kept in.
-fn ordered_merge_key(
+fn ordered_merge_component(
     row: &VersionedRow,
     column: &str,
     direction: contextdb_core::SortDirection,
@@ -1083,6 +1504,37 @@ fn ordered_merge_key(
         contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value)),
         contextdb_core::SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value)),
     }
+}
+
+/// Compare two rows by the complete ORDER BY tuple. Equal components keep
+/// walking, including a pinned leading column, and NULL follows the same
+/// directed total order as the declared index and ordinary SQL sort.
+fn compare_ordered_merge_rows(
+    left: &VersionedRow,
+    right: &VersionedRow,
+    keys: &[(String, contextdb_core::SortDirection)],
+) -> Ordering {
+    for (column, direction) in keys {
+        let ordering = ordered_merge_component(left, column, *direction)
+            .cmp(&ordered_merge_component(right, column, *direction));
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn ordered_merge_keys_capacity_bytes(
+    keys: &Vec<(String, contextdb_core::SortDirection)>,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    keys.iter().try_fold(
+        checked_size_mul(
+            keys.capacity(),
+            std::mem::size_of::<(String, contextdb_core::SortDirection)>(),
+            "ordered merge keys",
+        )?,
+        |bytes, (column, _)| checked_size_add(bytes, column.capacity(), "ordered merge key"),
+    )
 }
 
 /// The open transaction this scan is reading inside, and how far through its
@@ -1137,6 +1589,8 @@ enum ScanMode {
         cursor: BoundedOrderedRowCursor,
     },
     Ordered {
+        /// The leading indexed column and physical direction the relational
+        /// cursor needs to enter the B-tree.
         column: String,
         direction: contextdb_core::SortDirection,
         cursor: BoundedOrderedRowCursor,
@@ -1149,6 +1603,16 @@ enum ScanMode {
         cursor: contextdb_relational::mem::BoundedExactIndexCursor,
     },
     Empty,
+}
+
+struct OrderedIndexScan {
+    column: String,
+    direction: contextdb_core::SortDirection,
+    keys: Vec<(String, contextdb_core::SortDirection)>,
+    index: String,
+    reverse: bool,
+    predicate_pick: Option<IndexPick>,
+    predicate_considered: Vec<crate::database::IndexCandidate>,
 }
 
 struct GraphState {
@@ -1283,6 +1747,45 @@ enum VectorCandidateSource {
     Brute(contextdb_vector::mem::BoundedBruteForceCursor),
 }
 
+/// Own the request charge for one vector candidate partitioning until graph
+/// execution finishes with it or exact execution transfers it into its cursor.
+struct RetainedVectorCandidateGroups {
+    groups: Option<contextdb_vector::mem::BoundedVectorCandidateGroups>,
+    context: Arc<RequestContext>,
+}
+
+impl RetainedVectorCandidateGroups {
+    fn new(
+        groups: contextdb_vector::mem::BoundedVectorCandidateGroups,
+        context: &Arc<RequestContext>,
+    ) -> Self {
+        Self {
+            groups: Some(groups),
+            context: Arc::clone(context),
+        }
+    }
+
+    fn get(&self) -> &contextdb_vector::mem::BoundedVectorCandidateGroups {
+        self.groups
+            .as_ref()
+            .expect("candidate groups remain owned until exact transfer")
+    }
+
+    fn take(&mut self) -> contextdb_vector::mem::BoundedVectorCandidateGroups {
+        self.groups
+            .take()
+            .expect("candidate groups transfer to exactly one vector cursor")
+    }
+}
+
+impl Drop for RetainedVectorCandidateGroups {
+    fn drop(&mut self) {
+        if let Some(groups) = self.groups.take() {
+            self.context.release_parked(groups.into_retained_bytes());
+        }
+    }
+}
+
 struct RankedVectorRow {
     row_id: RowId,
     rank: f32,
@@ -1310,6 +1813,11 @@ struct VectorState {
     requested_search_mode: Option<contextdb_parser::ast::VectorSearchMode>,
     query_expr: Expr,
     candidate_plan: Option<Box<PhysicalPlan>>,
+    /// The declared index this search took its candidate identities from, when
+    /// it took them as identities rather than as rows. Naming it is what lets
+    /// a disagreement between a posting and the row it points at be reported
+    /// as the damage it is.
+    identity_source_index: Option<String>,
     restricted_candidates: bool,
     snapshot: SnapshotId,
     _schema: crate::database::VectorSchemaReadGuard,
@@ -1752,6 +2260,17 @@ fn value_refs_retained_bytes<'a>(
     Ok(bytes)
 }
 
+pub(crate) fn cursor_statement_bytes(
+    sql: &str,
+    params: &HashMap<String, Value>,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    checked_size_add(
+        sql.len(),
+        params_retained_bytes(params)?,
+        "cursor continuation statement",
+    )
+}
+
 fn params_retained_bytes(
     params: &HashMap<String, Value>,
 ) -> std::result::Result<usize, BoundedExecutionError> {
@@ -1797,6 +2316,13 @@ fn expr_capacity_bytes(expr: &Expr) -> std::result::Result<usize, BoundedExecuti
         ),
         Expr::Literal(literal) => literal_capacity_bytes(literal),
         Expr::Parameter(parameter) => Ok(parameter.capacity()),
+        Expr::Row(elements) => {
+            let mut bytes = checked_size_mul(elements.capacity(), boxed_expr, "row value")?;
+            for element in elements {
+                bytes = checked_size_add(bytes, expr_capacity_bytes(element)?, "row value")?;
+            }
+            Ok(bytes)
+        }
         Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
             let children = checked_size_add(
                 expr_capacity_bytes(left)?,
@@ -2634,39 +3160,66 @@ fn index_pick_capacity_bytes(
     bytes = checked_size_add(
         bytes,
         checked_size_mul(
-            pick.suffix_values.capacity(),
-            std::mem::size_of::<Value>(),
-            "index suffix values",
+            pick.suffix_shapes.capacity(),
+            std::mem::size_of::<IndexPredicateShape>(),
+            "index suffix shapes",
         )?,
         "index pick",
     )?;
-    for value in &pick.suffix_values {
-        bytes = checked_size_add(bytes, value_capacity_bytes(value)?, "index suffix value")?;
+    for shape in &pick.suffix_shapes {
+        bytes = checked_size_add(
+            bytes,
+            index_predicate_shape_capacity_bytes(shape)?,
+            "index suffix shape",
+        )?;
     }
-    match &pick.shape {
-        IndexPredicateShape::Equality(value) | IndexPredicateShape::NotEqual(value) => {
-            checked_size_add(bytes, value_capacity_bytes(value)?, "index predicate")
-        }
-        IndexPredicateShape::Range { lower, upper } => {
-            bytes = checked_size_add(bytes, bound_value_capacity_bytes(lower)?, "index predicate")?;
-            checked_size_add(bytes, bound_value_capacity_bytes(upper)?, "index predicate")
-        }
-        IndexPredicateShape::InList(values) => {
+    if let Some(tuples) = pick.tuple_prefix() {
+        for tuple in tuples {
             bytes = checked_size_add(
                 bytes,
                 checked_size_mul(
-                    values.capacity(),
+                    tuple.capacity(),
                     std::mem::size_of::<Value>(),
-                    "index IN values",
+                    "index tuple prefix",
                 )?,
-                "index predicate",
+                "index tuple prefix",
             )?;
-            for value in values {
+            for value in tuple {
+                bytes = checked_size_add(bytes, value.estimated_bytes(), "index tuple prefix")?;
+            }
+        }
+    }
+    checked_size_add(
+        bytes,
+        index_predicate_shape_capacity_bytes(&pick.shape)?,
+        "index predicate",
+    )
+}
+
+fn index_predicate_shape_capacity_bytes(
+    shape: &IndexPredicateShape,
+) -> std::result::Result<usize, BoundedExecutionError> {
+    match shape {
+        IndexPredicateShape::Equality(value) | IndexPredicateShape::NotEqual(value) => {
+            value_capacity_bytes(value)
+        }
+        IndexPredicateShape::Range { lower, upper } => checked_size_add(
+            bound_value_capacity_bytes(lower)?,
+            bound_value_capacity_bytes(upper)?,
+            "index predicate",
+        ),
+        IndexPredicateShape::InList(values) => {
+            let mut bytes = checked_size_mul(
+                values.capacity(),
+                std::mem::size_of::<Value>(),
+                "index IN values",
+            )?;
+            for value in values.iter() {
                 bytes = checked_size_add(bytes, value_capacity_bytes(value)?, "index predicate")?;
             }
             Ok(bytes)
         }
-        IndexPredicateShape::IsNull | IndexPredicateShape::IsNotNull => Ok(bytes),
+        IndexPredicateShape::IsNull | IndexPredicateShape::IsNotNull => Ok(0),
     }
 }
 
@@ -2710,6 +3263,11 @@ fn vector_search_disclosure_capacity_bytes(
         bytes = checked_size_add(
             bytes,
             partition.ef_search_source.capacity(),
+            "trace vector partition disclosure",
+        )?;
+        bytes = checked_size_add(
+            bytes,
+            optional_string_capacity(&partition.reason),
             "trace vector partition disclosure",
         )?;
     }
@@ -3015,8 +3573,11 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
             };
             state_bytes = checked_size_add(state_bytes, mode_bytes, "scan continuation")?;
             if let Some(merge) = state.ordered_merge.as_ref() {
-                let mut fold_bytes =
-                    checked_size_add(merge.held_bytes, merge.column.capacity(), "ordered fold")?;
+                let mut fold_bytes = checked_size_add(
+                    merge.held_bytes,
+                    ordered_merge_keys_capacity_bytes(&merge.keys)?,
+                    "ordered fold",
+                )?;
                 if let Some((_, deferred_bytes, _)) = merge.deferred.as_ref() {
                     fold_bytes = checked_size_add(fold_bytes, *deferred_bytes, "ordered fold")?;
                 }
@@ -3028,6 +3589,10 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
                     index_pick_capacity_bytes(pick)?,
                     "scan residual",
                 )?;
+            }
+            if let Some(index) = state.authenticated_exact_index.as_ref() {
+                state_bytes =
+                    checked_size_add(state_bytes, index.capacity(), "scan exact probe index")?;
             }
             state_bytes
         }
@@ -3120,6 +3685,38 @@ fn pull_continuation_bytes(node: &PullNode) -> std::result::Result<usize, Bounde
             // search that is still reading it.
             state_bytes =
                 checked_size_add(state_bytes, state.overlay_bytes, "vector continuation")?;
+            // The parts of a SEARCH that grow as it reads, and that it keeps
+            // between fetches: the candidate identities it admitted, the scores
+            // it computed for them, the ranked and output queues it hands rows
+            // out of, and the brute-force continuation it is stepping. Each is
+            // charged to this request where it is taken and released by the
+            // search itself when it is done with it. Leaving them out of this
+            // figure let the per-page settlement give those bytes away while
+            // the search was still holding them, and the fetch that finally
+            // released them asked the request for more than it had left --
+            // exactly the fault the traversal arm above is written against.
+            for growing in [
+                state.candidate_bytes,
+                state.score_bytes,
+                state.ranked_container_bytes,
+                state.output_container_bytes,
+                state.source.as_ref().map_or(0, |source| match source {
+                    VectorCandidateSource::Brute(cursor) => cursor.retained_bytes(),
+                }),
+            ] {
+                state_bytes = checked_size_add(state_bytes, growing, "vector continuation")?;
+            }
+            // The rows in those two queues are charged one at a time as they
+            // are materialised and stay charged until they are published, so
+            // they move with the queue rather than with the page.
+            for ranked in &state.ranked_rows {
+                state_bytes =
+                    checked_size_add(state_bytes, ranked.row.retained_bytes, "vector ranked rows")?;
+            }
+            for row in &state.output {
+                state_bytes =
+                    checked_size_add(state_bytes, row.retained_bytes, "vector output rows")?;
+            }
             state_bytes
         }
         PullKind::Project(state) => {
@@ -3247,6 +3844,9 @@ fn expr_nodes(expr: &Expr) -> std::result::Result<usize, BoundedExecutionError> 
         Expr::Like { expr, pattern, .. } => {
             checked_size_add(expr_nodes(expr)?, expr_nodes(pattern)?, "expression nodes")?
         }
+        Expr::Row(elements) => elements.iter().try_fold(0usize, |total, element| {
+            checked_size_add(total, expr_nodes(element)?, "expression nodes")
+        })?,
         Expr::InSubquery { .. } => 0,
         Expr::RowVectorSource { key, .. } => expr_nodes(key)?,
         Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => 0,
@@ -3279,6 +3879,11 @@ fn collect_expr_parameters(expr: &Expr, into: &mut std::collections::BTreeSet<St
             }
         }
         Expr::InSubquery { expr, .. } => collect_expr_parameters(expr, into),
+        Expr::Row(elements) => {
+            for element in elements {
+                collect_expr_parameters(element, into);
+            }
+        }
         _ => {}
     }
 }
@@ -3750,6 +4355,16 @@ fn bounded_eval_scalar_in_row<'a>(
             expr,
             list,
             negated,
+        } if matches!(expr.as_ref(), Expr::Row(_)) => {
+            Ok(match bounded_row_value_in_list(row, expr, list, params)? {
+                Some(matched) => BorrowedScalar::Bool(matched != *negated),
+                None => BorrowedScalar::Null,
+            })
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
         } => {
             let needle = bounded_eval_scalar_in_row(row, expr, params)?;
             let mut matched = false;
@@ -3845,6 +4460,59 @@ fn bounded_like_matches(value: &str, pattern: &str) -> bool {
     pattern_position == pattern.len()
 }
 
+/// `(a, b, ...) IN ((x, y, ...), ...)` over one row, under SQL's
+/// three-valued row comparison; the same rule as the executor's
+/// `row_value_in_list`, read through borrowed values.
+fn bounded_row_value_in_list(
+    row: &VersionedRow,
+    left: &Expr,
+    list: &[Expr],
+    params: &HashMap<String, Value>,
+) -> Result<Option<bool>> {
+    let Expr::Row(columns) = left else {
+        return Err(Error::PlanError(
+            "a row-value IN needs a row on its left".to_string(),
+        ));
+    };
+    let mut unknown = false;
+    for item in list {
+        let Expr::Row(values) = item else {
+            return Err(Error::PlanError(
+                "IN compares a row value against a single value".to_string(),
+            ));
+        };
+        if values.len() != columns.len() {
+            return Err(Error::PlanError(format!(
+                "IN compares a row of {} columns against a row of {} values",
+                columns.len(),
+                values.len()
+            )));
+        }
+        let mut row_unknown = false;
+        let mut row_differs = false;
+        for (column, value) in columns.iter().zip(values) {
+            let needle = bounded_eval_scalar_in_row(row, column, params)?;
+            let value = bounded_eval_scalar_in_row(row, value, params)?;
+            if needle.is_null() || value.is_null() {
+                row_unknown = true;
+            } else if borrowed_scalar_cmp(needle, value) != Some(std::cmp::Ordering::Equal)
+                && !borrowed_scalar_exact_eq(needle, value)
+            {
+                row_differs = true;
+                break;
+            }
+        }
+        if row_differs {
+            continue;
+        }
+        if !row_unknown {
+            return Ok(Some(true));
+        }
+        unknown = true;
+    }
+    Ok((!unknown).then_some(false))
+}
+
 fn bounded_eval_bool_expr(
     row: &VersionedRow,
     expr: &Expr,
@@ -3919,6 +4587,14 @@ fn bounded_eval_bool_expr(
             expr,
             list,
             negated,
+        } if matches!(expr.as_ref(), Expr::Row(_)) => {
+            Ok(bounded_row_value_in_list(row, expr, list, params)?
+                .map(|matched| matched != *negated))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
         } => {
             let needle = bounded_eval_scalar_in_row(row, expr, params)?;
             if needle.is_null() {
@@ -3983,6 +4659,59 @@ fn bounded_row_matches(
 }
 
 impl ScanState {
+    fn drain_verified_vector_candidate_identities(
+        &mut self,
+        db: &dyn ReadExecutionTarget,
+        context: &Arc<RequestContext>,
+        candidate_ids: &mut Vec<u64>,
+        candidate_bytes: &mut usize,
+    ) -> std::result::Result<bool, BoundedExecutionError> {
+        if !self.identities_only
+            || !self.vector_candidate_source
+            || self.pending_row.is_some()
+            || self.transaction.is_some()
+        {
+            return Ok(false);
+        }
+        let ScanMode::Index { cursor, pick, .. } = &mut self.mode else {
+            return Ok(false);
+        };
+        let _attribution = contextdb_core::find_attribution::stage("candidate_drain");
+        loop {
+            let visited = db.bounded_visit_verified_ordered_identities(
+                &self.table,
+                &pick.name,
+                self.snapshot,
+                cursor,
+                &mut || {
+                    context.charge(
+                        BoundedWorkSource::IndexRange,
+                        BoundedSourceTouch::IndexEntry,
+                    )
+                },
+                &mut |row_id| {
+                    let added = reserve_vector_slot(
+                        context,
+                        BoundedWorkSource::VectorCandidates,
+                        candidate_ids,
+                        "vector candidate ids",
+                    )?;
+                    *candidate_bytes = candidate_bytes
+                        .checked_add(added)
+                        .ok_or_else(|| bounded_size_error("vector candidate ids"))?;
+                    candidate_ids.push(row_id.0);
+                    Ok(())
+                },
+            )?;
+            if !visited {
+                return Ok(false);
+            }
+            if cursor.is_exhausted() {
+                return Ok(true);
+            }
+        }
+    }
+
     /// The next row this handle's own open transaction staged, once the
     /// committed rows are done.
     ///
@@ -4045,21 +4774,26 @@ impl ScanState {
                 let mut had_committed = false;
                 if !self.committed_source_offers_every_row {
                     let probe = Cell::new(0_usize);
-                    let existing = db.bounded_row_by_identity(
-                        None,
-                        &self.table,
-                        row.row_id,
-                        self.snapshot,
-                        &mut || {
-                            context
-                                .charge(BoundedWorkSource::TableScan, BoundedSourceTouch::TableRow)
-                        },
-                        &mut |bytes| {
-                            context.reserve(BoundedWorkSource::TableScan, bytes)?;
-                            probe.set(bytes);
-                            Ok(())
-                        },
-                    )?;
+                    let existing =
+                        context.with_source_page_admission(BoundedWorkSource::TableScan, || {
+                            db.bounded_row_by_identity(
+                                None,
+                                &self.table,
+                                row.row_id,
+                                self.snapshot,
+                                &mut || {
+                                    context.charge(
+                                        BoundedWorkSource::TableScan,
+                                        BoundedSourceTouch::TableRow,
+                                    )
+                                },
+                                &mut |bytes| {
+                                    context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                                    probe.set(bytes);
+                                    Ok(())
+                                },
+                            )
+                        })?;
                     // The probe asks only whether the original is there; the
                     // copy it made is handed straight back.
                     context.release(probe.get())?;
@@ -4094,12 +4828,7 @@ impl ScanState {
         let Some(merge) = self.ordered_merge.as_mut() else {
             return Ok(());
         };
-        let column = merge.column.clone();
-        let direction = merge.direction;
-        rows.sort_by(|left, right| {
-            ordered_merge_key(&left.0, &column, direction)
-                .cmp(&ordered_merge_key(&right.0, &column, direction))
-        });
+        rows.sort_by(|left, right| compare_ordered_merge_rows(&left.0, &right.0, &merge.keys));
         merge.held_bytes = rows.iter().map(|(_, bytes)| *bytes).sum();
         merge.staged = Some(rows.into());
         Ok(())
@@ -4119,10 +4848,7 @@ impl ScanState {
             return;
         };
         let comes_first = match merge.staged.as_ref().and_then(VecDeque::front) {
-            Some((head, _)) => {
-                ordered_merge_key(head, &merge.column, merge.direction)
-                    < ordered_merge_key(&committed.0, &merge.column, merge.direction)
-            }
+            Some((head, _)) => compare_ordered_merge_rows(head, &committed.0, &merge.keys).is_lt(),
             None => false,
         };
         if !comes_first {
@@ -4163,19 +4889,25 @@ impl ScanState {
                 let reserved = Cell::new(0usize);
                 let (row, source) = match &mut self.mode {
                     ScanMode::Physical { cursor } => {
-                        let pulled = db.bounded_physical_table_row_next(
-                            self.table.as_str(),
-                            cursor,
-                            &mut || {
-                                context.charge(
-                                    BoundedWorkSource::TableScan,
-                                    BoundedSourceTouch::TableRow,
+                        let pulled = context.with_source_page_admission(
+                            BoundedWorkSource::TableScan,
+                            || {
+                                db.bounded_physical_table_row_next(
+                                    self.table.as_str(),
+                                    self.snapshot,
+                                    cursor,
+                                    &mut || {
+                                        context.charge(
+                                            BoundedWorkSource::TableScan,
+                                            BoundedSourceTouch::TableRow,
+                                        )
+                                    },
+                                    &mut |bytes| {
+                                        context.reserve(BoundedWorkSource::TableScan, bytes)?;
+                                        reserved.set(bytes);
+                                        Ok(())
+                                    },
                                 )
-                            },
-                            &mut |bytes| {
-                                context.reserve(BoundedWorkSource::TableScan, bytes)?;
-                                reserved.set(bytes);
-                                Ok(())
                             },
                         )?;
                         (pulled, BoundedWorkSource::TableScan)
@@ -4184,25 +4916,32 @@ impl ScanState {
                         column,
                         direction,
                         cursor,
+                        ..
                     } => {
                         let old_key_bytes = cursor.retained_key_bytes();
                         let old_key_generation = cursor.key_generation();
-                        let pulled = db.bounded_ordered_table_row_next(
-                            &self.table,
-                            column,
-                            *direction,
-                            self.snapshot,
-                            cursor,
-                            &mut || {
-                                context.charge(
-                                    BoundedWorkSource::IndexRange,
-                                    BoundedSourceTouch::IndexEntry,
+                        let pulled = context.with_source_page_admission(
+                            BoundedWorkSource::IndexRange,
+                            || {
+                                db.bounded_ordered_table_row_next(
+                                    &self.table,
+                                    column,
+                                    *direction,
+                                    self.snapshot,
+                                    cursor,
+                                    &mut || context.check_final_boundary(),
+                                    &mut || {
+                                        context.charge(
+                                            BoundedWorkSource::IndexRange,
+                                            BoundedSourceTouch::IndexEntry,
+                                        )
+                                    },
+                                    &mut |bytes| {
+                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        reserved.set(bytes);
+                                        Ok(())
+                                    },
                                 )
-                            },
-                            &mut |bytes| {
-                                context.reserve(BoundedWorkSource::IndexRange, bytes)?;
-                                reserved.set(bytes);
-                                Ok(())
                             },
                         )?;
                         if cursor.key_generation() != old_key_generation {
@@ -4229,22 +4968,28 @@ impl ScanState {
                     } => {
                         let old_key_bytes = cursor.retained_key_bytes();
                         let old_key_generation = cursor.key_generation();
-                        let pulled = db.bounded_ordered_table_row_next(
-                            &self.table,
-                            column,
-                            *direction,
-                            self.snapshot,
-                            cursor,
-                            &mut || {
-                                context.charge(
-                                    BoundedWorkSource::IndexRange,
-                                    BoundedSourceTouch::IndexEntry,
+                        let pulled = context.with_source_page_admission(
+                            BoundedWorkSource::IndexRange,
+                            || {
+                                db.bounded_ordered_table_row_next(
+                                    &self.table,
+                                    column,
+                                    *direction,
+                                    self.snapshot,
+                                    cursor,
+                                    &mut || context.check_final_boundary(),
+                                    &mut || {
+                                        context.charge(
+                                            BoundedWorkSource::IndexRange,
+                                            BoundedSourceTouch::IndexEntry,
+                                        )
+                                    },
+                                    &mut |bytes| {
+                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        reserved.set(bytes);
+                                        Ok(())
+                                    },
                                 )
-                            },
-                            &mut |bytes| {
-                                context.reserve(BoundedWorkSource::IndexRange, bytes)?;
-                                reserved.set(bytes);
-                                Ok(())
                             },
                         )?;
                         if cursor.key_generation() != old_key_generation {
@@ -4264,23 +5009,30 @@ impl ScanState {
                         (pulled, BoundedWorkSource::IndexRange)
                     }
                     ScanMode::Exact { index, cursor } => {
-                        let pulled = db.bounded_exact_index_row_next(
-                            &self.table,
-                            index,
-                            self.snapshot,
-                            cursor,
-                            &mut || {
-                                context.charge(
-                                    BoundedWorkSource::IndexRange,
-                                    BoundedSourceTouch::IndexEntry,
+                        let pulled = context.with_source_page_admission(
+                            BoundedWorkSource::IndexRange,
+                            || {
+                                db.bounded_exact_index_row_next(
+                                    &self.table,
+                                    index,
+                                    self.snapshot,
+                                    cursor,
+                                    &mut || {
+                                        context.charge(
+                                            BoundedWorkSource::IndexRange,
+                                            BoundedSourceTouch::IndexEntry,
+                                        )
+                                    },
+                                    &mut |bytes| {
+                                        context.reserve(BoundedWorkSource::IndexRange, bytes)
+                                    },
+                                    &mut |bytes| context.release(bytes),
+                                    &mut |bytes| {
+                                        context.reserve(BoundedWorkSource::IndexRange, bytes)?;
+                                        reserved.set(bytes);
+                                        Ok(())
+                                    },
                                 )
-                            },
-                            &mut |bytes| context.reserve(BoundedWorkSource::IndexRange, bytes),
-                            &mut |bytes| context.release(bytes),
-                            &mut |bytes| {
-                                context.reserve(BoundedWorkSource::IndexRange, bytes)?;
-                                reserved.set(bytes);
-                                Ok(())
                             },
                         )?;
                         self.cursor_key_bytes = cursor.retained_bytes();
@@ -4441,10 +5193,17 @@ impl ScanState {
             // that merely scans is asking what it MAY see, and hiding is the
             // honest answer -- so the two are told apart by the executor's own
             // line, asked here rather than drawn again.
-            let names_one_row = match (&self.mode, index_pick) {
+            // An exact whole-key probe is the same statement whether it is
+            // answered by the exact source or by the authenticated run it was
+            // re-planned onto, so the same question is asked either way.
+            let exact_index = match &self.mode {
+                ScanMode::Exact { index, .. } => Some(index.as_str()),
+                _ => self.authenticated_exact_index.as_deref(),
+            };
+            let names_one_row = match (exact_index, index_pick) {
                 // An exact-lookup source asked a whole key: it is already
                 // reading the row that key names.
-                (ScanMode::Exact { index, .. }, _) => db.read_index_names_one_row(
+                (Some(index), _) => db.read_index_names_one_row(
                     &self.table,
                     index,
                     self.filter.as_ref(),
@@ -4468,7 +5227,19 @@ impl ScanState {
             };
             let mut refused = None;
             let mut hidden = false;
-            if names_one_row {
+            // A candidate this scan is deriving for a vector search is not a
+            // row anyone is served. It was drawn from an index range that the
+            // reader's own restrictions already bound (see
+            // `select_vector_candidate_identity_source`), so there is nothing
+            // left for the row gate to decide about it -- and deciding it
+            // anyway would mean reading a stored row version per candidate to
+            // publish k of them. The k rows that ARE published go through the
+            // gate where they are published, unchanged.
+            let candidate_range_answers_gate =
+                self.vector_candidate_source && self.gate_answered_by_candidate_range;
+            if candidate_range_answers_gate {
+                note_vector_candidate_identity("candidate range answers the gate")?;
+            } else if names_one_row {
                 refused = db.bounded_read_denial_for_row(
                     // The request's transaction, not this scan's row
                     // overlay: a transaction that staged only a GRANT row has
@@ -4546,18 +5317,7 @@ impl ScanState {
                     Error::Other("bounded scan projection allocation failed".to_string()).into(),
                 );
             }
-            values.push(row_id_value);
-            values.extend(
-                self.schema_columns
-                    .iter()
-                    .map(|column| match row.values.get(column) {
-                        Some(value) => value.clone(),
-                        None => Value::Null,
-                    }),
-            );
-            let output_bytes = values_retained_bytes(&values)?;
-            reconcile_new_reservation(context, source, planned_output_bytes, output_bytes)?;
-            let (_, retained_source_bytes, _) = self
+            let (source_row, retained_source_bytes, _) = self
                 .pending_row
                 .take()
                 .ok_or_else(|| Error::Other("bounded scan lost its projected row".to_string()))?;
@@ -4567,6 +5327,20 @@ impl ScanState {
                 )
                 .into());
             }
+            // The output row takes the source row's values rather than copies
+            // of them: the source row is released right here, so a copy would
+            // only put a second instance of every value -- one very large
+            // value included -- in memory for the length of this step.
+            let mut source_values = source_row.values;
+            values.push(row_id_value);
+            values.extend(
+                self.schema_columns
+                    .iter()
+                    .map(|column| source_values.remove(column).unwrap_or(Value::Null)),
+            );
+            drop(source_values);
+            let output_bytes = values_retained_bytes(&values)?;
+            reconcile_new_reservation(context, source, planned_output_bytes, output_bytes)?;
             context.release(retained_source_bytes)?;
             if let ScanMode::Physical { cursor } = &mut self.mode {
                 // The emitted anchor is what a later pull re-anchors against
@@ -5527,6 +6301,10 @@ impl contextdb_vector::hnsw::HnswCandidateObserver for BoundedHnswProbeObserver 
     fn before_candidate_distance(&self, event: contextdb_vector::hnsw::HnswCandidateDistanceEvent) {
         self.probe.before_hnsw_candidate_distance(event);
     }
+
+    fn after_residual_rejection(&self, event: contextdb_vector::hnsw::HnswResidualRejectionEvent) {
+        self.probe.after_hnsw_residual_rejection(event);
+    }
 }
 
 /// The capacity an accumulating collection starts at before doubling. Small
@@ -5628,11 +6406,9 @@ impl VectorState {
         &mut self,
         db: &dyn ReadExecutionTarget,
         aggregate_allowed_vectors: usize,
-        used_hnsw: bool,
+        groups: &contextdb_vector::mem::BoundedVectorCandidateGroups,
+        trace: &contextdb_vector::mem::BoundedVectorSearchTrace,
     ) -> std::result::Result<(), BoundedExecutionError> {
-        let authorized_sorted_ids = self
-            .candidate_filter
-            .then_some(self.candidate_ids.as_slice());
         let disclosure = db.completed_vector_search_disclosure(
             self.index.clone(),
             self.k,
@@ -5643,8 +6419,11 @@ impl VectorState {
             self.snapshot,
             &self.params,
             aggregate_allowed_vectors,
-            authorized_sorted_ids,
-            used_hnsw,
+            groups,
+            trace.partition_routes(),
+            trace.used_hnsw(),
+            trace.fallback_reason(),
+            trace.budget_receipt(),
         )?;
         self.disclosure = Some(disclosure);
         Ok(())
@@ -5657,6 +6436,38 @@ impl VectorState {
     /// two outcomes the scan produced, decided per published row, so what the
     /// search admitted and what the reader is entitled to stay separate
     /// questions.
+    /// Whether a row body satisfies the statement's own predicate -- the
+    /// filter its candidate source carries. One rule, asked both of a row this
+    /// transaction staged and of a committed row about to be published.
+    ///
+    /// A predicate that reads another table cannot be answered from a row, so
+    /// it is not asked here: the candidate source already ran it against the
+    /// rows it admitted, and re-asking it with only a row in hand would not
+    /// reach the subquery's answer. What is left is what a row can settle for
+    /// itself, which is the part a posting could have lied about.
+    fn row_matches_candidate_predicate(
+        &self,
+        row: &VersionedRow,
+    ) -> std::result::Result<bool, BoundedExecutionError> {
+        let mut plan = self.candidate_plan.as_deref();
+        while let Some(PhysicalPlan::Project { input, .. }) = plan {
+            plan = Some(input);
+        }
+        let Some(PhysicalPlan::Scan {
+            filter: Some(filter),
+            ..
+        }) = plan
+        else {
+            return Ok(true);
+        };
+        if !predicate_is_answerable_from_one_row(filter) {
+            return Ok(true);
+        }
+        Ok(super::eval_bool_expr(filter, &|inner| {
+            super::eval_expr_value(row, inner, &self.params)
+        })? == Some(true))
+    }
+
     fn materialize_scored_row(
         &mut self,
         db: &dyn ReadExecutionTarget,
@@ -5664,25 +6475,27 @@ impl VectorState {
         row_id: RowId,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
         let mut retained = 0usize;
-        let row = db.bounded_row_by_identity(
-            context.transaction(),
-            &self.table,
-            row_id,
-            self.snapshot,
-            // Publishing a row the search already scored is charged as the
-            // work it is, and it is NOT a source touch: the candidate source
-            // already counted the rows this statement examined, and counting
-            // the answer again would make a filtered search report more rows
-            // read than the filter admitted -- one more per row returned. The
-            // other door resolves the same row through the version index
-            // (`RelationalStore::row_by_id`) and counts nothing, and
-            // `rows_examined` is one figure both doors owe the same answer to.
-            &mut || context.charge_operator(BoundedWorkSource::TableScan),
-            &mut |bytes| {
-                retained = bytes;
-                context.reserve(BoundedWorkSource::TableScan, bytes)
-            },
-        )?;
+        let row = context.with_source_page_admission(BoundedWorkSource::TableScan, || {
+            db.bounded_row_by_identity(
+                context.transaction(),
+                &self.table,
+                row_id,
+                self.snapshot,
+                // Publishing a row the search already scored is charged as the
+                // work it is, and it is NOT a source touch: the candidate source
+                // already counted the rows this statement examined, and counting
+                // the answer again would make a filtered search report more rows
+                // read than the filter admitted -- one more per row returned. The
+                // other door resolves the same row through the version index
+                // (`RelationalStore::row_by_id`) and counts nothing, and
+                // `rows_examined` is one figure both doors owe the same answer to.
+                &mut || context.charge_operator(BoundedWorkSource::TableScan),
+                &mut |bytes| {
+                    retained = bytes;
+                    context.reserve(BoundedWorkSource::TableScan, bytes)
+                },
+            )
+        })?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -5709,7 +6522,48 @@ impl VectorState {
                 Ok(())
             },
         )?;
-        if !allowed {
+        // The gate decides what this reader MAY see; it does not decide what
+        // the statement ASKED for. On the identity route nothing has read this
+        // row body yet, so `context_id`, `generation_id` and `is_current` have
+        // been believed from the index posting alone up to this point.
+        //
+        // Measured: on the authenticated route neither divergence can reach
+        // here -- a tampered row body is refused by the content-identity
+        // authentication at load, and a moved posting by the per-window
+        // reconciliation that compares the canonical posting tree against the
+        // physical index. This check is the last of those three, not the first,
+        // and it costs one predicate evaluation per PUBLISHED row.
+        let matches = self.row_matches_candidate_predicate(&row)?;
+        if !allowed || !matches {
+            // A posting and the row version it names are written and retired
+            // by the same transaction, so inside ONE snapshot they cannot
+            // disagree -- unless this reader's own open transaction has staged
+            // a change the committed index has not seen, which is ordinary and
+            // keeps the old hide-and-continue. With no such transaction, an
+            // index naming a row whose body contradicts it is store damage,
+            // and damage is reported, never served: publishing a different row
+            // in its place would hide it, and dropping this one would answer
+            // short of the LIMIT with nothing to say.
+            if let Some(index) = self.identity_source_index.as_deref()
+                && context.transaction().is_none()
+            {
+                context.release(retained)?;
+                return Err(Error::StoreCorrupted {
+                    path: db.bounded_store_path(),
+                    reason: format!(
+                        "relational index {index} on table {} names row {} as {}, and the row \
+                         version stored at this snapshot disagrees",
+                        self.table,
+                        row_id.0,
+                        if allowed {
+                            "one the statement selected"
+                        } else {
+                            "one this reader may see"
+                        },
+                    ),
+                }
+                .into());
+            }
             context.release(retained)?;
             return Ok(None);
         }
@@ -5729,7 +6583,6 @@ impl VectorState {
                 row.values.insert(column.clone(), Value::Vector(vector));
             }
         }
-        let row = &row;
         let row_id_value =
             Value::Int64(i64::try_from(row.row_id.0).map_err(|_| {
                 Error::Other("bounded row identifier exceeds SQL INTEGER".to_string())
@@ -5754,12 +6607,16 @@ impl VectorState {
             context.release(retained)?;
             return Err(Error::Other("bounded vector row allocation failed".to_string()).into());
         }
+        // The source row is released below, so its values are moved into the
+        // output rather than copied: a copy would hold every value twice.
+        let mut source_values = row.values;
         values.push(row_id_value);
         values.extend(
             self.schema_columns
                 .iter()
-                .map(|column| row.values.get(column).cloned().unwrap_or(Value::Null)),
+                .map(|column| source_values.remove(column).unwrap_or(Value::Null)),
         );
+        drop(source_values);
         let actual = values_retained_bytes(&values)?;
         reconcile_new_reservation(context, BoundedWorkSource::TableScan, planned, actual)?;
         // The source copy has been projected and is no longer held.
@@ -5884,33 +6741,25 @@ impl VectorState {
             return Ok(false);
         }
         let mut retained = 0;
-        let row = db.bounded_row_by_identity(
-            context.transaction(),
-            &self.table,
-            row_id,
-            self.snapshot,
-            &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
-            &mut |bytes| {
-                retained = bytes;
-                context.reserve(BoundedWorkSource::VectorCandidates, bytes)
-            },
-        )?;
+        let row =
+            context.with_source_page_admission(BoundedWorkSource::VectorCandidates, || {
+                db.bounded_row_by_identity(
+                    context.transaction(),
+                    &self.table,
+                    row_id,
+                    self.snapshot,
+                    &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                    &mut |bytes| {
+                        retained = bytes;
+                        context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                    },
+                )
+            })?;
         let admitted = (|| {
             let Some(row) = row.as_ref() else {
                 return Ok(false);
             };
-            let mut plan = self.candidate_plan.as_deref();
-            while let Some(PhysicalPlan::Project { input, .. }) = plan {
-                plan = Some(input);
-            }
-            if let Some(PhysicalPlan::Scan {
-                filter: Some(filter),
-                ..
-            }) = plan
-                && super::eval_bool_expr(filter, &|inner| {
-                    super::eval_expr_value(row, inner, &self.params)
-                })? != Some(true)
-            {
+            if !self.row_matches_candidate_predicate(row)? {
                 return Ok(false);
             }
             let meta = db
@@ -6044,6 +6893,19 @@ impl VectorState {
                         self.preparation = VectorPreparation::Search;
                         continue;
                     };
+                    if let PullKind::Scan(scan) = &mut root.kind
+                        && scan.drain_verified_vector_candidate_identities(
+                            db,
+                            context,
+                            &mut self.candidate_ids,
+                            &mut self.candidate_bytes,
+                        )?
+                    {
+                        self.candidate_ids.sort_unstable();
+                        self.candidate_ids.dedup();
+                        self.preparation = VectorPreparation::Search;
+                        continue;
+                    }
                     // How this candidate set names the rows it picked. A plan
                     // that reads the table directly projects the table's own
                     // `row_id`. A candidate set written as named queries -- a
@@ -6144,35 +7006,12 @@ impl VectorState {
                     let candidates = self
                         .candidate_filter
                         .then_some(self.candidate_ids.as_slice());
-                    self.candidate_k = self
-                        .with_partition_scope(|| {
-                            db.bounded_vector_candidate_k(
-                                &self.index,
-                                self.k,
-                                self.sort_key.as_deref(),
-                                self.snapshot,
-                                candidates,
-                                &mut || {
-                                    context.charge_operator(BoundedWorkSource::VectorCandidates)
-                                },
-                                &mut |bytes| {
-                                    context.reserve(BoundedWorkSource::VectorCandidates, bytes)
-                                },
-                                &mut |bytes| context.release_parked(bytes),
-                            )
-                        })?
-                        .saturating_add(
-                            self.vector_overlay
-                                .as_ref()
-                                .map_or(0, |overlay| overlay.searchable_entry_count),
-                        );
-                    // Count the same selected snapshot membership for every mode.
-                    // Directory counts and indexed identities do not hydrate vector bodies.
-                    let aggregate_allowed_count = self.with_partition_scope(|| {
-                        db.bounded_authorized_visible_vector_count(
+                    let groups = self.with_partition_scope(|| {
+                        db.bounded_vector_candidate_groups(
                             &self.index,
                             candidates,
                             self.snapshot,
+                            &mut || context.checkpoint(),
                             &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
                             &mut |bytes| {
                                 context.reserve(BoundedWorkSource::VectorCandidates, bytes)
@@ -6180,11 +7019,22 @@ impl VectorState {
                             &mut |bytes| context.release_parked(bytes),
                         )
                     })?;
-                    let hnsw = if self.search_mode == contextdb_core::VectorSearchMode::Exact
-                        || self.force_exact_for_relational_fallback
-                    {
-                        super::BoundedVectorSearchOutcome::ExactRequired
-                    } else {
+                    let mut groups = RetainedVectorCandidateGroups::new(groups, context);
+                    let aggregate_allowed_count = groups.get().aggregate_allowed_count();
+                    self.candidate_k = db
+                        .bounded_vector_candidate_k(
+                            &self.index,
+                            self.k,
+                            self.sort_key.as_deref(),
+                            groups.get(),
+                            &mut || context.checkpoint(),
+                        )?
+                        .saturating_add(
+                            self.vector_overlay
+                                .as_ref()
+                                .map_or(0, |overlay| overlay.searchable_entry_count),
+                        );
+                    let hnsw = {
                         let remaining_graph_work = context.remaining_vector_graph_work()?;
                         let allowed_search_limits =
                             contextdb_vector::hnsw::HnswAllowedSearchLimits {
@@ -6201,35 +7051,35 @@ impl VectorState {
                                 &accountant,
                                 transfer,
                                 || {
-                                    self.with_partition_scope(|| {
-                                        db.bounded_hnsw_vector_search(
-                                            &self.index,
-                                            &self.query,
-                                            self.candidate_k,
-                                            candidates,
-                                            self.snapshot,
-                                            self.search_mode,
-                                            aggregate_allowed_count,
-                                            allowed_search_limits,
-                                            &mut || {
-                                                context.charge_operator(
-                                                    BoundedWorkSource::VectorCandidates,
-                                                )
-                                            },
-                                            &mut || {
-                                                context.charge_operator(
-                                                    BoundedWorkSource::VectorCandidates,
-                                                )
-                                            },
-                                            &mut |bytes| {
-                                                context.reserve(
-                                                    BoundedWorkSource::VectorCandidates,
-                                                    bytes,
-                                                )
-                                            },
-                                            &mut |bytes| context.release_parked(bytes),
-                                        )
-                                    })
+                                    db.bounded_hnsw_vector_search(
+                                        &self.index,
+                                        &self.query,
+                                        self.candidate_k,
+                                        groups.get(),
+                                        if self.force_exact_for_relational_fallback {
+                                            contextdb_core::VectorSearchMode::Exact
+                                        } else {
+                                            self.search_mode
+                                        },
+                                        allowed_search_limits,
+                                        &mut || context.checkpoint(),
+                                        &mut || {
+                                            context.charge(
+                                                BoundedWorkSource::VectorCandidates,
+                                                BoundedSourceTouch::BruteForceVectorCandidate,
+                                            )
+                                        },
+                                        &mut || {
+                                            context.charge_operator(
+                                                BoundedWorkSource::VectorCandidates,
+                                            )
+                                        },
+                                        &mut |bytes| {
+                                            context
+                                                .reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                        },
+                                        &mut |bytes| context.release_parked(bytes),
+                                    )
                                 },
                             )
                         };
@@ -6247,8 +7097,14 @@ impl VectorState {
                         searched
                     };
                     match hnsw {
-                        super::BoundedVectorSearchOutcome::Complete((mut rows, retained_bytes)) => {
-                            self.used_hnsw = true;
+                        super::BoundedVectorSearchOutcome::Complete(
+                            (mut rows, retained_bytes),
+                            mut trace,
+                        ) => {
+                            if self.force_exact_for_relational_fallback {
+                                trace.override_exact_reason("filtered_route_exact");
+                            }
+                            self.used_hnsw = trace.used_hnsw();
                             if self.vector_overlay.is_some() {
                                 rows.retain_mut(|(row_id, _score)| {
                                     let Some(published) = self.overlay_publishes(*row_id) else {
@@ -6263,8 +7119,23 @@ impl VectorState {
                             // INDEXED searches committed rows through the
                             // maintained graph and scores only this
                             // transaction's bounded staged delta directly.
-                            self.score_staged_vectors(db, context)?;
-                            self.record_disclosure(db, aggregate_allowed_count, true)?;
+                            if let Err(error) =
+                                self.score_staged_vectors(db, context).and_then(|()| {
+                                    self.record_disclosure(
+                                        db,
+                                        aggregate_allowed_count,
+                                        groups.get(),
+                                        &trace,
+                                    )
+                                })
+                            {
+                                context.release(trace.retained_bytes())?;
+                                return Err(error);
+                            }
+                            let trace_bytes = trace.retained_bytes();
+                            let trace = trace.into_trace();
+                            context.release(trace_bytes)?;
+                            db.publish_vector_search_trace(trace);
                             self.preparation = VectorPreparation::Materialize;
                             continue;
                         }
@@ -6273,12 +7144,28 @@ impl VectorState {
                             self.scores.clear();
                             self.score_bytes = 0;
                             self.score_staged_vectors(db, context)?;
-                            self.record_disclosure(db, aggregate_allowed_count, true)?;
                             self.preparation = VectorPreparation::Materialize;
                             continue;
                         }
-                        super::BoundedVectorSearchOutcome::ExactRequired
-                        | super::BoundedVectorSearchOutcome::Unavailable
+                        super::BoundedVectorSearchOutcome::ExactRequired(mut trace) => {
+                            if self.force_exact_for_relational_fallback {
+                                trace.override_exact_reason("filtered_route_exact");
+                            }
+                            if let Err(error) = self.record_disclosure(
+                                db,
+                                aggregate_allowed_count,
+                                groups.get(),
+                                &trace,
+                            ) {
+                                context.release(trace.retained_bytes())?;
+                                return Err(error);
+                            }
+                            let trace_bytes = trace.retained_bytes();
+                            let trace = trace.into_trace();
+                            context.release(trace_bytes)?;
+                            db.publish_vector_search_trace(trace);
+                        }
+                        super::BoundedVectorSearchOutcome::Unavailable
                         | super::BoundedVectorSearchOutcome::Incomplete => {}
                     }
                     if self.search_mode == contextdb_core::VectorSearchMode::Indexed {
@@ -6309,36 +7196,45 @@ impl VectorState {
                     } else {
                         self.candidate_k
                     };
-                    let cursor = self.with_partition_scope(|| {
-                        db.bounded_brute_force_vector_cursor(
-                            self.index.clone(),
-                            &self.query,
-                            exact_candidate_k,
-                            candidates,
-                            self.snapshot,
-                            &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
-                            &mut |bytes| {
-                                context
-                                    .reserve(BoundedWorkSource::VectorCandidates, bytes)
-                                    .map_err(|error| match error {
-                                        BoundedExecutionError::Engine(
-                                            Error::MemoryBudgetExceeded {
-                                                available_bytes, ..
-                                            },
-                                        ) => Error::VectorExactSearchBudgetExceeded {
-                                            index: self.index.clone(),
-                                            required_bytes: bytes as u64,
-                                            available_bytes: available_bytes as u64,
-                                        }
-                                        .into(),
-                                        other => other,
-                                    })
-                            },
-                            &mut |bytes| context.release_parked(bytes),
-                        )
-                    })?;
+                    let cursor = db.bounded_brute_force_vector_cursor(
+                        self.index.clone(),
+                        &self.query,
+                        exact_candidate_k,
+                        groups.take(),
+                        &mut || context.checkpoint(),
+                        &mut |bytes| {
+                            context
+                                .reserve(BoundedWorkSource::VectorCandidates, bytes)
+                                .map_err(|error| match error {
+                                    BoundedExecutionError::Engine(
+                                        Error::MemoryBudgetExceeded {
+                                            available_bytes, ..
+                                        },
+                                    ) => Error::VectorExactSearchBudgetExceeded {
+                                        index: self.index.clone(),
+                                        required_bytes: bytes as u64,
+                                        available_bytes: available_bytes as u64,
+                                    }
+                                    .into(),
+                                    other => other,
+                                })
+                        },
+                        &mut |bytes| context.release_parked(bytes),
+                    )?;
+                    // Automatic exhaustive work, and an exact comparison over a
+                    // committed image, answer inside the memory they have by
+                    // reading one stored body at a time where a whole partition
+                    // does not fit. A writable store's exact search keeps the
+                    // whole-partition load and its typed refusal.
+                    let cursor = if self.search_mode == contextdb_core::VectorSearchMode::Auto
+                        || (self.search_mode == contextdb_core::VectorSearchMode::Exact
+                            && cursor.exact_comparison_streams_when_partition_does_not_fit())
+                    {
+                        cursor.streaming_bodies_it_cannot_hold()
+                    } else {
+                        cursor
+                    };
                     self.source = Some(VectorCandidateSource::Brute(cursor));
-                    self.record_disclosure(db, aggregate_allowed_count, false)?;
                     self.preparation = VectorPreparation::Materialize;
                     continue;
                 }
@@ -6347,6 +7243,12 @@ impl VectorState {
                         Some(VectorCandidateSource::Brute(cursor)) => db
                             .bounded_brute_force_vector_step(
                                 cursor,
+                                &mut || context.checkpoint(),
+                                &mut || {
+                                    context.observe_precharged_touch(
+                                        BoundedSourceTouch::BruteForceVectorCandidate,
+                                    )
+                                },
                                 &mut || {
                                     context.charge(
                                         BoundedWorkSource::VectorCandidates,
@@ -7534,6 +8436,7 @@ fn ensure_supported_plan(plan: &PhysicalPlan) -> std::result::Result<(), Bounded
         PhysicalPlan::ShowMemoryLimit
         | PhysicalPlan::ShowDiskLimit
         | PhysicalPlan::ShowMaintenancePollInterval
+        | PhysicalPlan::ShowVectorServingCache
         | PhysicalPlan::ShowSyncConflictPolicy
         | PhysicalPlan::ShowVectorIndexes
         | PhysicalPlan::ShowTenantTablePolicy { .. }
@@ -7707,6 +8610,184 @@ fn build_kernel(
     build_kernel_with_ctes(db, plan, params, snapshot, &HashMap::new(), context).map(|node| *node)
 }
 
+/// Serve a `COUNT(*)` over an exact index prefix from the maintained count,
+/// when the table declares one over exactly those columns.
+///
+/// `disclosure` is an out-parameter rather than a return value because the
+/// two answers travel on different traces: a served count carries its own
+/// node and trace, while a NOT-declared count returns `Ok(None)` and the
+/// ordinary index-range aggregate the caller builds next is what carries the
+/// disclosure. Both answers are exact; only their cost differs, and this is
+/// what lets a consumer see which one it got.
+fn build_authenticated_index_count(
+    db: &dyn ReadExecutionTarget,
+    input: &PhysicalPlan,
+    columns: &[ProjectColumn],
+    params: &HashMap<String, Value>,
+    context: &Arc<RequestContext>,
+    disclosure: &mut Option<crate::maintained_counts::MaintainedCountDisclosure>,
+) -> std::result::Result<Option<Box<PullNode>>, BoundedExecutionError> {
+    if context.transaction().is_some() || columns.len() != 1 {
+        return Ok(None);
+    }
+    let Expr::FunctionCall { name, args } = &columns[0].expr else {
+        return Ok(None);
+    };
+    if !name.eq_ignore_ascii_case("count") || !matches!(aggregate_input(args), AggregateInput::Row)
+    {
+        return Ok(None);
+    }
+    let PhysicalPlan::Scan {
+        table,
+        filter: Some(filter),
+        ..
+    } = input
+    else {
+        return Ok(None);
+    };
+    db.assert_table_read_allowed(table)?;
+    if db.bounded_read_requires_candidate_filter(table)? {
+        return Ok(None);
+    }
+    let Some(meta) = db.table_meta(table) else {
+        return Err(Error::TableNotFound(table.clone()).into());
+    };
+    let analysis = analyze_filter_for_index(table, &meta, filter, params);
+    let Some(pick) = analysis.pick else {
+        return Ok(None);
+    };
+    let pick = match db.coerce_pick_shape_to_column_type(table, &pick) {
+        Ok(pick) => pick,
+        Err(_) => return Ok(None),
+    };
+    let conjuncts = split_conjuncts(filter);
+    if conjuncts.len() != pick.pushed_columns.len() {
+        return Ok(None);
+    }
+    let mut covered = HashSet::new();
+    for conjunct in conjuncts {
+        let Some((column, shape)) = classify_index_predicate(&conjunct, params) else {
+            return Ok(None);
+        };
+        if !matches!(
+            shape,
+            IndexPredicateShape::Equality(_) | IndexPredicateShape::IsNull
+        ) || !pick.pushed_columns.iter().any(|pushed| pushed == &column)
+            || !covered.insert(column)
+        {
+            return Ok(None);
+        }
+    }
+    if !matches!(
+        pick.shape,
+        IndexPredicateShape::Equality(_) | IndexPredicateShape::IsNull
+    ) || pick.suffix_shapes.iter().any(|shape| {
+        !matches!(
+            shape,
+            IndexPredicateShape::Equality(_) | IndexPredicateShape::IsNull
+        )
+    }) {
+        return Ok(None);
+    }
+    let mut runs = crate::executor::expanded_index_runs(&pick)?;
+    if runs.len() != 1 {
+        return Ok(None);
+    }
+    let (Bound::Included(prefix), _) = runs.pop().expect("one exact index run") else {
+        return Ok(None);
+    };
+    if prefix.len() != pick.pushed_columns.len() {
+        return Ok(None);
+    }
+    // A count over a column list a primary key or unique constraint already
+    // bounds at 0 or 1 is not maintained: the same answer comes from the index
+    // range itself, which holds at most one posting for such a key. Falling
+    // through to the ordinary aggregate reads that one posting and returns the
+    // same number, authenticated by the same postings.
+    if crate::persistence::relational_index_prefix_is_constraint_bounded(
+        &meta,
+        &pick.columns[..prefix.len()],
+    ) {
+        return Ok(None);
+    }
+    // Whether a count is MAINTAINED is the declaration's answer, and it is the
+    // only thing an `ALTER TABLE` can change. Whether this read route can SERVE
+    // it is a separate question the route answers, so the two are reported
+    // separately: advising a declaration that is already in force would send a
+    // consumer to change DDL that is not what is costing it anything.
+    let declared =
+        crate::maintained_counts::maintained_count_member(&meta, &pick.columns[..prefix.len()]);
+    if !declared {
+        // Nothing maintains a count over this list, so there is no record to
+        // consult and no record's absence to misread. Name the declaration
+        // that would make it O(1) and let the ordinary aggregate answer.
+        *disclosure = Some(
+            crate::maintained_counts::MaintainedCountDisclosure::NotDeclared {
+                table: table.clone(),
+                columns: pick.columns[..prefix.len()].to_vec(),
+                // `SET` replaces the whole declared set, so the advice carries
+                // what the table already declares alongside the missing list.
+                already_declared: crate::maintained_counts::declared_lists(&meta),
+            },
+        );
+        return Ok(None);
+    }
+    let Some(count) = db.authenticated_relational_index_prefix_count(
+        table,
+        &pick.columns[..prefix.len()],
+        &prefix,
+    )?
+    else {
+        // The shape was eligible and the answer is still exact — the ordinary
+        // index-range aggregate the caller builds next opens the same exact
+        // prefix range and counts live postings.
+        // The table DOES declare this count and the write path keeps it
+        // current; this read route simply did not serve the answer from it.
+        // That is not a declaration problem and no DDL changes it.
+        *disclosure = Some(
+            crate::maintained_counts::MaintainedCountDisclosure::DeclaredNotServed {
+                table: table.clone(),
+                columns: pick.columns[..prefix.len()].to_vec(),
+            },
+        );
+        return Ok(None);
+    };
+    *disclosure = Some(crate::maintained_counts::MaintainedCountDisclosure::Used {
+        table: table.clone(),
+        columns: pick.columns[..prefix.len()].to_vec(),
+    });
+    let count =
+        i64::try_from(count).map_err(|_| Error::PlanError("integer out of range".to_owned()))?;
+    context.charge(
+        BoundedWorkSource::IndexRange,
+        BoundedSourceTouch::IndexEntry,
+    )?;
+    let values = vec![Value::Int64(count)];
+    let retained_bytes = value_refs_retained_bytes(values.iter(), values.len())?;
+    context.reserve(BoundedWorkSource::IndexRange, retained_bytes)?;
+    Ok(Some(Box::new(PullNode {
+        columns: project_output_columns(columns),
+        trace: QueryTrace {
+            physical_plan: "IndexScan",
+            index_used: Some(pick.name),
+            predicates_pushed: pick
+                .pushed_columns
+                .into_iter()
+                .map(std::borrow::Cow::Owned)
+                .collect(),
+            indexes_considered: analysis.considered.into_iter().collect(),
+            maintained_count: disclosure.clone().map(Box::new),
+            ..Default::default()
+        },
+        kind: PullKind::Static(StaticState {
+            rows: VecDeque::from([PulledRow {
+                values,
+                retained_bytes,
+            }]),
+        }),
+    })))
+}
+
 /// Build recursive plan nodes behind their eventual owning pointer.
 ///
 /// `PullNode` carries every source state inline and is deliberately large.
@@ -7744,6 +8825,7 @@ fn build_kernel_with_ctes<'plan>(
         PhysicalPlan::ShowMemoryLimit
         | PhysicalPlan::ShowDiskLimit
         | PhysicalPlan::ShowMaintenancePollInterval
+        | PhysicalPlan::ShowVectorServingCache
         | PhysicalPlan::ShowSyncConflictPolicy
         | PhysicalPlan::ShowVectorIndexes
         | PhysicalPlan::ShowTenantTablePolicy { .. }
@@ -7753,9 +8835,24 @@ fn build_kernel_with_ctes<'plan>(
             build_store_state(db, plan, context).map(Box::new)
         }
         PhysicalPlan::Project { input, columns } => {
+            let mut maintained_count = None;
+            if let Some(count) = build_authenticated_index_count(
+                db,
+                input,
+                columns,
+                &params,
+                context,
+                &mut maintained_count,
+            )? {
+                return Ok(count);
+            }
             let input =
                 build_kernel_with_ctes(db, input, Arc::clone(&params), snapshot, ctes, context)?;
-            let trace = input.trace.clone();
+            let mut trace = input.trace.clone();
+            // The count this aggregate is about to compute exactly is the one
+            // a declaration would have served in O(1); say so on the trace the
+            // caller reads.
+            trace.maintained_count = maintained_count.map(Box::new);
             let aggregate = projection_aggregates(columns);
             if aggregate
                 && columns
@@ -7800,16 +8897,14 @@ fn build_kernel_with_ctes<'plan>(
             // Asked once, so the two places below cannot disagree about
             // whether a transaction is open.
             let inside_transaction = context.transaction().is_some();
-            if let Some((table, filter, column, direction, index, reverse)) =
-                ordered_scan(db, input, keys)
-            {
+            if let Some((table, filter, ordered)) = ordered_scan(db, input, keys, &params) {
                 return build_scan(
                     db,
                     table,
                     filter,
                     params,
                     snapshot,
-                    Some((column, direction, index, reverse)),
+                    Some(ordered),
                     None,
                     context,
                 )
@@ -8370,6 +9465,51 @@ fn resolve_candidate_delete_membership(
     Ok(true)
 }
 
+// Proof-only: why one vector candidate source did or did not become
+// identity-only. Production never reads it.
+#[cfg(feature = "test-seams")]
+std::thread_local! {
+    static VECTOR_CANDIDATE_IDENTITY_DECISION: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether every term of a predicate can be settled by one row's own values.
+/// A subquery reads another table, so it cannot.
+fn predicate_is_answerable_from_one_row(expr: &Expr) -> bool {
+    match expr {
+        Expr::InSubquery { .. } => false,
+        Expr::BinaryOp { left, right, .. } => {
+            predicate_is_answerable_from_one_row(left)
+                && predicate_is_answerable_from_one_row(right)
+        }
+        Expr::UnaryOp { operand, .. } => predicate_is_answerable_from_one_row(operand),
+        Expr::IsNull { expr, .. } => predicate_is_answerable_from_one_row(expr),
+        Expr::Like { expr, .. } => predicate_is_answerable_from_one_row(expr),
+        Expr::InList { expr, list, .. } => {
+            predicate_is_answerable_from_one_row(expr)
+                && list.iter().all(predicate_is_answerable_from_one_row)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().all(predicate_is_answerable_from_one_row),
+        _ => true,
+    }
+}
+
+fn note_vector_candidate_identity(
+    reason: &'static str,
+) -> std::result::Result<(), BoundedExecutionError> {
+    #[cfg(feature = "test-seams")]
+    VECTOR_CANDIDATE_IDENTITY_DECISION.with(|slot| slot.borrow_mut().push(reason));
+    let _ = reason;
+    Ok(())
+}
+
+/// Take and clear what this thread's vector candidate sources decided.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn take_vector_candidate_identity_decisions_for_test() -> Vec<&'static str> {
+    VECTOR_CANDIDATE_IDENTITY_DECISION.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
 /// Index membership can supply identities directly when every conjunct is
 /// enforced by the selected key. Residual predicates and authorization keep
 /// their normal charged row reads.
@@ -8380,22 +9520,37 @@ fn select_vector_candidate_identity_source(
     context: &Arc<RequestContext>,
 ) -> std::result::Result<(), BoundedExecutionError> {
     let PullKind::Scan(state) = &mut root.kind else {
-        return Ok(());
+        return note_vector_candidate_identity("candidate source is not a scan");
     };
     state.vector_candidate_source = true;
-    if access_filter || state.ordered_merge.is_some() {
-        return Ok(());
+    if state.ordered_merge.is_some() {
+        return note_vector_candidate_identity("candidate source merges ordered runs");
+    }
+    // A read gate the candidate index already answers is decided by the index
+    // range itself: the reader's Context and scope-label restrictions were
+    // folded into this scan's filter before it was planned, and `covered`
+    // below refuses this route unless every term of that filter is served from
+    // the index key. What an index cannot answer is a grant lookup, which
+    // reads another table once per row, so an ACL-gated table keeps its row
+    // route. Every identity this route delivers still passes the real row gate
+    // where it is published; selecting a tuple never grants access.
+    if access_filter
+        && db
+            .table_meta(&state.table)
+            .is_some_and(|meta| meta.columns.iter().any(|column| column.acl_ref.is_some()))
+    {
+        return note_vector_candidate_identity("table entitlement is a grant lookup");
     }
     let Some(filter) = state.filter.as_ref() else {
-        return Ok(());
+        return note_vector_candidate_identity("candidate source carries no predicate");
     };
     let pick = match &state.mode {
-        ScanMode::Index { pick, .. } if pick.columns.len() == 1 => pick,
+        ScanMode::Index { pick, .. } => pick,
         ScanMode::Exact { .. } => match state.residual_pick.as_ref() {
             Some(pick) => pick,
-            None => return Ok(()),
+            None => return note_vector_candidate_identity("exact source has no residual pick"),
         },
-        _ => return Ok(()),
+        _ => return note_vector_candidate_identity("candidate source is not an index source"),
     };
     // One driving shape does not prove every predicate on that column. Keep
     // repeated terms on the row route, where the complete expression runs.
@@ -8406,11 +9561,90 @@ fn select_vector_candidate_identity_source(
                 op: BinOp::And,
                 right,
             } => column_terms(left, column) + column_terms(right, column),
-            Expr::BinaryOp { left, .. } | Expr::InList { expr: left, .. } => {
-                usize::from(matches!(left.as_ref(), Expr::Column(c) if c.column == column))
-            }
+            Expr::BinaryOp { left, .. } | Expr::InList { expr: left, .. } => match left.as_ref() {
+                Expr::Row(elements) => elements
+                    .iter()
+                    .filter(|element| matches!(element, Expr::Column(c) if c.column == column))
+                    .count(),
+                left => usize::from(matches!(left, Expr::Column(c) if c.column == column)),
+            },
             _ => 0,
         }
+    }
+    // The declared type a bound value arrives with, when it is one the index
+    // compares without coercion.
+    fn value_type(value: &Expr, state: &ScanState) -> Option<ColumnType> {
+        match value {
+            Expr::Literal(Literal::Text(_)) => Some(ColumnType::Text),
+            Expr::Literal(Literal::Integer(_)) => Some(ColumnType::Integer),
+            Expr::Literal(Literal::Bool(_)) => Some(ColumnType::Boolean),
+            Expr::Literal(Literal::Real(value)) if value.is_finite() => Some(ColumnType::Real),
+            Expr::Parameter(name) => match state.params.get(name) {
+                Some(Value::Text(_)) => Some(ColumnType::Text),
+                Some(Value::Int64(_)) => Some(ColumnType::Integer),
+                Some(Value::Bool(_)) => Some(ColumnType::Boolean),
+                Some(Value::Float64(value)) if value.is_finite() => Some(ColumnType::Real),
+                Some(Value::Uuid(_)) => Some(ColumnType::Uuid),
+                Some(Value::Timestamp(_)) => Some(ColumnType::Timestamp),
+                Some(Value::TxId(_)) => Some(ColumnType::TxId),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    // A row-value list is served by the index only as the pick's own tuple
+    // prefix: its columns are exactly the leading pushed columns, each named
+    // by no other term, and every listed value has its column's type.
+    fn row_list_covered(
+        columns: &[Expr],
+        list: &[Expr],
+        state: &ScanState,
+        pick: &IndexPick,
+    ) -> bool {
+        let Some(tuples) = pick.tuple_prefix() else {
+            return false;
+        };
+        let arity = tuples.first().map_or(columns.len(), Vec::len);
+        if arity != columns.len() || pick.pushed_columns.len() < arity {
+            return false;
+        }
+        let mut types = Vec::with_capacity(columns.len());
+        for element in columns {
+            let Expr::Column(column) = element else {
+                return false;
+            };
+            if !pick.pushed_columns[..arity]
+                .iter()
+                .any(|name| name == &column.column)
+                || state
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| column_terms(filter, &column.column) != 1)
+            {
+                return false;
+            }
+            let Some(meta) = state
+                .meta
+                .columns
+                .iter()
+                .find(|meta| meta.name == column.column)
+            else {
+                return false;
+            };
+            if meta.column_type == ColumnType::Real {
+                return false;
+            }
+            types.push(meta.column_type.clone());
+        }
+        list.iter().all(|item| {
+            let Expr::Row(values) = item else {
+                return false;
+            };
+            values.len() == types.len()
+                && values.iter().zip(&types).all(|(value, column_type)| {
+                    value_type(value, state).as_ref() == Some(column_type)
+                })
+        })
     }
     // SQL comparisons that need coercion, NULL/NaN exclusion or residual
     // expression evaluation retain their charged row reads.
@@ -8438,12 +9672,11 @@ fn select_vector_candidate_identity_source(
                 expr,
                 list,
                 negated: false,
-            } => {
-                let Expr::Column(column) = expr.as_ref() else {
-                    return false;
-                };
-                (column.column.as_str(), list.as_slice())
-            }
+            } => match expr.as_ref() {
+                Expr::Column(column) => (column.column.as_str(), list.as_slice()),
+                Expr::Row(columns) => return row_list_covered(columns, list, state, pick),
+                _ => return false,
+            },
             _ => return false,
         };
         if !pick.pushed_columns.iter().any(|name| name == column) {
@@ -8465,52 +9698,300 @@ fn select_vector_candidate_identity_source(
         } = expr
         {
             // The total index order includes NULL and NaN, which SQL ordered
-            // comparisons exclude. A non-REAL lower bound excludes NULL; an
-            // upper-only bound needs the declaration's NOT NULL guarantee.
+            // comparisons exclude. NULL is the physical tail in ascending
+            // order and the physical head in descending order, so a lower
+            // SQL bound (`>` / `>=`) reaches it in either direction. Keep
+            // nullable lower-bound ranges on the row-checking route.
             if meta.column_type == ColumnType::Real
-                || (meta.nullable && matches!(op, BinOp::Lt | BinOp::Lte))
+                || (meta.nullable && matches!(op, BinOp::Gt | BinOp::Gte))
             {
                 return false;
             }
         }
-        values.iter().all(|value| {
-            let value_type = match value {
-                Expr::Literal(Literal::Text(_)) => Some(ColumnType::Text),
-                Expr::Literal(Literal::Integer(_)) => Some(ColumnType::Integer),
-                Expr::Literal(Literal::Bool(_)) => Some(ColumnType::Boolean),
-                Expr::Literal(Literal::Real(value)) if value.is_finite() => Some(ColumnType::Real),
-                Expr::Parameter(name) => match state.params.get(name) {
-                    Some(Value::Text(_)) => Some(ColumnType::Text),
-                    Some(Value::Int64(_)) => Some(ColumnType::Integer),
-                    Some(Value::Bool(_)) => Some(ColumnType::Boolean),
-                    Some(Value::Float64(value)) if value.is_finite() => Some(ColumnType::Real),
-                    Some(Value::Uuid(_)) => Some(ColumnType::Uuid),
-                    Some(Value::Timestamp(_)) => Some(ColumnType::Timestamp),
-                    Some(Value::TxId(_)) => Some(ColumnType::TxId),
-                    _ => None,
-                },
-                _ => None,
-            };
-            value_type.as_ref() == Some(&meta.column_type)
-        })
+        values
+            .iter()
+            .all(|value| value_type(value, state).as_ref() == Some(&meta.column_type))
     }
     if !covered(filter, state, pick) {
-        return Ok(());
+        return note_vector_candidate_identity("a predicate is not served from the index key");
     }
+    // A finite equality/IN tuple is expanded into exact physical runs. A
+    // range on a composite prefix has only a partial-key seek edge, so it
+    // must retain the ordinary per-row predicate check.
+    let finite_composite_run = pick.columns.len() == 1
+        || std::iter::once(&pick.shape)
+            .chain(&pick.suffix_shapes)
+            .all(|shape| {
+                matches!(
+                    shape,
+                    IndexPredicateShape::Equality(_)
+                        | IndexPredicateShape::InList(_)
+                        | IndexPredicateShape::IsNull
+                )
+            });
+    if !finite_composite_run {
+        return note_vector_candidate_identity("the index run is not a finite composite");
+    }
+    // An identities-only candidate IS the answer on this route: no row body is
+    // read, so the posting itself has to have been authenticated against the
+    // committed content root before it is delivered. The exact source walks the
+    // physical posting table alone, which on the file route means a posting
+    // deleted behind that root silently removes an allowed candidate and one
+    // added behind it silently joins the candidate set. So the same finite keys
+    // are re-planned onto the authenticated ordered route: one closed run per
+    // probed key, over the same physical index in the same order, delivered
+    // through the bounded window proof and its per-window physical
+    // reconciliation -- the route every other authenticated range already
+    // takes. In-process reads keep the exact source: they have no committed
+    // content root to authenticate against, and a single-column automatic index
+    // is stored there as an exact hash with no ordered tree to walk.
+    let replanned_exact_pick = matches!(state.mode, ScanMode::Exact { .. })
+        .then(|| pick.clone())
+        .filter(|_| db.retained_relational_membership_source());
     if let Some(tx) = state.transaction.as_mut()
         && !resolve_candidate_delete_membership(db, &state.table, state.snapshot, tx, context)?
     {
         return Ok(());
     }
+    if let Some(pick) = replanned_exact_pick {
+        let ScanMode::Exact { index, .. } = &state.mode else {
+            unreachable!("the exact pick was taken from an exact source");
+        };
+        let index = index.clone();
+        let (column, direction) = pick.columns.first().cloned().ok_or_else(|| {
+            Error::Other(format!(
+                "exact automatic index {index} has no leading column"
+            ))
+        })?;
+        // Admitted before the runs are built, and handed back as soon as they
+        // exist: what the cursor ends up holding is charged by the continuation
+        // this kernel is reconciled to, exactly as the declared-index route
+        // charges it.
+        let planned = crate::executor::planned_index_run_construction_bytes(&pick)?;
+        context.reserve(BoundedWorkSource::TableScan, planned)?;
+        let runs = match crate::executor::expanded_index_runs(&pick) {
+            Ok(runs) => runs,
+            Err(error) => {
+                context.release(planned)?;
+                return Err(error.into());
+            }
+        };
+        let cursor = BoundedOrderedRowCursor::for_index(index.clone(), false).seeking_runs(runs);
+        context.release(planned)?;
+        // The pick moves into the mode, so the continuation counts it once.
+        state.residual_pick = None;
+        state.authenticated_exact_index = Some(index);
+        state.mode = ScanMode::Index {
+            pick,
+            column,
+            direction,
+            cursor,
+        };
+    }
     match &mut state.mode {
         ScanMode::Exact { cursor, .. } => cursor.select_identities_only(),
         ScanMode::Index { cursor, .. } => cursor.select_identities_only(),
-        _ => return Ok(()),
+        _ => return note_vector_candidate_identity("candidate source has no identity cursor"),
     }
+    note_vector_candidate_identity("identities only")?;
+    // Everything above has proved this range is inside what the reader may
+    // see. Either the reader's own restrictions were folded into this scan's
+    // filter and `covered` just proved every term of it is served from the
+    // index key, or they were left out because the statement's own finite
+    // terms on those columns were already a subset of them -- and those terms
+    // are covered too. A grant column, the one restriction an index cannot
+    // answer, took the row route long before here. So a candidate drawn from
+    // this range needs no row of its own to be judged by; the row that is
+    // published is still judged, where it is published.
+    state.gate_answered_by_candidate_range = access_filter;
     state.identities_only = true;
     state.schema_columns.clear();
     root.columns.truncate(1);
     Ok(())
+}
+
+/// The partitions a candidate scan's runs name, when the scan would admit
+/// every live vector of exactly those partitions and nothing else.
+///
+/// The scan is already proved to be served entirely from one index key: every
+/// term of its filter is a finite set over a pushed key column (see
+/// `select_vector_candidate_identity_source`). When its leading pushed columns
+/// are exactly the vector column's partition key, the runs name whole
+/// partitions, and every further pushed column is boolean, then what the
+/// filter rejects inside a named partition is a finite set of key prefixes --
+/// the complement of each column's admitted values. If the committed index
+/// proves every one of those prefixes empty, the filter admits the whole
+/// partition. The search can then walk those partitions directly, and the scan
+/// never enumerates a posting: its work no longer grows with how many rows the
+/// reader may see.
+///
+/// `None` whenever any of that is not proved -- a non-boolean residual, a
+/// probe that did not fit, a partition holding a row the filter rejects. The
+/// caller then keeps the scan, which proves its candidates window by window.
+fn candidate_runs_admit_whole_partitions(
+    db: &dyn ReadExecutionTarget,
+    root: &PullNode,
+    meta: &TableMeta,
+    partition_keys: &[String],
+    scope: Option<&[VectorPartitionKey]>,
+    context: &Arc<RequestContext>,
+) -> std::result::Result<Option<Vec<VectorPartitionKey>>, BoundedExecutionError> {
+    let PullKind::Scan(state) = &root.kind else {
+        return Ok(None);
+    };
+    if !state.identities_only || !db.retained_relational_membership_source() {
+        return Ok(None);
+    }
+    let ScanMode::Index { pick, .. } = &state.mode else {
+        return Ok(None);
+    };
+    let leading = partition_keys.len();
+    if leading == 0
+        || pick.pushed_columns.len() < leading
+        || !pick.pushed_columns[..leading]
+            .iter()
+            .all(|column| partition_keys.contains(column))
+        || !matches!(pick.tuple_arity(), 0) && pick.tuple_arity() != leading
+    {
+        return Ok(None);
+    }
+    let shapes = std::iter::once(&pick.shape)
+        .chain(&pick.suffix_shapes)
+        .collect::<Vec<_>>();
+    // What each boolean suffix column admits, and what it rejects.
+    let mut admitted = Vec::with_capacity(shapes.len() - leading);
+    let mut rejected = Vec::with_capacity(shapes.len() - leading);
+    for (shape, (column, _)) in shapes.iter().zip(&pick.columns).skip(leading) {
+        let Some(values) = super::finite_shape_values(shape) else {
+            return Ok(None);
+        };
+        let Some(declared) = meta
+            .columns
+            .iter()
+            .find(|candidate| &candidate.name == column)
+        else {
+            return Ok(None);
+        };
+        if declared.column_type != ColumnType::Boolean {
+            return Ok(None);
+        }
+        let mut domain = vec![Value::Bool(false), Value::Bool(true)];
+        if declared.nullable {
+            domain.push(Value::Null);
+        }
+        let admits = |candidate: &Value| values.iter().any(|value| value == candidate);
+        rejected.push(
+            domain
+                .iter()
+                .filter(|candidate| !admits(candidate))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        admitted.push(
+            domain
+                .into_iter()
+                .filter(|candidate| admits(candidate))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let directed = |value: &Value, direction: contextdb_core::SortDirection| match direction {
+        contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value.clone())),
+        contextdb_core::SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value.clone())),
+    };
+    let mut partitions = BTreeSet::<IndexKey>::new();
+    for (start, _) in super::expanded_index_runs(pick)? {
+        let Bound::Included(key) = start else {
+            return Ok(None);
+        };
+        partitions.insert(key[..leading].to_vec());
+    }
+    // Every prefix the filter rejects inside a named partition: an admitted
+    // value on each earlier suffix column, then a rejected value on this one.
+    let mut probes = Vec::new();
+    for position in 0..rejected.len() {
+        let mut heads = vec![Vec::<DirectedValue>::new()];
+        for (earlier, values) in admitted.iter().enumerate().take(position) {
+            let direction = pick.columns[leading + earlier].1;
+            heads = heads
+                .into_iter()
+                .flat_map(|head| {
+                    values.iter().map(move |value| {
+                        let mut next = head.clone();
+                        next.push(directed(value, direction));
+                        next
+                    })
+                })
+                .collect();
+        }
+        let direction = pick.columns[leading + position].1;
+        for head in heads {
+            for value in &rejected[position] {
+                let mut probe = head.clone();
+                probe.push(directed(value, direction));
+                probes.push(probe);
+            }
+        }
+    }
+    // Every rejected prefix of every named partition, proved empty together:
+    // one pool and one batch of authenticated pages for the statement.
+    let mut prefixes = Vec::with_capacity(partitions.len().saturating_mul(probes.len()));
+    for partition in &partitions {
+        for probe in &probes {
+            let mut prefix = partition.clone();
+            prefix.extend(probe.iter().cloned());
+            prefixes.push(prefix);
+        }
+    }
+    if !prefixes.is_empty() {
+        let empty = db.bounded_verified_index_prefixes_are_empty(
+            &state.table,
+            &pick.name,
+            &prefixes,
+            &mut || context.checkpoint(),
+            &mut || {
+                context.charge(
+                    BoundedWorkSource::IndexRange,
+                    BoundedSourceTouch::IndexEntry,
+                )
+            },
+        )?;
+        if empty != Some(true) {
+            return Ok(None);
+        }
+    }
+    let positions = partition_keys
+        .iter()
+        .map(|key| {
+            pick.pushed_columns[..leading]
+                .iter()
+                .position(|column| column == key)
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(positions) = positions else {
+        return Ok(None);
+    };
+    let mut keys = Vec::with_capacity(partitions.len());
+    for partition in &partitions {
+        let values = positions
+            .iter()
+            .map(|position| match &partition[*position] {
+                DirectedValue::Asc(TotalOrdAsc(value))
+                | DirectedValue::Desc(TotalOrdDesc(value)) => value.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Some(key) = VectorPartitionKey::from_values(&values) else {
+            return Ok(None);
+        };
+        // The partitions searched are never wider than the statement's own
+        // partition scope.
+        if scope.is_some_and(|scope| !scope.contains(&key)) {
+            return Ok(None);
+        }
+        keys.push(key);
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(Some(keys))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8621,6 +10102,41 @@ fn build_vector_kernel<'plan>(
     if let Some(root) = candidate_root.as_mut() {
         select_vector_candidate_identity_source(db, root, access_filter, context)?;
     }
+    let identity_source_index = match candidate_root.as_ref().map(|root| &root.kind) {
+        Some(PullKind::Scan(state)) if state.identities_only => match &state.mode {
+            ScanMode::Index { pick, .. } => Some(pick.name.clone()),
+            _ => state.authenticated_exact_index.clone(),
+        },
+        _ => None,
+    };
+    // A candidate scan that would admit every live vector of the partitions
+    // it names is not run at all: the search walks those partitions whole.
+    // The row gate and the statement's own predicate still judge every row
+    // that is published, and the scan's index still names any row that
+    // contradicts it (`materialize_scored_row`).
+    let whole_partitions = match (
+        candidate_root.as_ref(),
+        vector_column.partition_key_columns.as_deref(),
+    ) {
+        (Some(root), Some(keys)) if context.transaction().is_none() => {
+            candidate_runs_admit_whole_partitions(
+                db,
+                root,
+                &meta,
+                keys,
+                partition_scope
+                    .as_ref()
+                    .and_then(super::VectorPartitionScope::resolved_prefixes),
+                context,
+            )?
+        }
+        _ => None,
+    };
+    let candidate_root_was_kept = whole_partitions.is_none();
+    if !candidate_root_was_kept {
+        note_vector_candidate_identity("candidate runs admit whole partitions")?;
+        candidate_root = None;
+    }
     // What this handle's own transaction has done to these vectors, decided
     // once here rather than asked per entry. Charged before it is held, like
     // the row overlay a scan takes.
@@ -8647,18 +10163,22 @@ fn build_vector_kernel<'plan>(
             }
         });
         let mut admit = |row_id| {
+            note_vector_candidate_identity("directory admit")?;
             let mut retained = 0;
-            let row = db.bounded_row_by_identity(
-                context.transaction(),
-                table,
-                row_id,
-                snapshot,
-                &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
-                &mut |bytes| {
-                    retained = bytes;
-                    context.reserve(BoundedWorkSource::VectorCandidates, bytes)
-                },
-            )?;
+            let row =
+                context.with_source_page_admission(BoundedWorkSource::VectorCandidates, || {
+                    db.bounded_row_by_identity(
+                        context.transaction(),
+                        table,
+                        row_id,
+                        snapshot,
+                        &mut || context.charge_operator(BoundedWorkSource::VectorCandidates),
+                        &mut |bytes| {
+                            retained = bytes;
+                            context.reserve(BoundedWorkSource::VectorCandidates, bytes)
+                        },
+                    )
+                })?;
             let result = (|| {
                 let Some(row) = row.as_ref() else {
                     return Ok(());
@@ -8800,10 +10320,13 @@ fn build_vector_kernel<'plan>(
             _query_bytes: query_bytes,
             k,
             candidate_k,
-            partition_prefixes: partition_scope
-                .as_ref()
-                .and_then(super::VectorPartitionScope::resolved_prefixes)
-                .map(<[VectorPartitionKey]>::to_vec),
+            partition_prefixes: match whole_partitions {
+                Some(partitions) => Some(partitions),
+                None => partition_scope
+                    .as_ref()
+                    .and_then(super::VectorPartitionScope::resolved_prefixes)
+                    .map(<[VectorPartitionKey]>::to_vec),
+            },
             search_mode,
             force_exact_for_relational_fallback: search_mode
                 == contextdb_core::VectorSearchMode::Auto
@@ -8816,8 +10339,10 @@ fn build_vector_kernel<'plan>(
             restricted_candidates,
             snapshot,
             _schema: schema,
+            identity_source_index,
             preparation: VectorPreparation::Candidates(candidate_root),
-            candidate_filter: candidate_plan.is_some() || directory_candidates,
+            candidate_filter: (candidate_plan.is_some() && candidate_root_was_kept)
+                || directory_candidates,
             candidate_ids,
             candidate_bytes,
             source: None,
@@ -9128,7 +10653,7 @@ fn build_scan(
     filter: Option<&Expr>,
     params: Arc<HashMap<String, Value>>,
     snapshot: SnapshotId,
-    ordered: Option<(String, contextdb_core::SortDirection, String, bool)>,
+    ordered: Option<OrderedIndexScan>,
     // The index the CALLER already chose for this table. A caller that has
     // asked the planner which index answers its predicate hands the answer in
     // rather than making the scan ask again -- and a scan that is given no
@@ -9175,7 +10700,7 @@ fn build_scan(
     // shape the writer never wrote then looks indexable -- so the two doors
     // disagree about whether the statement uses an index at all.
     let filter_analysis =
-        filter.map(|filter| analyze_filter_for_index(filter, &meta.indexes, &params));
+        filter.map(|filter| analyze_filter_for_index(table, &meta, filter, &params));
     // A predicate that can match nothing -- contradictory equalities on the
     // same column, a NULL or NaN bound where a value is required, a literal
     // that cannot even be read as the column's type -- answers zero rows
@@ -9198,6 +10723,7 @@ fn build_scan(
     };
     let transaction = scan_transaction_overlay(db, table, context)?;
     let mut ordered_pick = None;
+    let mut ordered_merge_keys = None;
     let mut exact_pick: Option<IndexPick> = None;
     let mut empty_pick: Option<IndexPick> = None;
     let mut mode = if filter_matches_nothing {
@@ -9212,21 +10738,28 @@ fn build_scan(
         // same index returns rows.
         empty_pick = filter_pick.clone();
         ScanMode::Empty
-    } else if let Some((column, direction, index, reverse)) = ordered {
+    } else if let Some(OrderedIndexScan {
+        column,
+        direction,
+        keys: order_keys,
+        index,
+        reverse,
+        predicate_pick,
+        predicate_considered,
+    }) = ordered
+    {
         // The index that serves the order often serves the predicate too.
         // Walking it end to end and rejecting rows afterwards reads the whole
         // index where the executor reads the run the predicate names, so the
         // same statement reports a different examined count through this door.
-        let pick = filter_pick.clone().filter(|pick| pick.name == index);
+        let pick = predicate_pick
+            .or_else(|| filter_pick.clone().filter(|pick| pick.name == index))
+            .map(|pick| db.coerce_pick_shape_to_column_type(table, &pick))
+            .transpose()?;
         let cursor = BoundedOrderedRowCursor::for_index(index, reverse);
         let cursor = match pick.as_ref() {
             Some(pick) => {
-                considered.extend(
-                    filter_analysis
-                        .as_ref()
-                        .map(|analysis| analysis.considered.clone())
-                        .unwrap_or_default(),
-                );
+                considered.extend(predicate_considered);
                 // The run is expressed in the INDEX's physical order, which a
                 // descending leading column reverses -- so the bounds are read
                 // off the index's own declared direction, never off the
@@ -9236,12 +10769,37 @@ fn build_scan(
                     .first()
                     .map(|(_, index_direction)| *index_direction)
                     .unwrap_or(direction);
-                let (run_start, run_end) = declared_index_run(pick, index_direction);
-                cursor.seeking_run(run_start, run_end)
+                if matches!(
+                    pick.shape,
+                    IndexPredicateShape::Equality(_)
+                        | IndexPredicateShape::InList(_)
+                        | IndexPredicateShape::IsNull
+                ) {
+                    let planned = crate::executor::planned_index_run_construction_bytes(pick)?;
+                    context.reserve(BoundedWorkSource::TableScan, planned)?;
+                    let mut runs = match crate::executor::expanded_index_runs(pick) {
+                        Ok(runs) => runs,
+                        Err(error) => {
+                            context.release(planned)?;
+                            return Err(error.into());
+                        }
+                    };
+                    if reverse {
+                        runs.reverse();
+                    }
+                    let cursor = cursor.seeking_runs(runs);
+                    context.release(planned)?;
+                    cursor
+                } else {
+                    let (run_start, run_end, prefix_len) =
+                        declared_index_run(pick, index_direction, reverse);
+                    cursor.seeking_run_with_prefix_len(run_start, run_end, prefix_len)
+                }
             }
             None => cursor,
         };
         ordered_pick = pick;
+        ordered_merge_keys = Some(order_keys);
         ScanMode::Ordered {
             column,
             direction,
@@ -9269,22 +10827,33 @@ fn build_scan(
                 .cloned()
         });
         if let (Some(pick), Some(declaration)) = (pick.as_ref(), declaration.as_ref())
-            && let Some(keys) = crate::executor::exact_probe_keys(declaration.columns.len(), pick)
+            && declaration.kind == contextdb_core::IndexKind::Auto
+            && declaration.columns.len() == 1
         {
-            // A predicate that names whole keys is answered by asking the
-            // index for those keys -- one lookup each, whatever kind of index
-            // it is. Collapsing a list of keys into the span between its
-            // least and greatest member instead reads every key in between
-            // and rejects them afterwards, which reports far more rows
-            // examined for the same answer.
+            // Single-column automatic indexes deliberately retain their exact
+            // hash representation. Admit and build their complete key list
+            // before the cursor can retain it.
+            let planned = crate::executor::planned_index_run_construction_bytes(pick)?;
+            context.reserve(BoundedWorkSource::TableScan, planned)?;
+            let Some(keys) = crate::executor::exact_probe_keys(declaration.columns.len(), pick)
+            else {
+                context.release(planned)?;
+                return Err(
+                    Error::Other("exact automatic index lost its finite key set".into()).into(),
+                );
+            };
+            let cursor = contextdb_relational::mem::BoundedExactIndexCursor::for_keys(keys);
+            context.release(planned)?;
             exact_pick = Some(pick.clone());
             ScanMode::Exact {
                 index: pick.name.clone(),
-                cursor: contextdb_relational::mem::BoundedExactIndexCursor::for_keys(keys),
+                cursor,
             }
         } else if let Some(pick) = pick.filter(|pick| {
             meta.indexes.iter().any(|index| {
-                index.name == pick.name && index.kind == contextdb_core::IndexKind::UserDeclared
+                index.name == pick.name
+                    && (index.kind == contextdb_core::IndexKind::UserDeclared
+                        || index.columns.len() > 1)
             })
         }) {
             let (column, direction) = pick.columns.first().cloned().ok_or_else(|| {
@@ -9295,11 +10864,32 @@ fn build_scan(
             // What the cursor ends up holding is charged by the continuation
             // this kernel is reconciled to, so the admission is handed back
             // as soon as the runs exist and is never counted twice.
-            let planned_runs = planned_pending_run_bytes(&pick)?;
-            context.reserve(BoundedWorkSource::TableScan, planned_runs)?;
-            let cursor = BoundedOrderedRowCursor::for_index(pick.name.clone(), false)
-                .seeking_runs(declared_index_runs(&pick, direction));
-            context.release(planned_runs)?;
+            let cursor = BoundedOrderedRowCursor::for_index(pick.name.clone(), false);
+            let cursor = if matches!(
+                pick.shape,
+                IndexPredicateShape::Equality(_)
+                    | IndexPredicateShape::InList(_)
+                    | IndexPredicateShape::IsNull
+            ) {
+                let planned_pending = crate::executor::planned_pending_run_bytes(&pick)?;
+                let planned_construction =
+                    crate::executor::planned_index_run_construction_bytes(&pick)?;
+                context.reserve(BoundedWorkSource::TableScan, planned_construction)?;
+                let runs = match crate::executor::expanded_index_runs(&pick) {
+                    Ok(runs) => runs,
+                    Err(error) => {
+                        context.release(planned_construction)?;
+                        return Err(error.into());
+                    }
+                };
+                let cursor = cursor.seeking_runs(runs);
+                debug_assert_eq!(cursor.pending_run_bytes(), planned_pending);
+                context.release(planned_construction)?;
+                cursor
+            } else {
+                let (run_start, run_end, prefix_len) = declared_index_run(&pick, direction, false);
+                cursor.seeking_run_with_prefix_len(run_start, run_end, prefix_len)
+            };
             ScanMode::Index {
                 cursor,
                 pick,
@@ -9321,15 +10911,9 @@ fn build_scan(
     // An ordered walk with a transaction open folds the transaction's own
     // rows into the run rather than giving the run up for a sort of the
     // whole table.
-    let ordered_merge = match (&mode, transaction.is_some()) {
-        (
-            ScanMode::Ordered {
-                column, direction, ..
-            },
-            true,
-        ) => Some(OrderedMerge {
-            column: column.clone(),
-            direction: *direction,
+    let ordered_merge = match (ordered_merge_keys, transaction.is_some()) {
+        (Some(keys), true) => Some(OrderedMerge {
+            keys,
             staged: None,
             deferred: None,
             held_bytes: 0,
@@ -9408,9 +10992,10 @@ fn build_scan(
         },
         kind: PullKind::Scan(ScanState {
             identities_only: false,
+            gate_answered_by_candidate_range: false,
             vector_candidate_source: false,
             table: table.to_string(),
-            meta,
+            meta: Arc::new(meta),
             schema_columns,
             filter: resolved_filter,
             params,
@@ -9418,6 +11003,7 @@ fn build_scan(
             mode,
             cursor_key_bytes: 0,
             residual_pick: ordered_pick.or(exact_pick),
+            authenticated_exact_index: None,
             committed_source_offers_every_row: offers_every_committed_row,
             pending_row: None,
             supplement_columns: Vec::new(),
@@ -9510,6 +11096,11 @@ fn collect_expr_columns(expr: &Expr, into: &mut std::collections::BTreeSet<Strin
         Expr::Like { expr, .. } => collect_expr_columns(expr, into),
         Expr::InList { expr, .. } => collect_expr_columns(expr, into),
         Expr::InSubquery { expr, .. } => collect_expr_columns(expr, into),
+        Expr::Row(elements) => {
+            for element in elements {
+                collect_expr_columns(element, into);
+            }
+        }
         _ => {}
     }
 }
@@ -9539,12 +11130,34 @@ fn build_store_state(
     plan: &PhysicalPlan,
     context: &Arc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
+    // `SHOW MEMORY_LIMIT` / `SHOW DISK_LIMIT` are the operator's one way to see
+    // and then raise a budget that is already exhausted -- the same recovery
+    // path `redb_writer_cache_bytes_for_limit`'s own floor exists to protect
+    // ("a store declaring 1 KiB ... could not serve even the read that would
+    // raise the limit again"). Their answer is one row of a few fixed-width
+    // integers, never a table's worth of data, so it is exempt from the
+    // ordinary per-row budget charge that every other store-state answer
+    // still pays: an operator locked out of seeing their own limit has no way
+    // left to raise it.
+    let is_self_recovery_answer = matches!(
+        plan,
+        PhysicalPlan::ShowMemoryLimit | PhysicalPlan::ShowDiskLimit
+    );
     let answered = db.store_state_answer(plan)?;
     let mut rows = VecDeque::new();
     for values in answered.rows {
-        context.charge(BoundedWorkSource::TableScan, BoundedSourceTouch::TableRow)?;
-        let retained_bytes = value_refs_retained_bytes(values.iter(), values.len())?;
-        context.reserve(BoundedWorkSource::TableScan, retained_bytes)?;
+        // A row this function never reserved must never be released either:
+        // `PulledRow::release` unconditionally hands `retained_bytes` back to
+        // `context` when the row is consumed, so a self-recovery answer's row
+        // is stamped with a zero charge here, not merely an unreserved one.
+        let retained_bytes = if is_self_recovery_answer {
+            0
+        } else {
+            let retained_bytes = value_refs_retained_bytes(values.iter(), values.len())?;
+            context.charge(BoundedWorkSource::TableScan, BoundedSourceTouch::TableRow)?;
+            context.reserve(BoundedWorkSource::TableScan, retained_bytes)?;
+            retained_bytes
+        };
         rows.push_back(PulledRow {
             values,
             retained_bytes,
@@ -9599,8 +11212,10 @@ fn build_direct_index_scan(
             shape,
             pushed_column: leading_column.clone(),
             pushed_columns: vec![leading_column.clone()],
-            suffix_values: Vec::new(),
+            suffix_shapes: Vec::new(),
+            tuple_prefix: None,
             prefix_empty: false,
+            probe_values_normalized: false,
         },
     )?;
     let schema_columns = meta
@@ -9616,16 +11231,17 @@ fn build_direct_index_scan(
     // the whole table for a query the trace calls an index scan. An index the
     // engine synthesized is not a run this scan can seek, so its predicate
     // stays a residual the physical walk applies to every row it sees.
-    let declared = declaration.kind == contextdb_core::IndexKind::UserDeclared;
-    let residual_pick = (!declared).then(|| pick.clone());
-    let mut mode = if declared {
-        let (run_start, run_end) = declared_index_run(&pick, direction);
+    let ordered = declaration.kind == contextdb_core::IndexKind::UserDeclared
+        || declaration.columns.len() > 1;
+    let residual_pick = (!ordered).then(|| pick.clone());
+    let mut mode = if ordered {
+        let (run_start, run_end, prefix_len) = declared_index_run(&pick, direction, false);
         ScanMode::Index {
             pick,
             column: leading_column,
             direction,
             cursor: BoundedOrderedRowCursor::for_index(index.to_string(), false)
-                .seeking_run(run_start, run_end),
+                .seeking_run_with_prefix_len(run_start, run_end, prefix_len),
         }
     } else {
         ScanMode::Physical {
@@ -9645,9 +11261,10 @@ fn build_direct_index_scan(
         },
         kind: PullKind::Scan(ScanState {
             identities_only: false,
+            gate_answered_by_candidate_range: false,
             vector_candidate_source: false,
             table: table.to_string(),
-            meta,
+            meta: Arc::new(meta),
             schema_columns,
             filter: None,
             params,
@@ -9655,6 +11272,7 @@ fn build_direct_index_scan(
             mode,
             cursor_key_bytes: 0,
             residual_pick,
+            authenticated_exact_index: None,
             committed_source_offers_every_row: offers_every_committed_row,
             pending_row: None,
             supplement_columns: Vec::new(),
@@ -9665,49 +11283,104 @@ fn build_direct_index_scan(
     })
 }
 
-#[allow(clippy::type_complexity)]
 fn ordered_scan<'a>(
     db: &dyn ReadExecutionTarget,
     input: &'a PhysicalPlan,
     keys: &'a [SortKey],
-) -> Option<(
-    &'a str,
-    Option<&'a Expr>,
-    String,
-    contextdb_core::SortDirection,
-    String,
-    bool,
-)> {
+    params: &HashMap<String, Value>,
+) -> Option<(&'a str, Option<&'a Expr>, OrderedIndexScan)> {
     let PhysicalPlan::Scan { table, filter, .. } = input else {
         return None;
     };
     // Which index answers an ORDER BY without sorting is the executor's own
-    // decision, asked here rather than decided again. Deciding it twice is how
-    // one door sorts where the other does not.
-    let decl = crate::executor::sort_elision_index_decl(db, input, keys)?;
-    let (column, index_direction) = decl.columns.first()?.clone();
-    // The rule above matched EVERY sort key against the index's own columns in
-    // order, so walking the index answers all of them; the leading key is the
-    // one the walk is named by. Insisting on a single key here refused an
-    // ORDER BY over a composite index that the other door answers from the
-    // index alone.
-    let key = keys.first()?;
-    let direction = match key.direction {
-        SortDirection::Asc => contextdb_core::SortDirection::Asc,
-        SortDirection::Desc => contextdb_core::SortDirection::Desc,
-        SortDirection::CosineDistance => return None,
+    // decision, asked here rather than decided again. A WHERE that pins the
+    // leading equality prefix leaves the following index column ordered, so
+    // it asks the same prefix rule as the eager executor instead of falling
+    // through to a buffered sort.
+    let decl = crate::executor::sort_elision_index_decl(db, input, keys).or_else(|| {
+        let filter = filter.as_ref()?;
+        let meta = db.table_meta(table)?;
+        let pick = crate::executor::analyze_filter_for_index_with_sort(
+            table,
+            &meta,
+            filter,
+            params,
+            Some(keys),
+            true,
+        )
+        .pick?;
+        meta.indexes
+            .iter()
+            .find(|decl| {
+                decl.name == pick.name
+                    && crate::executor::sort_keys_match_index_prefix_in_either_direction(
+                        db, input, &decl.name, keys,
+                    )
+            })
+            .cloned()
+    })?;
+    let (column, leading_direction) = decl.columns.first()?.clone();
+    let order_keys = keys
+        .iter()
+        .map(|key| {
+            let direction = match key.direction {
+                SortDirection::Asc => contextdb_core::SortDirection::Asc,
+                SortDirection::Desc => contextdb_core::SortDirection::Desc,
+                SortDirection::CosineDistance => return None,
+            };
+            let column = match &key.expr {
+                Expr::Column(reference) => reference.column.clone(),
+                _ => return None,
+            };
+            Some((column, direction))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (order_column, order_direction) = order_keys.first()?;
+    let order_index_direction = decl
+        .columns
+        .iter()
+        .find(|(candidate, _)| candidate == order_column)
+        .map(|(_, direction)| *direction)?;
+    let reverse = order_index_direction != *order_direction;
+    // The ordered route must bind the predicate against the index it will
+    // actually walk. A predicate-only winner can be a different index, which
+    // otherwise turns a selective ordered query into a full ordered scan.
+    let sort_analysis = filter.as_ref().and_then(|filter| {
+        let meta = db.table_meta(table)?;
+        Some(crate::executor::analyze_filter_for_index_with_sort(
+            table,
+            &meta,
+            filter,
+            params,
+            Some(keys),
+            true,
+        ))
+    });
+    let predicate_pick = sort_analysis
+        .as_ref()
+        .and_then(|analysis| analysis.pick.clone())
+        .filter(|pick| pick.name == decl.name);
+    let predicate_considered = sort_analysis.map_or_else(Vec::new, |analysis| analysis.considered);
+    let direction = if reverse {
+        match leading_direction {
+            contextdb_core::SortDirection::Asc => contextdb_core::SortDirection::Desc,
+            contextdb_core::SortDirection::Desc => contextdb_core::SortDirection::Asc,
+        }
+    } else {
+        leading_direction
     };
-    // The rule above already matched every key's direction against the index,
-    // so the run is walked forward; a reversed walk would mean the two doors
-    // disagreed about the order.
-    let _ = index_direction;
     Some((
         table.as_str(),
         filter.as_ref(),
-        column,
-        direction,
-        decl.name.clone(),
-        false,
+        OrderedIndexScan {
+            column,
+            direction,
+            keys: order_keys,
+            index: decl.name.clone(),
+            reverse,
+            predicate_pick,
+            predicate_considered,
+        },
     ))
 }
 
@@ -9715,80 +11388,24 @@ fn ordered_scan<'a>(
 /// on the leading indexed component. A shape that names no run — an exclusion,
 /// or a prefix already known to be empty — declares none, and the source walks
 /// as it would with no predicate at all.
-/// The runs of index keys a predicate names, in the order it named them.
-///
-/// A predicate naming a LIST of values names one run per listed value, which
-/// is how the other door reads it: `execute_index_scan` probes each listed
-/// value's prefix in turn (`executor.rs`≈:7071) rather than reading from the
-/// least listed value to the greatest and rejecting everything in between.
-/// Reading the span costs every key between two listed values -- six rows
-/// asked for, nine read, for a list of two on a table holding five values.
-/// Every other predicate shape names exactly one run.
-/// What the runs a list predicate leaves in the cursor will hold, worked out
-/// from the predicate itself so the memory is admitted BEFORE it is built. A
-/// predicate naming a list of values names one run per value; the walk takes
-/// the first straight away and keeps the rest, and each kept run copies its
-/// value into both of its edges.
-fn planned_pending_run_bytes(
-    pick: &IndexPick,
-) -> std::result::Result<usize, BoundedExecutionError> {
-    let IndexPredicateShape::InList(values) = &pick.shape else {
-        return Ok(0);
-    };
-    if pick.prefix_empty || values.len() < 2 {
-        return Ok(0);
-    }
-    let mut bytes = checked_size_mul(
-        values.len() - 1,
-        std::mem::size_of::<(Bound<DirectedValue>, Bound<DirectedValue>)>(),
-        "index run bounds",
-    )?;
-    for value in values.iter().skip(1) {
-        let edges = checked_size_mul(value.estimated_bytes(), 2, "index run bound")?;
-        bytes = checked_size_add(bytes, edges, "index run bounds")?;
-    }
-    Ok(bytes)
-}
-
-fn declared_index_runs(
-    pick: &IndexPick,
-    direction: contextdb_core::SortDirection,
-) -> Vec<(Bound<DirectedValue>, Bound<DirectedValue>)> {
-    let directed = |value: &Value| match direction {
-        contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value.clone())),
-        contextdb_core::SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value.clone())),
-    };
-    match &pick.shape {
-        IndexPredicateShape::InList(values) if !pick.prefix_empty && !values.is_empty() => values
-            .iter()
-            .map(|value| {
-                (
-                    Bound::Included(directed(value)),
-                    Bound::Included(directed(value)),
-                )
-            })
-            .collect(),
-        _ => vec![declared_index_run(pick, direction)],
-    }
-}
-
 fn declared_index_run(
     pick: &IndexPick,
     direction: contextdb_core::SortDirection,
-) -> (Bound<DirectedValue>, Bound<DirectedValue>) {
-    let directed = |value: &Value| match direction {
+    reverse: bool,
+) -> (Bound<IndexKey>, Bound<IndexKey>, usize) {
+    let directed = |value: &Value, direction| match direction {
         contextdb_core::SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(value.clone())),
         contextdb_core::SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(value.clone())),
     };
     let ordered = |lower: &Bound<Value>, upper: &Bound<Value>| {
         let low = match lower {
-            Bound::Included(value) => Bound::Included(directed(value)),
-            Bound::Excluded(value) => Bound::Excluded(directed(value)),
+            Bound::Included(value) => Bound::Included(vec![directed(value, direction)]),
+            Bound::Excluded(value) => Bound::Excluded(vec![directed(value, direction)]),
             Bound::Unbounded => Bound::Unbounded,
         };
         let high = match upper {
-            Bound::Included(value) => Bound::Included(directed(value)),
-            Bound::Excluded(value) => Bound::Excluded(directed(value)),
+            Bound::Included(value) => Bound::Included(vec![directed(value, direction)]),
+            Bound::Excluded(value) => Bound::Excluded(vec![directed(value, direction)]),
             Bound::Unbounded => Bound::Unbounded,
         };
         // A descending component stores the largest value first, so the run
@@ -9799,38 +11416,97 @@ fn declared_index_run(
         }
     };
     if pick.prefix_empty {
-        return (Bound::Unbounded, Bound::Unbounded);
+        return (Bound::Unbounded, Bound::Unbounded, 0);
     }
-    match &pick.shape {
-        IndexPredicateShape::Equality(value) => (
-            Bound::Included(directed(value)),
-            Bound::Included(directed(value)),
-        ),
-        IndexPredicateShape::IsNull => (
-            Bound::Included(directed(&Value::Null)),
-            Bound::Included(directed(&Value::Null)),
-        ),
-        IndexPredicateShape::Range { lower, upper } => ordered(lower, upper),
+    let (start, mut end, prefix_len) = match &pick.shape {
+        IndexPredicateShape::Equality(_) | IndexPredicateShape::IsNull => {
+            let mut runs = crate::executor::expanded_index_runs(pick).unwrap_or_default();
+            if let Some((start, end)) = runs.pop() {
+                (start, end, 1 + pick.suffix_shapes.len())
+            } else {
+                (Bound::Unbounded, Bound::Unbounded, 0)
+            }
+        }
+        IndexPredicateShape::Range { lower, upper } => {
+            let (start, end) = ordered(lower, upper);
+            (start, end, 1)
+        }
         IndexPredicateShape::InList(values) => {
-            let mut edges = values.iter().map(directed).collect::<Vec<_>>();
+            let mut edges = values
+                .iter()
+                .map(|value| directed(value, direction))
+                .collect::<Vec<_>>();
             edges.sort();
             match (edges.first(), edges.last()) {
                 (Some(first), Some(last)) => (
-                    Bound::Included(first.clone()),
-                    Bound::Included(last.clone()),
+                    Bound::Included(vec![first.clone()]),
+                    Bound::Included(vec![last.clone()]),
+                    1,
                 ),
-                _ => (Bound::Unbounded, Bound::Unbounded),
+                _ => (Bound::Unbounded, Bound::Unbounded, 0),
             }
         }
         IndexPredicateShape::NotEqual(_) | IndexPredicateShape::IsNotNull => {
-            (Bound::Unbounded, Bound::Unbounded)
+            (Bound::Unbounded, Bound::Unbounded, 0)
         }
+    };
+    if reverse {
+        pad_reverse_inclusive_end(pick, &mut end);
     }
+    (start, end, prefix_len)
+}
+
+/// Complete an inclusive physical upper edge when every missing component
+/// has the same NULL-high representation. The logical predicate prefix stays
+/// separate, so the sentinel affects only where a reverse walk starts.
+fn pad_reverse_inclusive_end(pick: &IndexPick, end: &mut Bound<IndexKey>) {
+    let Bound::Included(edge) = end else {
+        return;
+    };
+    let edge_len = edge.len();
+    if edge_len >= pick.columns.len()
+        || !pick
+            .columns
+            .iter()
+            .skip(edge_len)
+            .all(|(_, direction)| *direction == contextdb_core::SortDirection::Asc)
+    {
+        return;
+    }
+    edge.extend(
+        pick.columns
+            .iter()
+            .skip(edge_len)
+            .map(|_| DirectedValue::Asc(TotalOrdAsc(Value::Null))),
+    );
 }
 
 fn index_key_matches_pick(key: &IndexKey, pick: &IndexPick) -> bool {
     if pick.prefix_empty || key.is_empty() {
         return false;
+    }
+    // A row-value list admits its listed tuples only, not every combination
+    // of their per-column values.
+    if let Some(tuples) = pick.tuple_prefix() {
+        let arity = tuples.first().map_or(0, Vec::len);
+        if key.len() < arity {
+            return false;
+        }
+        let leading = key[..arity]
+            .iter()
+            .map(|value| match value {
+                DirectedValue::Asc(TotalOrdAsc(value))
+                | DirectedValue::Desc(TotalOrdDesc(value)) => value,
+            })
+            .collect::<Vec<_>>();
+        if !tuples.iter().any(|tuple| {
+            tuple
+                .iter()
+                .zip(&leading)
+                .all(|(expected, actual)| values_equal(expected, actual))
+        }) {
+            return false;
+        }
     }
     let mut values = key.iter().map(|value| match value {
         DirectedValue::Asc(TotalOrdAsc(value)) | DirectedValue::Desc(TotalOrdDesc(value)) => value,
@@ -9838,11 +11514,19 @@ fn index_key_matches_pick(key: &IndexKey, pick: &IndexPick) -> bool {
     let Some(value) = values.next() else {
         return false;
     };
-    for expected in &pick.suffix_values {
+    for expected in &pick.suffix_shapes {
         let Some(actual) = values.next() else {
             return false;
         };
-        if !values_equal(expected, actual) {
+        let matches = match expected {
+            IndexPredicateShape::Equality(expected) => values_equal(expected, actual),
+            IndexPredicateShape::InList(expected) => expected
+                .iter()
+                .any(|candidate| values_equal(candidate, actual)),
+            IndexPredicateShape::IsNull => actual == &Value::Null,
+            _ => false,
+        };
+        if !matches {
             return false;
         }
     }
@@ -10307,6 +11991,16 @@ pub(crate) fn kernel_can_answer(plan: &PhysicalPlan) -> bool {
     ensure_supported_plan(plan).is_ok()
 }
 
+struct StatementProofReuse<'a> {
+    db: &'a dyn ReadExecutionTarget,
+}
+
+impl Drop for StatementProofReuse<'_> {
+    fn drop(&mut self) {
+        self.db.release_statement_proof_reuse();
+    }
+}
+
 /// Drain a plan the CALLER already chose, with no ceilings.
 ///
 /// This is the established embedding door's half of the shared kernel: the
@@ -10323,6 +12017,7 @@ pub(crate) fn drain_chosen_plan(
     clock: Arc<dyn DeadlineClock>,
     #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<QueryResult, BoundedExecutionError> {
+    let _release_proofs = StatementProofReuse { db };
     let context = RequestContext::new(
         db,
         uncapped_ceilings(),
@@ -10375,6 +12070,72 @@ pub(crate) fn drain_chosen_plan(
     Ok(result)
 }
 
+fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
+    fn collect(plan: &PhysicalPlan, tables: &mut BTreeSet<String>) {
+        match plan {
+            PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
+                tables.insert(table.clone());
+            }
+            PhysicalPlan::VectorSearch {
+                table,
+                query_expr,
+                candidates,
+                ..
+            }
+            | PhysicalPlan::HnswSearch {
+                table,
+                query_expr,
+                candidates,
+                ..
+            } => {
+                tables.insert(table.clone());
+                if let Expr::RowVectorSource { table, .. } = query_expr {
+                    tables.insert(table.clone());
+                }
+                if let Some(candidates) = candidates {
+                    collect(candidates, tables);
+                }
+            }
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::MaterializeCte { input, .. } => collect(input, tables),
+            PhysicalPlan::Join { left, right, .. } => {
+                collect(left, tables);
+                collect(right, tables);
+            }
+            PhysicalPlan::Union { inputs, .. } | PhysicalPlan::Pipeline(inputs) => {
+                for input in inputs {
+                    collect(input, tables);
+                }
+            }
+            // These nodes can resolve sources through aliases no longer
+            // carried by the final physical node.
+            PhysicalPlan::GraphBfs {
+                start_candidates, ..
+            } => {
+                tables.insert("*".to_owned());
+                if let Some(candidates) = start_candidates {
+                    collect(candidates, tables);
+                }
+            }
+            PhysicalPlan::CteRef { .. } => {
+                tables.insert("*".to_owned());
+            }
+            // Store-state reads can expose table-bound inventories.
+            _ => {
+                tables.insert("*".to_owned());
+            }
+        }
+    }
+
+    let mut tables = BTreeSet::new();
+    collect(plan, &mut tables);
+    tables
+}
+
 pub(super) fn execute(
     db: &dyn ReadExecutionTarget,
     sql: &str,
@@ -10384,6 +12145,7 @@ pub(super) fn execute(
     cancellation: OwnerReadCancellation,
     #[cfg(feature = "test-seams")] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
+    let _release_proofs = StatementProofReuse { db };
     let statement = contextdb_parser::parse(sql)?;
     db.plugin().on_query(sql)?;
     let plugin_started_ms = clock.now_ms();
@@ -10402,13 +12164,14 @@ pub(super) fn execute(
         )?;
         let schema_capture = db.capture_read_schema();
         let membership_capture = db.relational_membership_store().begin_membership_capture();
-        let Some((snapshot, _snapshot_registration)) =
-            db.bounded_read_snapshot_registration(&withdrawn)?
+        let Some((snapshot, publication_lsn, _snapshot_registration)) =
+            db.bounded_read_snapshot_registration(&context.registration_budget(), &withdrawn)?
         else {
             return Err(context.withdrawn_failure());
         };
         #[cfg(feature = "test-seams")]
         if let Some(probe) = context.probe() {
+            probe.registered_snapshot_for_test(snapshot);
             probe.after_snapshot_registration();
         }
         let statement_bytes = statement_capacity_bytes(&statement)?;
@@ -10422,6 +12185,7 @@ pub(super) fn execute(
         let planned_prepared_bytes = checked_size_mul(statement_bytes, 2, "bounded read plan")?;
         context.reserve(BoundedWorkSource::TableScan, planned_prepared_bytes)?;
         let (resolved, plan) = db.prepare_bounded_read_plan(&statement, params)?;
+        let publication = context.publication_scope(publication_lsn, publication_tables(&plan));
         let resolved_bytes = statement_capacity_bytes(&resolved)?;
         ensure_supported_plan(&plan)?;
         let plan_bytes = physical_plan_capacity_bytes(&plan)?;
@@ -10591,6 +12355,7 @@ pub(super) fn execute(
         context.flush_final_progress();
         Ok(BoundedExecutionResult {
             result,
+            publication,
             telemetry: context.telemetry(),
         })
     })();
@@ -10608,6 +12373,8 @@ pub(super) struct CursorState {
     database: Arc<dyn ReadExecutionTarget>,
     _snapshot: SnapshotId,
     _snapshot_registration: Box<dyn Send + Sync>,
+    storage_snapshot: Option<crate::persistence::OwnerCursorStoragePin>,
+    publication: ReadPublicationScope,
     /// The idle window this cursor's registration is judged by. Stamped
     /// beside `last_used_ms` on every page handed back, so removal reads the
     /// same "still entitled to another page" answer `check_expiry` gives.
@@ -10881,7 +12648,16 @@ impl CursorState {
         match self.root.has_more_hint() {
             Some(has_more) => Ok(has_more),
             None if self.context.can_charge_more_work() => {
-                let Some(row) = self.pull_visible_row()? else {
+                let pulled = match self.pull_visible_row() {
+                    Err(error)
+                        if !cursor_replay_work_available()
+                            && self.context.refusal_pauses_this_fetch(&error) =>
+                    {
+                        return Ok(true);
+                    }
+                    pulled => pulled?,
+                };
+                let Some(row) = pulled else {
                     return Ok(false);
                 };
                 self.replay_push_back(row)?;
@@ -11126,7 +12902,21 @@ impl CursorState {
                 )
             })? < row_limit
             {
-                let Some(row) = self.pull_visible_row()? else {
+                if !cursor_replay_work_available() {
+                    page.has_more = true;
+                    break;
+                }
+                let pulled = match self.pull_visible_row() {
+                    Err(error)
+                        if !cursor_replay_work_available()
+                            && self.context.refusal_pauses_this_fetch(&error) =>
+                    {
+                        page.has_more = true;
+                        break;
+                    }
+                    pulled => pulled?,
+                };
+                let Some(row) = pulled else {
                     // Out of rows for THIS page is not always out of input:
                     // an aggregate that has spent this fetch's work budget
                     // keeps its partial answer and says it still has more,
@@ -11236,7 +13026,14 @@ impl CursorState {
         // The page is published, so this fetch is over: whatever it examined
         // and assembled is told now, even if it never crossed an interval.
         self.context.flush_final_progress();
-        Ok(BoundedCursorFetch { page, telemetry })
+        Ok(BoundedCursorFetch {
+            page,
+            publication: self.context.publication_scope(
+                self.publication.snapshot_lsn,
+                self.publication.tables.clone(),
+            ),
+            telemetry,
+        })
     }
 }
 
@@ -11293,10 +13090,11 @@ pub(super) fn open_cursor(
         )?;
         let schema_capture = db.capture_read_schema();
         let membership_capture = db.relational_membership_store().begin_membership_capture();
-        let Some((snapshot, idle_window, snapshot_registration)) = db
-            .bounded_cursor_snapshot_registration(
+        let Some((snapshot, publication_lsn, idle_window, storage_snapshot, snapshot_registration)) =
+            db.bounded_cursor_snapshot_registration(
                 Arc::clone(&clock),
                 limits.cursor_idle_ms,
+                &context.registration_budget(),
                 &withdrawn,
             )?
         else {
@@ -11304,6 +13102,7 @@ pub(super) fn open_cursor(
         };
         #[cfg(feature = "test-seams")]
         if let Some(probe) = context.probe() {
+            probe.registered_snapshot_for_test(snapshot);
             probe.after_snapshot_registration();
         }
         let statement_bytes = statement_capacity_bytes(&statement)?;
@@ -11317,6 +13116,7 @@ pub(super) fn open_cursor(
         let planned_prepared_bytes = checked_size_mul(statement_bytes, 2, "bounded read plan")?;
         context.reserve(BoundedWorkSource::TableScan, planned_prepared_bytes)?;
         let (resolved, plan) = db.prepare_bounded_read_plan(&statement, params)?;
+        let publication = context.publication_scope(publication_lsn, publication_tables(&plan));
         let resolved_bytes = statement_capacity_bytes(&resolved)?;
         ensure_supported_plan(&plan)?;
         let plan_bytes = physical_plan_capacity_bytes(&plan)?;
@@ -11412,6 +13212,8 @@ pub(super) fn open_cursor(
             database: Arc::clone(&db),
             _snapshot: snapshot,
             _snapshot_registration: snapshot_registration,
+            storage_snapshot,
+            publication,
             idle_window,
             context,
             root,
@@ -11456,6 +13258,17 @@ pub(super) fn open_cursor(
             return Err(error);
         }
     };
+    let publication = first.publication.clone();
+    let storage_snapshot = first
+        .page
+        .has_more
+        .then(|| {
+            state
+                .storage_snapshot
+                .as_ref()
+                .map(|pin| pin.read.storage_snapshot_identity())
+        })
+        .flatten();
     let lifecycle = if first.page.has_more {
         BoundedCursorLifecycle::Open(state)
     } else {
@@ -11467,9 +13280,12 @@ pub(super) fn open_cursor(
         cursor: BoundedCursorHandle {
             _state: Arc::new(BoundedCursorExecutionState {
                 lifecycle: Mutex::new(lifecycle),
+                publication: publication.clone(),
             }),
         },
         first_page: first.page,
+        storage_snapshot,
+        publication,
         telemetry: first.telemetry,
     })
 }
@@ -11547,6 +13363,8 @@ fn cursor_lifecycle(cursor: &BoundedCursorHandle) -> MutexGuard<'_, BoundedCurso
 
 fn exhausted_fetch(
     columns: Vec<String>,
+    publication: ReadPublicationScope,
+    cancellation: OwnerReadCancellation,
 ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
     let page = CursorPage {
         columns,
@@ -11558,6 +13376,7 @@ fn exhausted_fetch(
         .map_err(|_| Error::Other("empty cursor page exceeds u64".to_string()))?;
     Ok(BoundedCursorFetch {
         page,
+        publication: publication.refreshed(cancellation),
         telemetry: BoundedExecutionTelemetry {
             encoded_bytes: encoded,
             ..BoundedExecutionTelemetry::default()
@@ -11582,7 +13401,11 @@ pub(super) fn fetch_cursor(
             return Err(cursor_not_found());
         }
         BoundedCursorLifecycle::Exhausted(columns) => {
-            let fetch = exhausted_fetch(columns.clone());
+            let fetch = exhausted_fetch(
+                columns.clone(),
+                cursor._state.publication.clone(),
+                cancellation,
+            );
             *lifecycle = BoundedCursorLifecycle::Exhausted(columns);
             return fetch;
         }
@@ -11674,4 +13497,338 @@ pub(super) fn close_cursor(
         }
     }
     Ok(())
+}
+
+/// What a paged vector cursor holds, measured against the accountant it really
+/// charges. The public paged-cursor contract lives in
+/// `tests/read/verified_ordered_run_work_resume_contract.rs`; this is the same
+/// fault seen from the inside, in exact bytes, on success, on refusal and on
+/// close.
+#[cfg(all(test, feature = "test-seams"))]
+mod paged_vector_accounting_tests {
+    use super::*;
+    use crate::Database;
+    use contextdb_core::read_contract::DeadlineWait;
+
+    struct FrozenClock;
+
+    impl DeadlineClock for FrozenClock {
+        fn now_ms(&self) -> u64 {
+            0
+        }
+
+        fn wait_until(&self, _: u64) -> DeadlineWait<'_> {
+            Box::pin(async {})
+        }
+    }
+
+    const LABEL_BYTES: usize = 4 * 1024;
+
+    fn limits() -> ReadLimits {
+        ReadLimits {
+            result_rows: 256,
+            result_bytes: 64 * 1024 * 1024,
+            work: 10_000_000,
+            active_ms: 600_000,
+            memory: 64 * 1024 * 1024,
+            cursor_page_rows: 8,
+            cursor_page_bytes: 4 * 1024 * 1024,
+            cursor_idle_ms: 600_000,
+            cursor_lifetime_ms: 600_000,
+        }
+    }
+
+    fn params() -> HashMap<String, Value> {
+        HashMap::from([
+            ("query".to_owned(), Value::Vector(vec![1.0, 0.0])),
+            ("label".to_owned(), Value::Text("w".repeat(LABEL_BYTES))),
+        ])
+    }
+
+    fn statement(rows: usize) -> String {
+        format!(
+            "SELECT id FROM paged_rows WHERE label = $label ORDER BY embedding <=> $query LIMIT {rows}"
+        )
+    }
+
+    fn fixture(path: &std::path::Path, rows: i64) -> Arc<Database> {
+        let db = Database::open(path).expect("open the paged-cursor fixture");
+        db.execute(
+            "CREATE TABLE paged_rows (id INTEGER PRIMARY KEY, label TEXT NOT NULL, embedding VECTOR(2) SEARCH_MODE EXACT)",
+            &HashMap::new(),
+        )
+        .expect("create the paged-cursor table");
+        db.execute(
+            "CREATE INDEX paged_rows_label ON paged_rows (label)",
+            &HashMap::new(),
+        )
+        .expect("create the candidate index");
+        let label = "w".repeat(LABEL_BYTES);
+        for id in 0..rows {
+            db.execute(
+                "INSERT INTO paged_rows VALUES ($id, $label, $embedding)",
+                &HashMap::from([
+                    ("id".to_owned(), Value::Int64(id)),
+                    ("label".to_owned(), Value::Text(label.clone())),
+                    (
+                        "embedding".to_owned(),
+                        Value::Vector(vec![1.0 - id as f32 / 512.0, id as f32 / 512.0]),
+                    ),
+                ]),
+            )
+            .expect("insert a paged-cursor row");
+        }
+        Arc::new(db)
+    }
+
+    fn ids(rows: &[Vec<Value>]) -> Vec<i64> {
+        rows.iter()
+            .map(|row| match row.as_slice() {
+                [Value::Int64(id)] => *id,
+                other => panic!("expected one integer id, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A paged vector cursor takes memory for its candidates, its scores and
+    /// its output queue, holds them between fetches, and must give every byte
+    /// back exactly once — against the reservation that took it. When the
+    /// per-page settlement could not see that state it gave those bytes away
+    /// underneath the search, and the fetch that released them under-ran the
+    /// request: `bounded_read/release requested N bytes, M available of M`.
+    #[test]
+    fn a_drained_paged_vector_cursor_returns_every_byte_it_took() {
+        let rows = 64usize;
+        let root = tempfile::tempdir().expect("task-scoped fixture");
+        let db = fixture(&root.path().join("paged.db"), rows as i64);
+        let accountant = db.bounded_read_accountant();
+        let baseline = accountant.usage().used;
+
+        let mut opened = open_cursor(
+            Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
+            &statement(rows),
+            &params(),
+            limits(),
+            Arc::new(FrozenClock),
+            OwnerReadCancellation::new(),
+            None,
+        )
+        .expect("open a paged vector cursor");
+
+        let held_open = accountant.usage().used;
+        assert!(
+            held_open > baseline,
+            "an open cursor holds its continuation: baseline={baseline} open={held_open}"
+        );
+
+        let mut delivered = ids(&opened.first_page.rows);
+        let mut more = opened.first_page.has_more;
+        let page = NonZeroUsize::new(8).expect("a non-zero page");
+        while more {
+            let fetched = fetch_cursor(
+                &mut opened.cursor,
+                Some(page),
+                OwnerReadCancellation::new(),
+                None,
+            )
+            .expect("a paged vector cursor fetches its next page");
+            delivered.extend(ids(&fetched.page.rows));
+            more = fetched.page.has_more;
+        }
+        assert_eq!(delivered.len(), rows, "every row, once: {delivered:?}");
+        let mut sorted = delivered.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..rows as i64).collect::<Vec<_>>());
+
+        let peak = accountant.high_water_for_test();
+        close_cursor(&mut opened.cursor).expect("the drained cursor closes");
+        let after_close = accountant.usage().used;
+        eprintln!(
+            "paged vector cursor accounting: baseline={baseline} open={held_open} \
+             peak={peak} after_close={after_close}"
+        );
+        assert_eq!(
+            after_close, baseline,
+            "closing returns exactly what the cursor took: baseline={baseline} \
+             after_close={after_close}"
+        );
+        assert!(
+            peak >= held_open,
+            "the peak covers what the cursor held: peak={peak} open={held_open}"
+        );
+    }
+
+    /// A cursor refused part way through is held to the same rule: nothing it
+    /// took stays behind, and the refusal is the typed one the caller declared.
+    #[test]
+    fn a_refused_paged_vector_cursor_leaves_nothing_admitted() {
+        let rows = 64usize;
+        let root = tempfile::tempdir().expect("task-scoped fixture");
+        let db = fixture(&root.path().join("refused.db"), rows as i64);
+        let accountant = db.bounded_read_accountant();
+        let baseline = accountant.usage().used;
+
+        let mut tight = limits();
+        tight.work = 1;
+        let refused = open_cursor(
+            Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
+            &statement(rows),
+            &params(),
+            tight,
+            Arc::new(FrozenClock),
+            OwnerReadCancellation::new(),
+            None,
+        );
+        let error = match refused {
+            Ok(_) => panic!("one work unit cannot open this cursor"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, BoundedExecutionError::Refused(failure)
+                if matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail)
+                    if detail.limit == ReadFailureLimit::Work)),
+            "the refusal is the declared work ceiling: {error:?}"
+        );
+        let after_refusal = accountant.usage().used;
+        eprintln!("refused paged vector cursor: baseline={baseline} after_refusal={after_refusal}");
+        assert_eq!(
+            after_refusal, baseline,
+            "a refused open leaves nothing admitted: baseline={baseline} \
+             after_refusal={after_refusal}"
+        );
+    }
+
+    /// Closing a cursor that is still part way through its range returns its
+    /// whole charge too — the state it was holding is the state it gives back.
+    #[test]
+    fn closing_a_part_drained_paged_vector_cursor_returns_every_byte() {
+        let rows = 64usize;
+        let root = tempfile::tempdir().expect("task-scoped fixture");
+        let db = fixture(&root.path().join("partial.db"), rows as i64);
+        let accountant = db.bounded_read_accountant();
+        let baseline = accountant.usage().used;
+
+        let mut opened = open_cursor(
+            Arc::clone(&db) as Arc<dyn ReadExecutionTarget>,
+            &statement(rows),
+            &params(),
+            limits(),
+            Arc::new(FrozenClock),
+            OwnerReadCancellation::new(),
+            None,
+        )
+        .expect("open a paged vector cursor");
+        assert!(
+            opened.first_page.has_more,
+            "this cursor has more pages to give"
+        );
+        let page = NonZeroUsize::new(8).expect("a non-zero page");
+        let _ = fetch_cursor(
+            &mut opened.cursor,
+            Some(page),
+            OwnerReadCancellation::new(),
+            None,
+        )
+        .expect("one more page");
+        let held = accountant.usage().used;
+        assert!(held > baseline, "the part-drained cursor is holding state");
+        close_cursor(&mut opened.cursor).expect("a part-drained cursor closes");
+        let after_close = accountant.usage().used;
+        eprintln!(
+            "part-drained paged vector cursor: baseline={baseline} held={held} \
+             after_close={after_close}"
+        );
+        assert_eq!(after_close, baseline, "closing returns the whole charge");
+    }
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+mod cursor_replay_budget_tests {
+    use super::*;
+    use crate::local_transport::ManualDeadlineClock;
+
+    #[test]
+    fn replay_work_does_not_reset_at_internal_page_boundaries() {
+        let db = Database::open(":memory:").unwrap();
+        let clock = Arc::new(ManualDeadlineClock::default());
+        let limits = ReadLimits {
+            work: 2,
+            ..ReadLimits::default()
+        };
+        let context = RequestContext::new(
+            &db,
+            limits,
+            ReadResumption::AcrossFetches,
+            clock.clone(),
+            OwnerReadCancellation::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        with_cursor_replay_budget(limits, clock, 0, 0, 0, || {
+            context
+                .charge_operator(BoundedWorkSource::UnindexedSort)
+                .unwrap();
+            context
+                .begin_fetch(OwnerReadCancellation::new(), None)
+                .unwrap();
+            context
+                .charge_operator(BoundedWorkSource::UnindexedSort)
+                .unwrap();
+            context
+                .begin_fetch(OwnerReadCancellation::new(), None)
+                .unwrap();
+            assert!(
+                matches!(context.charge_operator(BoundedWorkSource::UnindexedSort), Err(BoundedExecutionError::Refused(failure)) if matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail) if detail.limit == ReadFailureLimit::Work))
+            );
+            assert!(!cursor_replay_work_available());
+        });
+        assert!(cursor_replay_work_available(), "request scope is released");
+    }
+
+    #[test]
+    fn replay_checks_original_active_idle_and_lifetime_deadlines_inside_the_kernel() {
+        let db = Database::open(":memory:").unwrap();
+        for (active_ms, idle_ms, lifetime_ms, expected) in [
+            (10, 100, 100, None),
+            (100, 10, 100, Some(CursorExpiryKind::Idle)),
+            (100, 10, 10, Some(CursorExpiryKind::Lifetime)),
+        ] {
+            let clock = Arc::new(ManualDeadlineClock::default());
+            let limits = ReadLimits {
+                active_ms,
+                cursor_idle_ms: idle_ms,
+                cursor_lifetime_ms: lifetime_ms,
+                ..ReadLimits::default()
+            };
+            let context = RequestContext::new(
+                &db,
+                limits,
+                ReadResumption::AcrossFetches,
+                clock.clone(),
+                OwnerReadCancellation::new(),
+                None,
+                None,
+            )
+            .unwrap();
+            with_cursor_replay_budget(limits, clock.clone(), 0, 0, 0, || {
+                context
+                    .charge_operator(BoundedWorkSource::UnindexedSort)
+                    .unwrap();
+                clock.advance_to(11);
+                context
+                    .begin_fetch(OwnerReadCancellation::new(), None)
+                    .unwrap();
+                let Err(BoundedExecutionError::Refused(failure)) = context.checkpoint() else {
+                    panic!("the original request deadline must survive an internal page reset");
+                };
+                match expected {
+                    Some(kind) => assert_eq!(failure, ReadFailure::cursor_expired(kind)),
+                    None => assert!(
+                        matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail) if detail.limit == ReadFailureLimit::ActiveMs)
+                    ),
+                }
+            });
+        }
+    }
 }

@@ -424,6 +424,8 @@ impl ClientTransport for PauseAfterPushReply {
                         server_current_lsn: Some(self.status_frontier),
                         // Ordinary lost-ack fixtures have no custody binding.
                         hub_incarnation: None,
+                        refused_schema_unit_digests_ack: Some(Vec::new()),
+                        ..Default::default()
                     },
                 )
                 .map_err(|error| TransportError::Other(error.to_string()));

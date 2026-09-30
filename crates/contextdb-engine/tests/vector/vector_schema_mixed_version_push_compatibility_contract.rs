@@ -551,7 +551,7 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
         edge.clone(),
         transport.clone(),
         TenantId::from(REVERTED_PUSH_TENANT),
-        edge_identity,
+        edge_identity.clone(),
     );
     client.set_peer_vector_schema_support_for_test(false);
 
@@ -591,7 +591,7 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
             &TenantId::from(REVERTED_PUSH_TENANT),
             &edge_node_id,
             contextdb_core::Incarnation::mint(),
-            &|_| panic!("DDL witness cannot sign row lineage"),
+            &|bytes| Ok(edge_identity.sign_for_test(bytes)),
         )
         .unwrap();
     let expected = schema
@@ -600,12 +600,21 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
         .map(WireDdlChange::from)
         .zip(provenance)
         .filter(|(_, entry)| entry.table.as_deref() == Some("docs"))
+        .map(|(ddl, mut entry)| {
+            entry.author = None;
+            (ddl, entry)
+        })
         .collect::<Vec<_>>();
     let observed = transport
         .requests()
         .into_iter()
         .flat_map(|request| request.ddl.into_iter().zip(request.ddl_provenance))
         .filter(|(_, entry)| entry.table.as_deref() == Some("docs"))
+        .map(|(ddl, mut entry)| {
+            assert!(entry.author.is_some(), "pushed schema has a signed author");
+            entry.author = None;
+            (ddl, entry)
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         observed, expected,

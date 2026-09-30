@@ -7,7 +7,8 @@ use contextdb_server::chunking::CHUNKING_THRESHOLD;
 use contextdb_server::protocol::{
     DependencyCompletePullResponse, Envelope, MessageType, PullRequest, PullResponse, PushRequest,
     PushResponse, SyncStatusRequest, SyncStatusResponse, WireApplyResult, WireChangeSet,
-    WireDdlChange, WireDdlProvenance, canonical_ddl_provenance_digest, decode, encode,
+    WireDdlAuthor, WireDdlChange, WireDdlProvenance, canonical_ddl_provenance_digest, decode,
+    encode,
 };
 use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
 use contextdb_server::transport::{
@@ -156,6 +157,53 @@ fn payload<T: DeserializeOwned>(envelope: &Envelope, expected: MessageType, labe
         .unwrap_or_else(|err| panic!("decode {label} payload: {err}"))
 }
 
+fn assert_exact_candidate_lookup(
+    exchange: &(Envelope, Envelope),
+    push_exchanges: &[(Envelope, Envelope)],
+) {
+    let mut authored_units =
+        BTreeMap::<(String, contextdb_core::Incarnation, Lsn), Vec<WireDdlAuthor>>::new();
+    for author in pushed_schema_authors(push_exchanges) {
+        authored_units
+            .entry((
+                author.node_id.clone(),
+                author.incarnation,
+                author.source_ddl_lsn,
+            ))
+            .or_default()
+            .push(author);
+    }
+    assert!(
+        !authored_units.is_empty(),
+        "fixture must push an authored schema unit before checking its candidate lookup"
+    );
+    let expected_digests = authored_units
+        .values()
+        .map(|authors| {
+            let members = authors.iter().collect::<Vec<_>>();
+            let bytes = rmp_serde::to_vec(&members).expect("encode signed outbound schema unit");
+            *blake3::hash(&bytes).as_bytes()
+        })
+        .collect::<Vec<_>>();
+    let request: SyncStatusRequest =
+        payload(&exchange.0, MessageType::StatusRequest, "candidate query");
+    let digests = &request.refused_schema_unit_digests;
+    assert_eq!(
+        digests, &expected_digests,
+        "candidate lookup must name exactly the signed outbound schema units"
+    );
+    let response: SyncStatusResponse =
+        payload(&exchange.1, MessageType::StatusResponse, "candidate reply");
+    assert_eq!(
+        response.refused_schema_unit_digests_ack.as_ref(),
+        Some(digests)
+    );
+    assert!(
+        response.refused_schema_units.is_empty(),
+        "the hub must return no unrelated refusal outcomes"
+    );
+}
+
 /// An authenticated status probe records the contacting edge in the hub's
 /// system state before answering. Its hub LSN is therefore a live position,
 /// not a fixture-owned constant, while the per-edge source watermark remains
@@ -209,6 +257,20 @@ fn push_request_payload(envelope: &Envelope, label: &str) -> (PushRequest, bool)
     let request = rmp_serde::from_slice(&envelope.payload)
         .unwrap_or_else(|err| panic!("decode {label} payload: {err}"));
     (request, dependency_complete)
+}
+
+fn pushed_schema_authors(exchanges: &[(Envelope, Envelope)]) -> Vec<WireDdlAuthor> {
+    exchanges
+        .iter()
+        .flat_map(|(request, _)| {
+            push_request_payload(request, "signed schema push")
+                .0
+                .changeset
+                .ddl_provenance
+                .into_iter()
+                .filter_map(|provenance| provenance.author)
+        })
+        .collect()
 }
 
 fn assert_push_exchange(
@@ -276,13 +338,130 @@ fn wire_changeset_summary(changes: &WireChangeSet) -> String {
         .zip(&changes.ddl_lsn)
         .map(|(ddl, lsn)| format!("{ddl:?}@{}", lsn.0))
         .collect::<Vec<_>>();
+    // Each schema record's author, the way each row's creator is summarised:
+    // who signed it and in which life, at which position, over which schema
+    // generation -- and that a signature is there at all.
+    let ddl_provenance = changes
+        .ddl_provenance
+        .iter()
+        .map(|provenance| {
+            let author = provenance.author.as_ref().map(|author| {
+                format!(
+                    "{}:{}:{}:{}:{:?}:{:?}:{}",
+                    author.node_id,
+                    author.incarnation,
+                    author.source_ddl_lsn.0,
+                    author.ordinal,
+                    author.table,
+                    author.table_generation,
+                    author.attestation.len(),
+                )
+            });
+            format!(
+                "{}:{}:{}",
+                provenance.source_ddl_lsn.0,
+                provenance.ordinal,
+                author.unwrap_or_else(|| "unsigned".to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
     format!(
-        "ddl={ddl:?}; ddl_provenance={}; rows={rows:?}; edges={}; vectors={}; purges={}",
-        changes.ddl_provenance.len(),
+        "ddl={ddl:?}; ddl_provenance={:?}; rows={rows:?}; edges={}; vectors={}; purges={}",
+        ddl_provenance,
         changes.edges.len(),
         changes.vectors.len(),
         changes.purges.len(),
     )
+}
+
+/// A schema record a peer authored and is pushing: it names that peer as the
+/// author, over exactly this record's position, table and digest, and carries
+/// the peer's own signature. The signature is made with the peer's secret key,
+/// which this fixture does not hold, so it is checked for what it is and then
+/// taken across, leaving the rest of the payload to compare exactly.
+fn take_self_authorship(actual: &WireChangeSet, expected: &mut WireChangeSet, label: &str) {
+    for (actual, expected) in actual
+        .ddl_provenance
+        .iter()
+        .zip(expected.ddl_provenance.iter_mut())
+    {
+        let author = actual
+            .author
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: every schema record names its author"));
+        assert!(
+            !author.attestation.is_empty(),
+            "{label}: and carries that author's own signature"
+        );
+        assert_eq!(
+            (
+                author.source_ddl_lsn,
+                author.ordinal,
+                author.table.clone(),
+                author.table_generation,
+                author.digest.clone()
+            ),
+            (
+                actual.source_ddl_lsn,
+                actual.ordinal,
+                actual.table.clone(),
+                actual.table_generation,
+                actual.digest.clone()
+            ),
+            "{label}: the author's account binds this exact record"
+        );
+        expected.author = Some(author.clone());
+    }
+}
+
+/// Take each served schema record's author block into the fixture's expected
+/// record, having first checked what the fixture can check without the
+/// author's secret key: that the record names an author at all, carries that
+/// author's signature, and -- where the fixture already knows who wrote the
+/// schema -- names exactly that peer.
+fn take_served_authorship(actual: &WireChangeSet, expected: &mut WireChangeSet, label: &str) {
+    for (actual, expected) in actual
+        .ddl_provenance
+        .iter()
+        .zip(expected.ddl_provenance.iter_mut())
+    {
+        let author = actual
+            .author
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: every served schema record names its author"));
+        assert!(
+            !author.attestation.is_empty(),
+            "{label}: and carries that author's own signature"
+        );
+        match expected.author.as_ref() {
+            // Schema the hub received from an edge: the fixture knows the
+            // edge that wrote it, and the hub must still be naming that edge.
+            Some(known) => assert_eq!(
+                author, known,
+                "{label}: the served record preserves the peer's exact signed author block"
+            ),
+            // Schema the hub wrote itself: its account of the record is its
+            // own, bound to exactly this record.
+            None => assert_eq!(
+                (
+                    author.source_ddl_lsn,
+                    author.ordinal,
+                    author.table.clone(),
+                    author.table_generation,
+                    author.digest.clone()
+                ),
+                (
+                    actual.source_ddl_lsn,
+                    actual.ordinal,
+                    actual.table.clone(),
+                    actual.table_generation,
+                    actual.digest.clone()
+                ),
+                "{label}: the author's account binds this exact record"
+            ),
+        }
+        expected.author = Some(author.clone());
+    }
 }
 
 fn assert_pull_exchange(
@@ -302,6 +481,22 @@ fn assert_pull_exchange(
         MessageType::DependencyCompletePullResponse,
         &format!("{label} response"),
     );
+    // Every schema record's author block comes across once the fixture has
+    // checked what it can; everything else below compares exactly.
+    let mut expected_response = expected_response;
+    take_served_authorship(
+        &response.ordinary.changeset,
+        &mut expected_response.ordinary.changeset,
+        &format!("{label} ordinary page"),
+    );
+    for (index, (actual, expected)) in response
+        .units
+        .iter()
+        .zip(expected_response.units.iter_mut())
+        .enumerate()
+    {
+        take_served_authorship(actual, expected, &format!("{label} unit {index}"));
+    }
     assert_eq!(
         response.ordinary.has_more, expected_response.ordinary.has_more,
         "{label} ordinary page completion flag"
@@ -441,6 +636,8 @@ fn expected_wire_changeset_for_newly_authored_batches(
                 .expect("canonical fixture DDL provenance digest"),
                 table,
                 table_generation,
+                author: None,
+                unattested: false,
             }
         })
         .collect();
@@ -488,6 +685,29 @@ fn expected_wire_changeset_for_freshly_pushed_rows(
     wire
 }
 
+/// A forwarded schema record carries the exact signed author block captured
+/// from the edge's push, including its original source LSN and signature.
+/// Schema the hub wrote itself names no other author.
+fn with_forwarded_schema_author(
+    mut wire: WireChangeSet,
+    author_node_id: &str,
+    pushed_authors: &[WireDdlAuthor],
+) -> WireChangeSet {
+    for provenance in &mut wire.ddl_provenance {
+        provenance.author = pushed_authors
+            .iter()
+            .find(|author| author.table == provenance.table)
+            .map(|author| {
+                assert_eq!(
+                    author.node_id, author_node_id,
+                    "forwarded schema author node"
+                );
+                author.clone()
+            });
+    }
+    wire
+}
+
 /// Keep a schema migration in its dependency-complete reply unit while the
 /// ordinary response carries rows from later source positions. This mirrors
 /// the public wire contract without flattening a dependency envelope into an
@@ -524,14 +744,19 @@ fn split_expected_pull_units(changes: ChangeSet) -> (ChangeSet, Vec<ChangeSet>) 
     (ordinary, migrations.into_values().collect())
 }
 
-/// Status/pull contact bookkeeping is hub-local `SYNC OFF` state. Its rows
-/// never leave the hub, but authenticated schema is deliberately delivered
-/// regardless of direction so a fresh reader receives the complete schema
-/// vector. Keep only the requested application's rows/vectors while retaining
-/// every DDL entry (including the DDL-only contact-table migration).
+/// Status/pull contact bookkeeping is hub-local `SYNC OFF` state. Keep only
+/// the requested application's rows, vectors, and DDL in the expected page.
 fn expected_deliverable_table_changes(mut changes: ChangeSet, table: &str) -> ChangeSet {
     changes.rows.retain(|row| row.table == table);
     changes.vectors.retain(|vector| vector.index.table == table);
+    let (ddl, ddl_lsn) = changes
+        .ddl
+        .into_iter()
+        .zip(changes.ddl_lsn)
+        .filter(|(ddl, _)| matches!(ddl, DdlChange::CreateTable { name, .. } if name == table))
+        .unzip();
+    changes.ddl = ddl;
+    changes.ddl_lsn = ddl_lsn;
     changes
 }
 
@@ -846,7 +1071,10 @@ async fn ip_01_push_pull_converges_over_fake() {
         acceptance_stamped_push_batches_for_test(edge_a_db.changes_since(Lsn(0)));
     let expected_batch_results =
         expected_apply_results_for_batches(&expected_push_batches, &policies);
-    let edge_a = authenticated_client(edge_a_db.clone(), &broker, tenant);
+    let edge_a_identity = Arc::new(FabricIdentity::generate());
+    let edge_a_node_id = edge_a_identity.node_id();
+    let edge_a =
+        authenticated_client_with_identity(edge_a_db.clone(), &broker, tenant, edge_a_identity);
     let edge_a_push = within(edge_a.push()).await;
     assert!(
         edge_a_push.is_ok(),
@@ -857,8 +1085,12 @@ async fn ip_01_push_pull_converges_over_fake() {
     let status_exchanges = exchanges_on(&broker, &status_subject(tenant));
     assert_eq!(
         status_exchanges.len(),
-        1,
-        "push must use one broker-free status exchange before sending data"
+        2,
+        "schema push probes status and then queries its exact candidate outcomes"
+    );
+    assert_exact_candidate_lookup(
+        &status_exchanges[1],
+        &exchanges_on(&broker, &push_subject(tenant)),
     );
     let push_status =
         assert_authenticated_status_exchange(&status_exchanges[0], Lsn(0), Lsn(0), "push status");
@@ -876,6 +1108,9 @@ async fn ip_01_push_pull_converges_over_fake() {
         "each atomic source-LSN group must cross the fake in its own complete PushRequest envelope"
     );
     let mut applied = 0usize;
+    let hub_incarnation = push_status
+        .hub_incarnation
+        .expect("authenticated pre-push status identifies the hub life");
     for (idx, (exchange, expected_batch)) in push_exchanges
         .iter()
         .zip(&expected_push_batches)
@@ -889,14 +1124,24 @@ async fn ip_01_push_pull_converges_over_fake() {
             expected_dependency_complete,
             "acceptance-stamped push group {idx} must be the schema migration first, followed only by ordinary row groups"
         );
+        let mut expected_changeset =
+            expected_wire_changeset_for_newly_authored_batches(&edge_a_db, expected_batch.clone());
+        take_self_authorship(
+            &push_request_payload(&exchange.0, &format!("acceptance-stamped push group {idx}"))
+                .0
+                .changeset,
+            &mut expected_changeset,
+            &format!("acceptance-stamped push group {idx}"),
+        );
         assert_push_exchange(
             exchange,
             expected_dependency_complete,
-            expected_wire_changeset_for_newly_authored_batches(&edge_a_db, expected_batch.clone()),
+            expected_changeset,
             PushResponse {
                 result: Some(expected_result),
                 error: None,
                 application_error: None,
+                hub_incarnation: Some(hub_incarnation),
                 // Ordinary response lane compile prerequisite.
                 ..Default::default()
             },
@@ -908,6 +1153,7 @@ async fn ip_01_push_pull_converges_over_fake() {
         applied, edge_a_push.applied_rows,
         "the caller-visible result accumulates every acceptance-stamped response"
     );
+    let pushed_authors = pushed_schema_authors(&push_exchanges);
 
     let edge_b_db = Arc::new(Database::open_memory());
     let edge_b = authenticated_client(edge_b_db.clone(), &broker, tenant);
@@ -920,11 +1166,11 @@ async fn ip_01_push_pull_converges_over_fake() {
     let status_exchanges = exchanges_on(&broker, &status_subject(tenant));
     assert_eq!(
         status_exchanges.len(),
-        2,
-        "push and pull must each make the normal status probe through the fake"
+        3,
+        "schema push uses a probe plus exact lookup, and pull adds its normal probe"
     );
     let pull_status =
-        assert_authenticated_status_exchange(&status_exchanges[1], Lsn(0), Lsn(0), "pull status");
+        assert_authenticated_status_exchange(&status_exchanges[2], Lsn(0), Lsn(0), "pull status");
     assert!(
         pull_status
             .server_current_lsn
@@ -952,33 +1198,20 @@ async fn ip_01_push_pull_converges_over_fake() {
     );
     assert_eq!(
         expected_dependency_units.len(),
-        2,
-        "the authenticated schema vector must contain the hub's DDL-only contact-table migration and the application migration"
+        1,
+        "the pull must contain the application's schema migration"
     );
     assert!(
         expected_dependency_units[0].rows.is_empty(),
-        "the SYNC OFF contact-table migration must never carry its hub-local row"
+        "the application migration is DDL-only because its row was authored later"
     );
     assert_eq!(
         expected_dependency_units[0].ddl.len(),
         1,
-        "the contact-table migration must contain one CREATE TABLE statement"
-    );
-    assert!(matches!(
-        expected_dependency_units[0].ddl.as_slice(),
-        [DdlChange::CreateTable { name, .. }] if name == "work_node_contacts"
-    ));
-    assert!(
-        expected_dependency_units[1].rows.is_empty(),
-        "the application migration is DDL-only because its row was authored later"
-    );
-    assert_eq!(
-        expected_dependency_units[1].ddl.len(),
-        1,
         "the application migration must contain one CREATE TABLE statement"
     );
     assert!(matches!(
-        expected_dependency_units[1].ddl.as_slice(),
+        expected_dependency_units[0].ddl.as_slice(),
         [DdlChange::CreateTable { name, .. }] if name == "notes"
     ));
     let expected_pull_response = DependencyCompletePullResponse {
@@ -996,7 +1229,13 @@ async fn ip_01_push_pull_converges_over_fake() {
         },
         units: expected_dependency_units
             .into_iter()
-            .map(|unit| expected_wire_changeset_for_freshly_pushed_rows(&server_db, unit))
+            .map(|unit| {
+                with_forwarded_schema_author(
+                    expected_wire_changeset_for_freshly_pushed_rows(&server_db, unit),
+                    &edge_a_node_id,
+                    &pushed_authors,
+                )
+            })
             .collect(),
     };
     assert_pull_exchange(
@@ -1236,8 +1475,12 @@ async fn ip_02_conflicting_push_reports_real_apply_result_over_fake() {
     let status_exchanges = exchanges_on(&broker, &status_subject(tenant));
     assert_eq!(
         status_exchanges.len(),
-        1,
-        "the losing push must still probe hub status through the fake"
+        2,
+        "the losing schema push probes status and queries exact candidates"
+    );
+    assert_exact_candidate_lookup(
+        &status_exchanges[1],
+        &exchanges_on(&broker, &push_subject(tenant)),
     );
     let conflict_status = assert_authenticated_status_exchange(
         &status_exchanges[0],
@@ -1265,10 +1508,14 @@ async fn ip_02_conflicting_push_reports_real_apply_result_over_fake() {
     {
         let (request, _dependency_complete) =
             push_request_payload(&exchange.0, &format!("conflicting group {idx} request"));
-        assert_eq!(
-            request.changeset,
-            expected_wire_changeset_for_newly_authored_batches(&second_db, expected_batch.clone())
+        let mut expected_changeset =
+            expected_wire_changeset_for_newly_authored_batches(&second_db, expected_batch.clone());
+        take_self_authorship(
+            &request.changeset,
+            &mut expected_changeset,
+            &format!("conflicting group {idx}"),
         );
+        assert_eq!(request.changeset, expected_changeset);
         let response: PushResponse = payload(
             &exchange.1,
             MessageType::PushResponse,
@@ -1512,7 +1759,9 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
     // interleave with each accepted batch and therefore cannot be borrowed
     // from a separate engine instance.
     let expected_batch_effects = expected_apply_results_for_batches(&expected_batches, &policies);
-    let edge = authenticated_client(edge_db.clone(), &broker, tenant);
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let edge = authenticated_client_with_identity(edge_db.clone(), &broker, tenant, edge_identity);
     let push_result = within(edge.push()).await;
     assert!(
         push_result.is_ok(),
@@ -1526,8 +1775,12 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
     let status_exchanges = exchanges_on(&broker, &status_subject(tenant));
     assert_eq!(
         status_exchanges.len(),
-        1,
-        "the multi-batch push must establish one authenticated live-hub position before data"
+        2,
+        "the multi-batch schema push probes status and queries exact candidates once"
+    );
+    assert_exact_candidate_lookup(
+        &status_exchanges[1],
+        &exchanges_on(&broker, &push_subject(tenant)),
     );
     let mut preceding_live_hub_position = assert_authenticated_status_exchange(
         &status_exchanges[0],
@@ -1564,9 +1817,15 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
             dependency_complete, expected_dependency_complete,
             "batch {idx} request envelope must preserve the exact dependency-complete boundary"
         );
+        let mut expected_changeset =
+            expected_wire_changeset_for_newly_authored_batches(&edge_db, expected_batch.clone());
+        take_self_authorship(
+            &request.changeset,
+            &mut expected_changeset,
+            &format!("batch {idx}"),
+        );
         assert_eq!(
-            request.changeset,
-            expected_wire_changeset_for_newly_authored_batches(&edge_db, expected_batch.clone()),
+            request.changeset, expected_changeset,
             "batch {idx} request payload must equal the splitter output"
         );
         let response: PushResponse = payload(
@@ -1625,6 +1884,7 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
         push_result.conflicts.len(),
         "per-batch conflicts must sum to the caller-visible result"
     );
+    let pushed_authors = pushed_schema_authors(&push_exchanges);
     assert_eq!(
         uuid_set(&server_db, "blobs"),
         expected_ids,
@@ -1664,33 +1924,20 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
     );
     assert_eq!(
         expected_dependency_units.len(),
-        2,
-        "the authenticated schema vector must contain the hub's DDL-only contact-table migration and the blob bootstrap migration"
+        1,
+        "the pull must contain the blob bootstrap migration"
     );
     assert!(
         expected_dependency_units[0].rows.is_empty(),
-        "the SYNC OFF contact-table migration must never carry its hub-local row"
+        "the blob bootstrap migration is DDL-only because every blob row was authored later"
     );
     assert_eq!(
         expected_dependency_units[0].ddl.len(),
         1,
-        "the contact-table migration must contain one CREATE TABLE statement"
-    );
-    assert!(matches!(
-        expected_dependency_units[0].ddl.as_slice(),
-        [DdlChange::CreateTable { name, .. }] if name == "work_node_contacts"
-    ));
-    assert!(
-        expected_dependency_units[1].rows.is_empty(),
-        "the blob bootstrap migration is DDL-only because every blob row was authored later"
-    );
-    assert_eq!(
-        expected_dependency_units[1].ddl.len(),
-        1,
         "the blob bootstrap migration must contain one CREATE TABLE statement"
     );
     assert!(matches!(
-        expected_dependency_units[1].ddl.as_slice(),
+        expected_dependency_units[0].ddl.as_slice(),
         [DdlChange::CreateTable { name, .. }] if name == "blobs"
     ));
     let expected_pull_response = DependencyCompletePullResponse {
@@ -1708,7 +1955,13 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
         },
         units: expected_dependency_units
             .into_iter()
-            .map(|unit| expected_wire_changeset_for_freshly_pushed_rows(&server_db, unit))
+            .map(|unit| {
+                with_forwarded_schema_author(
+                    expected_wire_changeset_for_freshly_pushed_rows(&server_db, unit),
+                    &edge_node_id,
+                    &pushed_authors,
+                )
+            })
             .collect(),
     };
     assert_pull_exchange(

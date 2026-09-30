@@ -84,18 +84,35 @@ pub use transactions::StorageStatisticsSnapshot;
 #[doc(hidden)]
 pub use transactions::{CompactionCursor, CompactionProgress};
 pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
+#[doc(hidden)]
+pub use transactions::{ExternalSnapshotProvider, ExternalSnapshotRetentionStats};
+#[doc(hidden)]
+pub use transactions::{StorageSnapshotIdentity, StorageUserRootIdentity};
 pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use tree_store::{BoundedByteCursor, BoundedByteHandle};
 pub use types::{Key, MutInPlaceValue, TypeName, Value};
 
 pub type Result<T = (), E = StorageError> = std::result::Result<T, E>;
 
 pub mod backends;
+#[cfg(feature = "test-seams")]
+pub mod commit_work;
 mod complex_types;
 mod db;
 mod error;
 mod multimap_table;
 mod sealed;
 mod table;
+#[cfg(feature = "test-seams")]
+mod table_write_observer;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use table_write_observer::{
+    TableWriteForTest, TableWriteObservationGuardForTest, TableWriteObserverForTest,
+    TableWriteOperationForTest,
+};
 mod transaction_tracker;
 mod transactions;
 mod tree_store;
@@ -113,6 +130,6 @@ fn create_tempfile() -> tempfile::NamedTempFile {
 
 mod read_admission;
 #[doc(hidden)]
-pub use read_admission::with_read_memory_admission;
-#[doc(hidden)]
 pub use read_admission::{BackendReadObservation, observe_backend_reads};
+#[doc(hidden)]
+pub use read_admission::{ReadPageCharge, with_read_memory_admission, with_read_page_charge};

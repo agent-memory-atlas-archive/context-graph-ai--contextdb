@@ -163,13 +163,76 @@ pub(crate) fn check_declared(db: &Database, table: &str, candidate: &TableMeta) 
             && policy.table == table
             && let Some(clause) = differing_clause(&policy.policy, &candidate)
         {
-            return Err(Error::DeclaredPolicyPreserved {
-                table: table.into(),
-                clause: clause.into(),
-            });
+            return Err(declared_policy_refusal(
+                table,
+                clause,
+                &policy.policy,
+                &candidate,
+            ));
         }
     }
     Ok(())
+}
+
+/// The typed refusal of an authored transaction whose statement restates a
+/// table this node declared for itself with a different policy: it names the
+/// table, the differing clause, and both policies in the words an operator
+/// writes them.
+pub(crate) fn declared_policy_refusal(
+    table: &str,
+    clause: &str,
+    local: &ApplicationTablePolicy,
+    arriving: &ApplicationTablePolicy,
+) -> Error {
+    Error::DeclaredPolicyPreserved {
+        table: table.into(),
+        clause: clause.into(),
+        local_policy: clause_words(local),
+        arriving_policy: clause_words(arriving),
+    }
+}
+
+/// A policy in the declaration's own clause words. Direction and conflict
+/// are always spoken, because they are the axes two declarations most often
+/// disagree on; the other axes are spoken only when they are not the default,
+/// exactly as a schema author would have written them.
+pub(crate) fn clause_words(p: &ApplicationTablePolicy) -> String {
+    use contextdb_core::{EdgeDiscardMode, RetainUnit};
+    let mut words = vec![p.sync_direction.sql().to_string()];
+    words.extend(p.sync_conflict.declared_clause().map(str::to_string));
+    if p.immutable {
+        words.push("IMMUTABLE".into());
+    }
+    if let Some(retain) = p.retain {
+        let unit = match retain.declared_unit {
+            RetainUnit::Seconds => "SECONDS",
+            RetainUnit::Minutes => "MINUTES",
+            RetainUnit::Hours => "HOURS",
+            RetainUnit::Days => "DAYS",
+        };
+        let count = retain.seconds / retain.declared_unit.seconds_multiplier().max(1);
+        words.push(format!(
+            "RETAIN {count} {unit}{}",
+            if retain.sync_safe { " SYNC SAFE" } else { "" }
+        ));
+    }
+    if p.history != contextdb_core::DEFAULT_HISTORY_POLICY {
+        words.push(p.history.declared_clause().into());
+    }
+    if let Some(tables) = &p.manifest_tables {
+        words.push(format!("DELIVERY MANIFEST OVER {}", tables.join(", ")));
+    }
+    if p.edge_discard != EdgeDiscardMode::default() {
+        words.push(
+            match p.edge_discard {
+                EdgeDiscardMode::Never => "EDGE DISCARD NEVER",
+                EdgeDiscardMode::AfterOutcome => "EDGE DISCARD AFTER OUTCOME",
+                EdgeDiscardMode::Always => "EDGE DISCARD ALWAYS",
+            }
+            .into(),
+        );
+    }
+    words.join(" ")
 }
 
 pub(crate) fn binding_projection(b: &SignedBinding) -> AuthenticatedTenantPolicyBinding {

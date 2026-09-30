@@ -3,8 +3,44 @@ use contextdb_core::read_contract::{DeadlineClock, DeadlineWait};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(any(test, feature = "test-seams"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    /// How many timer threads this thread has started since it last reset the
+    /// count.
+    ///
+    /// A wait that has to be woken at a particular instant and has nothing else to
+    /// wake it starts an operating-system thread to do the waking. That is the
+    /// right shape for a wait that genuinely waits and the wrong price for an
+    /// operation that never does, so the count is what a proof reads. It is kept
+    /// per thread, because the thread that starts one is the thread that asked for
+    /// the wait, and per-thread counting stays honest beside other tests sharing
+    /// the binary.
+    static TIMER_THREADS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn note_timer_thread_started_for_test() {
+    TIMER_THREADS_STARTED.with(|started| started.set(started.get() + 1));
+}
+
+/// Start counting from zero on this thread.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn reset_timer_threads_started_for_test() {
+    TIMER_THREADS_STARTED.with(|started| started.set(0));
+}
+
+/// Timer threads this thread has started since the reset.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub fn timer_threads_started_for_test() -> usize {
+    TIMER_THREADS_STARTED.with(std::cell::Cell::get)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadlineStage {
@@ -171,13 +207,94 @@ impl Drop for ManualDeadlineWait {
 #[derive(Debug)]
 pub struct MonotonicDeadlineClock {
     origin: std::time::Instant,
+    #[cfg(feature = "test-seams")]
+    thread_lifecycle: Option<DeadlineThreadLifecycle>,
+    #[cfg(any(test, feature = "test-seams"))]
+    fail_timer_arm: bool,
+    #[cfg(any(test, feature = "test-seams"))]
+    timer_arm_failure_waits: AtomicUsize,
+    #[cfg(any(test, feature = "test-seams"))]
+    timer_arm_failure_polls: AtomicUsize,
+}
+
+#[cfg(feature = "test-seams")]
+#[derive(Debug, Clone)]
+struct DeadlineThreadLifecycle {
+    started: std::sync::mpsc::Sender<()>,
+    exited: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(feature = "test-seams")]
+struct DeadlineThreadExit(Option<std::sync::mpsc::Sender<()>>);
+
+#[cfg(feature = "test-seams")]
+impl Drop for DeadlineThreadExit {
+    fn drop(&mut self) {
+        if let Some(exited) = self.0.take() {
+            let _ = exited.send(());
+        }
+    }
 }
 
 impl MonotonicDeadlineClock {
     pub fn new() -> Self {
         Self {
             origin: std::time::Instant::now(),
+            #[cfg(feature = "test-seams")]
+            thread_lifecycle: None,
+            #[cfg(any(test, feature = "test-seams"))]
+            fail_timer_arm: false,
+            #[cfg(any(test, feature = "test-seams"))]
+            timer_arm_failure_waits: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-seams"))]
+            timer_arm_failure_polls: AtomicUsize::new(0),
         }
+    }
+
+    /// Observe the real timer worker entering and leaving its thread body.
+    /// These senders own no worker and cannot advance or abandon a deadline.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn with_thread_lifecycle_for_test(
+        started: std::sync::mpsc::Sender<()>,
+        exited: std::sync::mpsc::Sender<()>,
+    ) -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            thread_lifecycle: Some(DeadlineThreadLifecycle { started, exited }),
+            fail_timer_arm: false,
+            timer_arm_failure_waits: AtomicUsize::new(0),
+            timer_arm_failure_polls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Deterministically exercise the production timer-thread spawn-failure
+    /// result. The returned wait matches production's completed one-shot: it
+    /// supplies no wake of its own, so the caller must provide a bounded native
+    /// wake fallback and must latch completion rather than poll it twice.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn with_timer_arm_failure_for_test() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            #[cfg(feature = "test-seams")]
+            thread_lifecycle: None,
+            fail_timer_arm: true,
+            timer_arm_failure_waits: AtomicUsize::new(0),
+            timer_arm_failure_polls: AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn timer_arm_failure_waits_for_test(&self) -> usize {
+        self.timer_arm_failure_waits.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn timer_arm_failure_polls_for_test(&self) -> usize {
+        self.timer_arm_failure_polls.load(Ordering::SeqCst)
     }
 }
 
@@ -193,54 +310,130 @@ impl DeadlineClock for MonotonicDeadlineClock {
     }
 
     /// One waiter, one timer thread, released the moment the deadline is
-    /// reached. A wait whose deadline has already passed never starts one.
+    /// reached or the wait is abandoned. A wait whose deadline has already
+    /// passed never starts one, and a wait that is dropped first ends its
+    /// thread before the drop returns, so a deadline that was never needed
+    /// leaves nothing running behind the operation it bounded.
     fn wait_until(&self, deadline_ms: u64) -> DeadlineWait<'_> {
         let remaining = deadline_ms.saturating_sub(self.now_ms());
         if remaining == 0 {
             return Box::pin(std::future::ready(()));
         }
-        let state = Arc::new(Mutex::new(TimerState::default()));
+        #[cfg(any(test, feature = "test-seams"))]
+        if self.fail_timer_arm {
+            self.timer_arm_failure_waits.fetch_add(1, Ordering::SeqCst);
+            return Box::pin(InjectedTimerArmFailureWait {
+                completed: false,
+                polls: &self.timer_arm_failure_polls,
+            });
+        }
+        let state = Arc::new((Mutex::new(TimerState::default()), std::sync::Condvar::new()));
         let timer = Arc::clone(&state);
+        #[cfg(feature = "test-seams")]
+        let lifecycle = self.thread_lifecycle.clone();
         let spawned = std::thread::Builder::new()
             .name("contextdb-owner-deadline".to_owned())
             .spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(remaining));
-                let waker = {
-                    let mut timer = timer.lock().unwrap_or_else(|held| held.into_inner());
-                    timer.reached = true;
-                    timer.waker.take()
-                };
+                #[cfg(feature = "test-seams")]
+                let _exited = lifecycle.as_ref().map(|lifecycle| {
+                    let _ = lifecycle.started.send(());
+                    DeadlineThreadExit(Some(lifecycle.exited.clone()))
+                });
+                let (lock, changed) = &*timer;
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(remaining);
+                let mut state = lock.lock().unwrap_or_else(|held| held.into_inner());
+                loop {
+                    if state.abandoned {
+                        return;
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= until {
+                        break;
+                    }
+                    state = changed
+                        .wait_timeout(state, until - now)
+                        .map(|(state, _)| state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().0);
+                }
+                state.reached = true;
+                let waker = state.waker.take();
+                drop(state);
                 if let Some(waker) = waker {
                     waker.wake();
                 }
             });
-        if spawned.is_err() {
-            return Box::pin(std::future::ready(()));
+        match spawned {
+            Ok(thread) => {
+                #[cfg(any(test, feature = "test-seams"))]
+                note_timer_thread_started_for_test();
+                Box::pin(TimerWait {
+                    state,
+                    thread: Some(thread),
+                })
+            }
+            Err(_) => Box::pin(std::future::ready(())),
         }
-        Box::pin(TimerWait { state })
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+struct InjectedTimerArmFailureWait<'a> {
+    completed: bool,
+    polls: &'a AtomicUsize,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl Future for InjectedTimerArmFailureWait<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        assert!(
+            !self.completed,
+            "one-shot timer-arm failure was polled twice"
+        );
+        self.completed = true;
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        let _ = context;
+        Poll::Ready(())
     }
 }
 
 #[derive(Default)]
 struct TimerState {
     reached: bool,
+    abandoned: bool,
     waker: Option<Waker>,
 }
 
 struct TimerWait {
-    state: Arc<Mutex<TimerState>>,
+    state: Arc<(Mutex<TimerState>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Future for TimerWait {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.state.lock().unwrap_or_else(|held| held.into_inner());
+        let mut state = self.state.0.lock().unwrap_or_else(|held| held.into_inner());
         if state.reached {
             return Poll::Ready(());
         }
         state.waker = Some(context.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for TimerWait {
+    fn drop(&mut self) {
+        {
+            let mut state = self.state.0.lock().unwrap_or_else(|held| held.into_inner());
+            state.abandoned = true;
+            state.waker = None;
+        }
+        self.state.1.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

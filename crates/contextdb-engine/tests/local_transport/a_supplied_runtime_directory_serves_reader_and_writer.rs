@@ -19,6 +19,7 @@ use contextdb_engine::{
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -178,4 +179,48 @@ fn the_same_directory_reads_the_committed_file_when_nobody_owns_the_store() {
         panic!("an absent owner is a typed refusal: {refusal:?}");
     };
     assert_eq!(failure.kind(), ReadFailureKind::OwnerNotRunning);
+}
+
+#[test]
+fn a_supplied_root_reads_a_stopped_store_without_a_platform_runtime_root() {
+    const CHILD: &str = "CONTEXTDB_SUPPLIED_ROOT_FILE_CHILD";
+    const STORE: &str = "CONTEXTDB_SUPPLIED_ROOT_FILE_STORE";
+    const ROOT: &str = "CONTEXTDB_SUPPLIED_ROOT_FILE_ROOT";
+
+    if std::env::var_os(CHILD).is_some() {
+        let path = PathBuf::from(std::env::var_os(STORE).expect("child store path"));
+        let runtime = PathBuf::from(std::env::var_os(ROOT).expect("child runtime root"));
+        let session =
+            ReadSession::open_in_runtime_dir(&path, ReadSessionOptions::default(), Some(runtime))
+                .expect("the supplied root serves a stopped store without a platform root");
+        assert_eq!(session.route(), ReadRoute::File);
+        let answer = session
+            .execute("SELECT label FROM shared ORDER BY id", &HashMap::new())
+            .expect("the committed row is readable");
+        assert_eq!(answer.rows, vec![vec![Value::Text("kept".to_owned())]]);
+        return;
+    }
+
+    let directory = tempfile::TempDir::new().expect("task-scoped runtime directory");
+    let runtime = supplied_runtime_directory(directory.path(), "supplied-runtime");
+    let (database, path) = writer_in(directory.path(), &runtime);
+    database.close().expect("leave a stopped store");
+    let unavailable = directory.path().join("no-platform-runtime");
+    assert!(!unavailable.exists(), "the platform root is unavailable");
+    let output = Command::new(std::env::current_exe().expect("integration test binary"))
+        .arg("--exact")
+        .arg("a_supplied_runtime_directory_serves_reader_and_writer::a_supplied_root_reads_a_stopped_store_without_a_platform_runtime_root")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env(STORE, &path)
+        .env(ROOT, &runtime)
+        .env("XDG_RUNTIME_DIR", unavailable)
+        .output()
+        .expect("run the reader without a platform root");
+    assert!(
+        output.status.success(),
+        "the stopped-store reader failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

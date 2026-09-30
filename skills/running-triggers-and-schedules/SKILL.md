@@ -61,7 +61,7 @@ SQL
 {"rows_affected":0}
 {"rows_affected":0}
 {"rows_affected":1}
-{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":true,"delivered":1,"examined":1,"kind":"sink","name":"slack","permanent_failures":0,"queued":0,"retried":0,"type":"CALLBACK"},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
+{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":true,"delivered":1,"examined":1,"kind":"sink","name":"slack","permanent_failures":0,"queued":0,"retried":0,"type":"CALLBACK","uncertain":0},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
 ```
 
 `callback_registered:true` and `delivered:1` together are the proof — the CLI's `:memory:` default
@@ -98,7 +98,7 @@ ok (rows_affected=1)
 Event types:
   inv_match WHEN INSERT ON invalidations
 Sinks:
-  slack TYPE CALLBACK registered=true delivered=2 queued=0 retried=0 permanent_failures=0 examined=2
+  slack TYPE CALLBACK registered=true delivered=2 queued=0 retried=0 uncertain=0 permanent_failures=0 examined=2
 Routes:
   inv_to_slack EVENT inv_match TO slack
 Schedules:
@@ -197,7 +197,7 @@ SQL
 {"rows_affected":0}
 {"rows_affected":0}
 {"rows_affected":1}
-{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":false,"delivered":0,"examined":0,"kind":"sink","name":"slack","permanent_failures":0,"queued":1,"retried":0,"type":"CALLBACK"},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
+{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":false,"delivered":0,"examined":0,"kind":"sink","name":"slack","permanent_failures":0,"queued":1,"retried":0,"type":"CALLBACK","uncertain":0},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
 ```
 
 `callback_registered:false, delivered:0, queued:1` — this is the queued-not-delivered state, and it
@@ -209,7 +209,7 @@ echo ".events status" | contextdb ./events.db --json
 
 ```json
 {"notice":{"class":"io","detail":{"kind":"read_route","route":"file","snapshot_at":"2026-08-30T02:41:07Z"},"message":"reading the committed snapshot taken at 2026-08-30T02:41:07Z"}}
-{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":false,"delivered":0,"examined":0,"kind":"sink","name":"slack","permanent_failures":0,"queued":1,"retried":0,"type":"CALLBACK"},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
+{"events_status":{"continuation":null,"has_more":false,"items":[{"kind":"event_type","name":"inv_match","table":"invalidations","trigger":"INSERT"},{"callback_registered":false,"delivered":0,"examined":0,"kind":"sink","name":"slack","permanent_failures":0,"queued":1,"retried":0,"type":"CALLBACK","uncertain":0},{"event_type":"inv_match","kind":"route","name":"inv_to_slack","sink":"slack"}]}}
 ```
 
 Both lines are shown because both reach the terminal. The first is the read-route notice every
@@ -273,7 +273,7 @@ are tagged by `kind`, so a consumer filters rather than indexing four parallel a
 {"events_status":{
   "items":[
     {"kind":"event_type","name":"...","table":"...","trigger":"INSERT|UPDATE"},
-    {"kind":"sink","name":"...","type":"CALLBACK","callback_registered":true,"examined":N,"delivered":N,"queued":N,"retried":N,"permanent_failures":N},
+    {"kind":"sink","name":"...","type":"CALLBACK","callback_registered":true,"examined":N,"delivered":N,"queued":N,"retried":N,"uncertain":N,"permanent_failures":N},
     {"kind":"route","name":"...","event_type":"...","sink":"..."},
     {"kind":"schedule","name":"...","every":"...","callback":"...","callback_registered":true,"fire_count":N,"last_fire_at_ms":N,"next_fire_at_ms":N}
   ],
@@ -293,14 +293,24 @@ are tagged by `kind`, so a consumer filters rather than indexing four parallel a
 - `delivered` — examined events whose callback ran successfully. `delivered <= examined` always.
 - `queued` — examined events waiting for a callback to be registered (or waiting on a retry).
   Non-zero `queued` on a file-backed store with no callback registered is expected, per recipe 3.
-- `retried` / `permanent_failures` — a registered callback that returned `Err` gets retried up to
-  the engine's own retry policy; `permanent_failures` is what exhausted it, not what merely queued.
+- `retried` — attempts that returned `SinkError::Transient` or `SinkError::OutcomeUncertain` (or
+  panicked) and stay pending; the dispatcher retries them with backoff and the same
+  `SinkEvent::action_id`, so the queue entry is never dropped for being retried.
+- `uncertain` — external attempts whose outcome could not be confirmed: the callback returned
+  `SinkError::OutcomeUncertain`, panicked after delivery began, or the process died mid-delivery.
+  The action stays pending and is retried with the same `action_id`; this count does not say
+  whether the recipient saw it, so a receiver that deduplicates on `action_id` absorbs the retry.
+  It is reported separately from `delivered` and `permanent_failures`, and a read-only session
+  reports it too.
+  <!-- enforced by: crates/contextdb-cli/src/json_output.rs::event_status_json_reports_uncertainty_separately, tests/integration/transactional_callback_delivery.rs::lost_acknowledgement_retries_same_identity_and_deduplicates_visible_event, tests/integration/transactional_callback_delivery.rs::crash_during_external_delivery_recovers_uncertainty_before_retry -->
+- `permanent_failures` — attempts the callback refused with `SinkError::Permanent`; the entry is
+  acknowledged and removed, not retried.
 - `callback_registered` — `true` only once *something in this process* called `register_sink` /
   `register_cron_callback` for that name. It resets to `false` on a fresh process even though
   `queued` durably survives — registration is a runtime fact, the queue is a durable one.
 
 **If you see `permanent_failures > 0`**, that is a real delivery failure your callback returned
-`Err` for — go read your callback's error path, not the DDL.
+`SinkError::Permanent` for — go read your callback's error path, not the DDL.
 
 ## Gotchas
 
@@ -315,6 +325,11 @@ are tagged by `kind`, so a consumer filters rather than indexing four parallel a
 - **Registering under the wrong name is a silent no-op**, not an error — `register_sink`/
   `register_cron_callback` succeed for any name; nothing checks it against declared DDL at
   registration time, only at delivery/fire time via `.events status`'s counters.
+
+A trigger callback cannot remove its own trigger with `DROP TRIGGER`, including through the
+transaction-bound handle: it receives `Error::TriggerRequiresAdmin`, and the declaration stays
+active. Drop triggers from an administrative handle outside the callback.
+<!-- enforced by: tests/acceptance/trigger.rs::t3_reg_introspection_and_delete_event_rejection -->
 
 ## Next
 

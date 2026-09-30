@@ -577,6 +577,46 @@ impl Database {
         }))
     }
 
+    /// The reader's own row restrictions on this table, as the values the row
+    /// gate itself compares against, one entry per restricted column.
+    ///
+    /// This is the same `contexts` and `scope_labels` sets
+    /// [`Self::bounded_read_allowed_for_row`] reads, handed out unrendered so a
+    /// caller that wants to know whether a statement already enforces a
+    /// restriction compares values rather than re-parsing text. A grant column
+    /// is deliberately absent: entitlement is a lookup in another table, not a
+    /// finite set of column values, and no caller may treat its absence here as
+    /// permission.
+    pub(crate) fn vector_access_restrictions(
+        &self,
+        table: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+        let mut restrictions = Vec::new();
+        if let (Some(contexts), Some(column)) = (&self.access.contexts, self.context_column(&meta))
+        {
+            restrictions.push((
+                column.name.clone(),
+                contexts.iter().map(|id| Value::Uuid(id.0)).collect(),
+            ));
+        }
+        if let (Some(labels), Some(column)) = (&self.access.scope_labels, self.scope_column(&meta))
+            && let Some(ScopeLabelKind::Split { read_labels, .. }) = &column.scope_label
+        {
+            restrictions.push((
+                column.name.clone(),
+                labels
+                    .iter()
+                    .filter(|label| read_labels.contains(&label.0))
+                    .map(|label| Value::Text(label.0.clone()))
+                    .collect(),
+            ));
+        }
+        Ok(restrictions)
+    }
+
     pub(crate) fn bounded_read_requires_candidate_filter(&self, table: &str) -> Result<bool> {
         if self.access_is_admin() {
             return Ok(false);
@@ -820,6 +860,13 @@ impl Database {
                 snapshot,
                 &mut before_access_row,
             )?,
+            None if self.retained_relational_source.is_some() => self
+                .bounded_allowed_acl_ids_in_retained_source(
+                    principal,
+                    acl_ref,
+                    snapshot,
+                    &mut before_access_row,
+                )?,
             None => {
                 let tables = self.relational_store.tables.read();
                 self.bounded_allowed_acl_ids_in_tables(
@@ -840,6 +887,64 @@ impl Database {
             &mut before_access_row,
         )?;
         Ok((!allowed.contains(acl_id)).then(acl_denied))
+    }
+
+    fn bounded_allowed_acl_ids_in_retained_source<E>(
+        &self,
+        principal: &Principal,
+        acl_ref: &AclRef,
+        snapshot: SnapshotId,
+        before_access_row: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Arc<HashSet<uuid::Uuid>>, E>
+    where
+        E: From<Error>,
+    {
+        let cache_key = AclGrantCacheKey {
+            principal: principal.clone(),
+            ref_table: acl_ref.ref_table.clone(),
+            ref_column: acl_ref.ref_column.clone(),
+            snapshot,
+        };
+        if let Some(cached) = self.acl_grant_cache.read().get(&cache_key).cloned() {
+            return Ok(cached);
+        }
+        let (kind, principal_id) = match principal {
+            Principal::System => return Ok(Arc::new(HashSet::new())),
+            Principal::Agent(id) => ("Agent", id.as_str()),
+            Principal::Human(id) => ("Human", id.as_str()),
+        };
+        let source = self.retained_relational_source.as_ref().ok_or_else(|| {
+            E::from(Error::Other(
+                "retained ACL scan requested without a retained relational source".to_owned(),
+            ))
+        })?;
+        let meta = self
+            .table_meta(&acl_ref.ref_table)
+            .ok_or_else(|| E::from(Error::TableNotFound(acl_ref.ref_table.clone())))?;
+        let mut allowed = HashSet::new();
+        source.bounded_visit_relational_rows::<E>(
+            &acl_ref.ref_table,
+            &meta,
+            snapshot,
+            |grant| {
+                before_access_row(grant.estimated_bytes())?;
+                if grant.visible_at(snapshot)
+                    && self
+                        .grant_row_context_scope_allowed(&acl_ref.ref_table, grant, snapshot)
+                        .map_err(E::from)?
+                    && grant.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
+                    && grant.values.get("principal_id")
+                        == Some(&Value::Text(principal_id.to_string()))
+                    && let Some(Value::Uuid(acl_id)) = grant.values.get(&acl_ref.ref_column)
+                {
+                    allowed.insert(*acl_id);
+                }
+                Ok(())
+            },
+        )?;
+        let allowed = Arc::new(allowed);
+        self.remember_allowed_acl_ids(cache_key, Arc::clone(&allowed));
+        Ok(allowed)
     }
 
     /// The entitlements this principal holds, read once and kept. Deciding a

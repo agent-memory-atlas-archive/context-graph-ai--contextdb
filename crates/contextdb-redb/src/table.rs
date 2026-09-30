@@ -215,7 +215,23 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         if value_len + key_len > MAX_PAIR_LENGTH {
             return Err(StorageError::ValueTooLarge(value_len + key_len));
         }
-        self.tree.insert(key.borrow(), value.borrow())
+        #[cfg(not(feature = "test-seams"))]
+        {
+            self.tree.insert(key.borrow(), value.borrow())
+        }
+        #[cfg(feature = "test-seams")]
+        {
+            let result = self.tree.insert(key.borrow(), value.borrow());
+            if result.is_ok() {
+                self.transaction.record_table_write_for_test(
+                    &self.name,
+                    crate::TableWriteOperationForTest::Insert,
+                    K::as_bytes(key.borrow()).as_ref(),
+                    value_len,
+                );
+            }
+            result
+        }
     }
 
     /// Removes the given key
@@ -225,7 +241,23 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         &mut self,
         key: impl Borrow<K::SelfType<'a>>,
     ) -> Result<Option<AccessGuard<'_, V>>> {
-        self.tree.remove(key.borrow())
+        #[cfg(not(feature = "test-seams"))]
+        {
+            self.tree.remove(key.borrow())
+        }
+        #[cfg(feature = "test-seams")]
+        {
+            let result = self.tree.remove(key.borrow());
+            if let Ok(Some(old)) = &result {
+                self.transaction.record_table_write_for_test(
+                    &self.name,
+                    crate::TableWriteOperationForTest::Remove,
+                    K::as_bytes(key.borrow()).as_ref(),
+                    V::as_bytes(&old.value()).as_ref().len(),
+                );
+            }
+            result
+        }
     }
 }
 
@@ -250,7 +282,23 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
         if value_length + key_len > MAX_PAIR_LENGTH {
             return Err(StorageError::ValueTooLarge(value_length + key_len));
         }
-        self.tree.insert_reserve(key.borrow(), value_length)
+        #[cfg(not(feature = "test-seams"))]
+        {
+            self.tree.insert_reserve(key.borrow(), value_length)
+        }
+        #[cfg(feature = "test-seams")]
+        {
+            let result = self.tree.insert_reserve(key.borrow(), value_length);
+            if result.is_ok() {
+                self.transaction.record_table_write_for_test(
+                    &self.name,
+                    crate::TableWriteOperationForTest::Insert,
+                    K::as_bytes(key.borrow()).as_ref(),
+                    value_length,
+                );
+            }
+            result
+        }
     }
 }
 
@@ -666,5 +714,75 @@ impl<K: Key + 'static, V: Value + 'static> DoubleEndedIterator for Range<'_, K, 
                 (key, value)
             })
         })
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+type BoundedByteEntry<'a> = (
+    AccessGuard<'a, &'static [u8]>,
+    AccessGuard<'a, &'static [u8]>,
+);
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadOnlyTable<&'static [u8], &'static [u8]> {
+    pub(crate) fn new_bounded(
+        name: String,
+        root: Option<BtreeHeader>,
+        hint: PageHint,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+    ) -> Self {
+        Self {
+            name,
+            tree: Btree::new_lazy(root, hint, guard.clone(), mem),
+            transaction_guard: guard,
+        }
+    }
+    #[doc(hidden)]
+    pub fn cursor_bounded(&self) -> crate::BoundedByteCursor<'_> {
+        self.tree.cursor_bounded()
+    }
+    #[doc(hidden)]
+    pub fn get_bounded(&self, key: &[u8]) -> Result<Option<AccessGuard<'static, &'static [u8]>>> {
+        self.tree.get_bounded(key)
+    }
+    #[doc(hidden)]
+    pub fn prefix_bounded<'a>(
+        &self,
+        prefix: &'a [u8],
+    ) -> Result<impl Iterator<Item = Result<BoundedByteEntry<'static>>> + 'a> {
+        Ok(self.tree.iter_bounded(Some(prefix), None))
+    }
+    #[doc(hidden)]
+    pub fn iter_bounded_value_prefix<'a>(
+        &self,
+        offset: usize,
+        prefix: &'a [u8],
+    ) -> Result<impl Iterator<Item = Result<BoundedByteEntry<'static>>> + 'a> {
+        Ok(self.tree.iter_bounded(None, Some((offset, prefix))))
+    }
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl Table<'_, &'static [u8], &'static [u8]> {
+    #[doc(hidden)]
+    pub fn get_bounded(&self, key: &[u8]) -> Result<Option<AccessGuard<'_, &'static [u8]>>> {
+        self.tree.get_bounded(key)
+    }
+    #[doc(hidden)]
+    pub fn prefix_bounded<'a>(
+        &'a self,
+        prefix: &'a [u8],
+    ) -> Result<impl Iterator<Item = Result<BoundedByteEntry<'a>>> + 'a> {
+        Ok(self
+            .tree
+            .iter_bounded(self.transaction.transaction_guard().clone(), Some(prefix))
+            .map(|entry| {
+                entry.map(|(key, value)| {
+                    let key: AccessGuard<'a, &'static [u8]> = key;
+                    let value: AccessGuard<'a, &'static [u8]> = value;
+                    (key, value)
+                })
+            }))
     }
 }

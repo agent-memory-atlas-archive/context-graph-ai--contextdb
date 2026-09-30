@@ -2749,7 +2749,13 @@ fn a10_03_budget_release_frees_capacity() {
 
 #[test]
 fn a10_04_bfs_aborts_on_frontier_overflow() {
-    let accountant = Arc::new(MemoryAccountant::with_budget(4096));
+    // 4 KiB over the two schemas. Each single-column PRIMARY KEY allocates a
+    // fixed 64 KiB exact-probe bitmap for the life of the index; it always
+    // did, and since the charge model was corrected the accountant sees it, so
+    // a budget meaning "the schema and 4 KiB more" has to say so.
+    let accountant = Arc::new(MemoryAccountant::with_budget(
+        2 * contextdb_core::EXACT_PROBE_FILTER_BYTES + 4096,
+    ));
     let db = contextdb_engine::Database::open_memory_with_accountant(accountant);
     db.execute(
         "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT)",

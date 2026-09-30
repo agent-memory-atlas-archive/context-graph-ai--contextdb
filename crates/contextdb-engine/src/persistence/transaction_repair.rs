@@ -211,6 +211,15 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                 }
             }
+            Self::rebuild_open_vector_directory_in_write(&write)?;
+            Self::rebuild_read_open_config_in_write(&write)?;
+            Self::rebuild_read_custody_config_in_write(&write)?;
+            Self::write_vector_body_root_fingerprint(&write)?;
+            Self::apply_content_identity_mutations_in_write(
+                &write,
+                &[],
+                &mut self.proof_admission(),
+            )?;
             write.commit().map_err(Self::storage_error)
         })
     }

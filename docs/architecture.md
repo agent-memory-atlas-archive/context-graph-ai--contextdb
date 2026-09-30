@@ -46,6 +46,15 @@ publishing this package before the engine, formatting/linting/testing its standa
 building the unpacked engine against the unpacked fork with `scripts/verify-packaged-engine.sh`.
 An upstream proposal remains part of maintenance; no upstream acceptance is claimed.
 
+The fork's `contextdb-internal` byte-table seam provides bounded lookup, prefix inspection and a
+root-pinned opaque cursor. Reject-only windows can exclude an unrelated oversized singleton without
+materializing its full extent. Possible matches use ordinary complete-page admission and decoding;
+retained roots keep complete checksum verification. Complete nodes reached by lookup, prefix
+iteration or cursor navigation validate their layouts before offset access, so malformed leaves and
+branches return typed corruption without panic. Branch cycles on all three paths return typed
+corruption without hanging. The engine owns inventory policy above this seam.
+<!-- enforced by: crates/contextdb-redb/src/tree_store/bounded_bytes.rs::absent_lookup_and_prefix_neighbor_reject_without_materializing_the_extent, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::retained_root_inspection_keeps_full_checksum_admission, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::bounded_lookup_rejects_malformed_leaf_and_branch_without_panicking, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::bounded_prefix_iteration_rejects_malformed_leaf_and_branch_without_panicking, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_layout_validation_rejects_malformed_navigation, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::bounded_lookup_rejects_branch_cycle_without_hanging, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::bounded_prefix_iteration_rejects_branch_cycle_without_hanging, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_navigation_rejects_branch_cycle_without_hanging -->
+
 ---
 
 ## Subsystem Design
@@ -91,7 +100,7 @@ audio, or policy embeddings with different dimensions and quantization choices.
   workload policy; silence keeps the compatibility profile. `AUTO` applies its effective threshold
   to the aggregate allowed set, while `EXACT` and `INDEXED` remain explicit whole-query contracts.
   The canonical SQL reference defines syntax, defaults, and online effects.
-  <!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_search_mode_bounded_contract::auto_uses_the_aggregate_selected_scope_not_each_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible -->
+  <!-- enforced by: vector_policy_resolver_contract::declared_vector_policy_resolves_consistently_at_default_and_declared_boundaries, vector_search_mode_bounded_contract::auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible -->
 - Filtered and broad searches stay bounded. Selected layouts are searched independently with a
   global candidate heap, then one final top-k; the engine does not load every selected graph at once.
   <!-- enforced by: vector_partition_query_contract::finite_in_partition_scope_merges_before_one_limit, vector_search_mode_bounded_contract::filtered_many_partition_search_reuses_partition_local_candidates, vector_lazy_raw_residency_contract::indexed_many_partition_reads_point_load_only_visible_versioned_candidates -->
@@ -125,12 +134,11 @@ not a missing feature.
 
 **Reading** is a separate door that does not take the write lock. A read session
 (`ReadSession` in Rust, `contextdb <path>` without `--write` on the CLI) resolves
-one of two routes when it opens, and never changes route mid-session:
+one of two routes when it opens. Ordinary reads keep that route for the session:
 
 - **Owner route** — a live process owns the store, so the reader is served that
-  owner's committed state over an authenticated local channel. The reader never
-  attaches to the file, and the owner's declared ceilings and deadlines govern
-  what it may ask for.
+  owner's committed state over an authenticated local channel. The owner's
+  declared ceilings and deadlines govern what it may ask for.
 - **File route** — nobody owns the store, so the reader reads the committed
   snapshot from the file directly and leaves every byte of the store folder
   unchanged. Several direct readers coexist on one store.
@@ -143,6 +151,121 @@ writer waits rather than tearing the file out from under it, and publishes a
 best-effort record of itself so that refusal can name who to go and look at. A direct read that finds committed state a writable open
 would have to mend refuses with `direct_read_requires_writer` instead of serving
 something the file cannot back.
+
+An in-memory database has no backing file, companion, or owner channel.
+<!-- enforced by: crates/contextdb-cli/tests/read_cli_journeys_invocation.rs::memory_store_emits_no_route_notice_and_reports_owner_state_not_applicable -->
+
+The supplied runtime directory names the owner channel; a channel startup failure leaves the
+database open with a `not_serving` status. Reader coordination uses the platform per-user
+directory when available, otherwise the supplied directory. Inventories inspect every known
+candidate directory, and an empty inventory does not prove that no reader exists. A writer
+publishes purge fences to each candidate. If one cannot be authenticated, the affected purge or
+reclamation refuses with a typed error naming that directory while database open remains
+available. On Linux each reader also holds byte-free database-file advisory presence locks.
+An unmatched lock retains potentially old pages during commits and refuses explicit purge or
+reclamation with `ReaderCoordinationUnavailable`, covering readers with different supplied roots
+when no platform root exists. The filesystem must support Linux OFD locks. Other Unix systems
+without a common platform root retain a conservative floor and refuse these operations when
+the inventory cannot be proved complete.
+
+Once a file reader has captured its committed image, it publishes an authenticated registration
+for that physical store incarnation and exact storage root for the lifetime of the shared session
+target. A later writer validates the pre-writer registrations before it can allocate or reclaim
+pages. Redb authenticates each saved root page and pins its transaction as a floor for durable
+deferred frees. Cursor admission keeps only fixed-size root metadata and does not enumerate the
+database under the commit lock. While a root is held, this conservative floor can also defer
+unrelated freed pages. They remain in the store's existing disk allocation and disk limit; the
+on-demand root-page diagnostic counts only the pages reachable from registered roots. The last
+close or authenticated process death releases the snapshot floor; subsequent durable writer
+commits reclaim eligible extents incrementally. Each such commit examines at most 64 deferred-free
+list entries and reclaims at most 64 allocated extents in total across redb's data and system free
+trees. An extent is one contiguous allocation and can span multiple physical pages, so this is
+not a 64-physical-page or byte bound. The separate append-time and memory acceptance gates still
+apply.
+The remaining list position is durable, so an ordinary abort before commit-only reclamation leaves
+pending work intact and later commits continue after restart. Reclamation runs only inside commit,
+after the ordinary abort path is disabled; aborting after that private reclaim stage is not a
+supported transaction operation. A released cursor does not make the next small append drain an
+arbitrarily large backlog.
+Explicit close drains eligible deferred frees through bounded commits before publishing the
+read-only handoff. A live reader or savepoint leaves protected work for a later writer. After
+handoff publication, no storage write is permitted. Cleanup or handoff failure is reported from
+explicit close after owner resources are released; an owner-read timeout can defer that failure
+until a later close finishes the drain. Destructor cleanup does not promise a drain.
+This is allocator cleanup behind the reader fence, distinct from retention's selection and removal
+of logical row versions below. Handles and cursors sharing a direct-file session target share one
+root hold. The registration does not hold writer admission for the session.
+<!-- enforced by: cursor_survives_writer_handover::closing_a_cursor_keeps_the_next_small_append_cleanup_bounded, crates/contextdb-redb/src/transactions.rs::released_snapshot_cleanup_is_bounded_durable_and_eventually_drains, crates/contextdb-redb/src/transactions.rs::empty_deferred_lists_consume_the_entry_budget, crates/contextdb-redb/src/transactions.rs::one_unit_budget_progresses_in_both_trees -->
+
+Before asking an owner to open a cursor, the client registers a provisional hold on the exact
+physical file. After receiving the first page it publishes the exact saved root before releasing
+that provisional hold. This overlap protects the original snapshot even when the owner closes and
+a replacement writer commits between response receipt and exact registration; registration does
+not require the old writer to remain present. The exact hold remains with the cursor when the owner
+exits. If the owner channel is withdrawn, the cursor continues through the file reader at
+that registered snapshot: it reexecutes its statement, skips the rows already delivered, and
+returns the remaining pages under the original cursor limits. A new writer may commit in between
+without changing the cursor's answer or forcing the caller to retry. Authoritative erasure returns
+its typed refusal and immediately releases the client's cursor registration and retained resources,
+even while the failed cursor object remains alive. A complete first page or final fetch releases
+the cursor's root even when the caller keeps its cursor object. A deadline watcher uses the cursor's
+declared clock to release an idle or lifetime-expired root without another fetch; a later fetch
+keeps the typed expiry. Direct-file cursors release their own execution resources at the same
+terminal pages, while a shared direct-file session root remains held for that session's lifetime.
+This continuation is internal to an already-open cursor; the session's selected route and ordinary
+request behavior remain fixed.
+Replay spends the caller's per-fetch work and active-time budget. If catching up uses that budget,
+the cursor keeps its position and may return an empty page with `has_more` before continuing on
+the next fetch. Admission reads one root page regardless of unrelated store size; explicit
+diagnostics may inspect all root pages. Replay work grows with rows already delivered.
+<!-- enforced by: cursor_survives_writer_handover::cursor_opened_before_writer_handover_finishes_its_snapshot, cursor_survives_writer_handover::owner_exit_after_open_response_does_not_break_client_registration, cursor_survives_writer_handover::small_cursor_admission_work_and_charged_memory_ignore_unrelated_store_size, cursor_survives_writer_handover::final_fetch_releases_pages_before_the_cursor_object_is_dropped, cursor_survives_writer_handover::idle_expiry_reclaims_pages_without_another_client_request, cursor_survives_writer_handover::replay_yields_under_one_public_fetch_budget_and_keeps_its_progress, authoritative_purge_reader_publication::owner_cursor_paused_before_carrier_publication_cannot_emit_after_purge -->
+
+A file reader opens from compact indexes the writer keeps beside the data, not from a copy of the
+whole store. At open it reads one small membership record per stored vector, checked against a
+commitment the writer publishes in the same transaction, and it compares that complete
+membership and visibility copy with a set commitment carried in the committed vector family
+roots — the same identity that authenticates vector bodies — before the copy controls search
+selection. It also compares the vector table's physical root fingerprint with the committed one
+without reading any vector body. It copies only the handful of settings a reader needs to start
+and compares them with an ordered digest carried in the committed Configuration root. The bytes
+an open reads for vectors and settings therefore do not grow with vector dimension or with
+unrelated configuration values; the vector part grows only with the number of vectors, one small
+record each. Rows, vector bodies and every other setting are read and authenticated from the
+reader's pinned root only when a query selects them. A tampered or incomplete index or startup
+copy is refused at open as corruption. A membership copy whose deletion markers hide a still-
+committed vector is refused at open even when its local checksums agree: the committed vector
+roots carry an order-independent lattice-hash commitment to the complete membership set, which the
+writer keeps current by folding in only the memberships each commit changes, so appending to a
+large store does not rehash its memberships. The copied custody index used for read-only policy
+and delivery inspection authenticates each copied record and compares the complete copy with the
+same kind of commitment in the committed Configuration root, also maintained per changed record,
+so a shortened copy is refused as damage even when its local checksums agree. That check runs when
+inspection reads the index, not at open, and it does not read unrelated configuration values.
+A damaged vector key is refused at open; damage confined to a vector's stored value is refused
+when a query selects that vector.
+<!-- enforced by: open_reads_compact_vector_and_config_state::opening_equal_vector_memberships_reads_bytes_independent_of_dimension, open_reads_compact_vector_and_config_state::opening_reads_only_config_values_needed_for_the_reader_image, open_reads_compact_vector_and_config_state::a_tampered_compact_vector_directory_is_refused_at_open, open_reads_compact_vector_and_config_state::a_self_consistent_visibility_copy_cannot_hide_a_committed_vector, open_reads_compact_vector_and_config_state::a_committed_vector_delete_stays_absent_after_reopen, open_reads_compact_vector_and_config_state::a_replayed_startup_setting_with_recomputed_copy_checksums_is_refused_at_open, open_reads_compact_vector_and_config_state::a_missing_copied_startup_setting_with_recomputed_copy_checksums_is_refused_at_open, open_reads_compact_vector_and_config_state::a_custody_copy_missing_one_policy_cannot_return_a_shortened_show_list, read_only_open_loads_only_the_working_set::open_configuration_proofs_follow_needed_settings_not_unrelated_config_entries, relational_on_demand_source_contract::public_relational_reads_fault_only_the_selected_rows_and_survive_writer_recycle, raw_vector_on_demand_source_contract::mixed_file_reads_point_load_exact_vectors_and_keep_their_snapshot_after_recycle, direct_file_reader_contract_tests::selected_quantized_vectors_are_authenticated_before_they_are_returned -->
+
+When the owner closes gracefully, readers are handed over rather than cut off. The owner first
+stops accepting writes, makes the file's committed state clean for direct readers, and publishes
+that the store is quiescent while it still holds the store; only then does it withdraw its read
+channel. Owner reads it had already accepted run to completion, or to their own declared limits,
+before it releases the store. A reader that opens during the handoff takes the file route and sees
+the committed rows. When several callers close the same database at once, one of them performs the
+shutdown and the others return only after it has finished, so a writable reopen after `close()`
+returns never races a half-finished shutdown.
+<!-- enforced by: graceful_owner_drop_completes_accepted_read::graceful_close_publishes_quiescence_before_withdrawing_the_channel, graceful_owner_drop_completes_accepted_read::dropped_owner_finishes_an_accepted_request_before_releasing_the_store, graceful_owner_drop_completes_accepted_read::two_ordinary_close_callers_wait_for_one_complete_shutdown, graceful_owner_drop_completes_accepted_read::ordinary_close_waits_until_callback_dispatcher_releases_writer_resources -->
+
+`ReadSession::charged_bytes` reports the memory the session is currently charged for. On the file
+route that is the session's own charge; on the owner route it is the owner's shared usage, which
+can include other work. Closing a cursor releases its result memory, but a storage or proof page
+still held by the session or another reader stays charged until its last holder releases it.
+Evicting the cache entry alone does not release that charge.
+<!-- enforced by: session_charged_bytes::public_charged_bytes_reports_and_releases_cursor_hydration_on_both_routes, direct_file_image_memory_lifetime::a_read_within_limit_succeeds_and_keeps_its_page_charged_until_the_session_drops, crates/contextdb-engine/src/persistence/search_page_reuse_tests.rs::a_proof_page_a_statement_still_holds_stays_charged_after_the_cache_evicts_it, crates/contextdb-engine/src/persistence/search_page_reuse_tests.rs::statement_cleanup_after_success_refusal_and_cancellation_leaves_no_uncharged_page -->
+
+A stored value too large for a read's memory budget is refused before its source buffer is
+allocated. Opening a session need not read that value: the refusal belongs to the statement that
+selects it, on both the file and owner routes, and leaves no new charge behind.
+<!-- enforced by: direct_file_image_memory_lifetime::one_oversized_durable_value_is_refused_before_its_source_buffer_is_allocated -->
 
 This is still the standard embedded-database model — the same shape as SQLite,
 LMDB, or redb: the application that mutates the data **owns the handle for its
@@ -199,11 +322,17 @@ not say who". Reading the process id out of the prose is never necessary.
 ## Trigger Concurrency
 
 Triggers are host callbacks declared with `CREATE TRIGGER` and
-registered through `Database::register_trigger_callback`. They are not
+registered through `Database::register_transactional_trigger_callback` (or the
+older `register_trigger_callback` name). They are not
 PG-style validation triggers; schema invariants remain engine-enforced through
 DDL. A trigger callback runs synchronously inside the firing transaction's
 commit window, and callback writes use the supplied tx-bound `Database` handle
-so relational rows, graph edges, and vectors commit atomically.
+so relational rows, graph edges, and vectors commit atomically. The callback
+runs before final validation, so its writes are validated with the rest of the
+transaction, and a refused commit publishes none of them. External effects
+belong in a sink registered with `Database::register_sink`, which the durable
+queue invokes only after commit; see
+[`README.md`](../README.md#triggers) for the delivery and retry contract.
 
 The callback-active contract is deliberately split by concurrency domain:
 
@@ -283,10 +412,22 @@ Single-file storage via redb:
   working set, rather than rebuilding every vector index.
   <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_lazy_consumer_restart_contract::point_lookup_after_reopen_loads_only_the_row_partition_and_returns_its_vector -->
 - Crash-safe: redb provides atomic transactions
+- Committed row bodies: a file-backed store keeps key, index, constraint and policy columns and
+  values up to 1 KiB resident; larger text/JSON values and vectors stay only in redb. Anything that
+  hands a row on — a pushed or pulled sync changeset, a full-state snapshot, a custody manifest
+  digest — reads the paged-out columns back from that row's exact durable version when the change is
+  built, one row at a time, so the wire unit carries every committed column. A unit that then
+  exceeds one sync frame travels on the oversized staging transport. Under a bounded history
+  answer the version's stored size is charged to the declared memory limit before it is read.
+  <!-- enforced by: delivery_manifest_contract::a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_staging_path_and_is_never_served_to_a_pulling_peer -->
+- Vector membership commitments are updated from the records changed by the commit. Appending
+  or deleting one vector does not rehash the complete membership directory; the same incremental
+  rule applies to a custody-policy write's set commitment.
+  <!-- enforced by: one_vector_append_does_not_rescan_the_directory::appending_one_vector_hashes_only_what_that_commit_changed, one_vector_append_does_not_rescan_the_directory::deleting_one_vector_hashes_only_what_that_commit_changed, one_vector_append_does_not_rescan_the_directory::one_custody_policy_write_hashes_only_what_that_commit_changed -->
 - Tables: rows, DDL metadata, graph edges, vector entries, counters
 - Vector entries use one composite-key table keyed by `(table, column, row_id)`.
 - A `metadata` table stores `format_version = "1.0.0"`; missing markers are
-  treated as legacy stores, while unreadable markers are reported as corrupt.
+  treated as incompatible stores, while unreadable markers are reported as corrupt.
 
 ### Vector generations, restart, and repair
 
@@ -310,14 +451,73 @@ query path, so an older valid route and ordinary relational/graph reads remain u
 <!-- enforced by: vector_partition_restart_contract::partitioned_indexed_search_survives_two_clean_restarts_without_a_query_rebuild, vector_lazy_replay_budget_contract::first_bounded_restart_query_charges_lazy_decode_and_replay_to_the_request_ceiling, vector_generation_quarantine_compaction_lock_contract::corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors, vector_generation_quarantine_compaction_lock_contract::newer_catalog_format_quarantines_only_that_route, vector_generation_quarantine_compaction_lock_contract::corrupt_journal_quarantines_and_repairs_one_route_while_a_cold_neighbour_builds, vector_generation_quarantine_compaction_lock_contract::caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart, vector_generation_quarantine_compaction_lock_contract::engine_owned_worker_repairs_the_quarantined_route_without_a_caller_cycle -->
 
 Raw vectors, base graphs, change graphs, and compaction workspace are independently accounted for.
+Generation admission counts raw versions separately from selected live graph points at one committed
+frontier. Ordinary resident generations price and copy only their consumed frontier-live entries,
+with an optional LSN boundary for a change graph. Selection preserves every retained membership,
+MVCC interval and canonical digest, including when writes advance after the captured frontier;
+refusal precedes body copying. Tombstone metadata does not add ordinary graph points. Full cold
+snapshots and delete-only carriers retain their raw-history path; change graphs use the actual live
+delta and the existing delete-only carrier rule.
+<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::a_retained_raw_body_has_decode_scratch_even_without_live_graph_points, vector_generation_admission_contract::retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph, vector_generation_delta_admission_contract::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries -->
+<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_preserves_retained_canonical_digests, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_writes, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::resident_generation_selection_admits_history_below_the_full_copy_bound_and_refuses_before_bodies, crates/contextdb-vector/src/store/generation_selection_tests.rs::selected_generation_materialization_preserves_all_representations_and_snapshot_intervals, crates/contextdb-vector/src/store/generation_selection_tests.rs::selected_generation_refuses_inconsistent_metadata_before_body_materialization -->
+
+A resident partition snapshot funds its copies without a generation-owned decoder. Dormant or
+evicted raw partitions admit loader decode scratch separately; direct cold reads and delete-only
+carriers retain the generation decoder's 1 MiB serde scratch floor as well as declared-body scratch,
+even when retained history has no live graph points.
+<!-- enforced by: crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_f32_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_sq8_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::resident_sq4_generation_funds_snapshot_without_a_decoder_owner, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::direct_cold_and_delete_carrier_generations_keep_the_decode_floor, crates/contextdb-engine/src/database/vector_generation_decode_owner_tests.rs::dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases -->
+
+Construction owns the raw snapshot, selected input and
+builder workspace; after input clones drop, encoding owns the builder and one checked codec
+envelope bound and encoder scratch. After the builder drops, the raw snapshot coexists with the
+candidate. The state digest equals the BLAKE3 hash of the canonical encoding of sorted snapshot-live entries
+(the proof checks byte identity, not streaming or peak allocation). After the raw snapshot drops, persistence
+owns the candidate and its encoding, validation and durable-write copies. Only change publication
+loads the prior base. The shared accountant atomically replaces each phase's held charge without
+exposing its capacity or charging both phases; refusal leaves the old charge intact.
+<!-- enforced by: crates/contextdb-engine/src/database/maintenance_resource_tests.rs::durable_generation_workspace_separates_build_and_persistence_owners, crates/contextdb-vector/src/hnsw.rs::durable_codec_capacity_bounds_all_stored_representations_and_checks_overflow, crates/contextdb-engine/src/database/maintenance_resource_tests.rs::streamed_state_digest_preserves_the_canonical_live_entry_encoding, vector_generation_admission_contract::encoding_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::candidate_shrink_transfers_held_workspace_without_additive_headroom, vector_generation_admission_contract::growing_persistence_transitions_refuse_atomically_for_base_and_change_publication, vector_generation_delta_admission_contract::small_delta_refuses_growing_prior_base_candidate_before_allocation_then_retries -->
+Page preparation
+retains one graph body and frames each physical key and page only during insertion. Reader-held
+old generations remain charged until their final holder releases them.
+<!-- enforced by: crates/contextdb-engine/src/persistence/generation_admission_tests.rs::near_extent_sized_page_roots_are_streamed_and_every_disk_key_is_counted, vector_generation_admission_contract::multiple_pinned_generations_remain_charged_until_their_final_snapshot_release -->
+An immutable candidate refines only its graph-page frame bound: sequential base/change page
+insertion needs the larger frame, rather than their sum, and no frame for empty graph bytes.
+The conservative constructor and payload bounds still apply.
+<!-- enforced by: crates/contextdb-engine/src/persistence/vector_streamed_frame_tests.rs::concrete_streamed_frame_covers_exact_capacities_and_root_edges, crates/contextdb-engine/src/persistence/vector_streamed_frame_tests.rs::candidate_streamed_frame_is_sequential_max_and_empty_zero, vector_generation_admission_contract::fresh_ten_thousand_dense_vectors_publish_and_restart_under_writer_limit, vector_generation_admission_contract::tiny_limit_refuses_with_typed_details_without_partial_generation -->
+Actual Redb source extents
+are admitted before allocation independently of decode/build workspace; uncached pages retain
+that charge until their final access guard drops.
 Their pages are mapped or loaded for the active working set and can be evicted when idle; an active
 query pins what it needs. When a declared `MEMORY_LIMIT` cannot admit a selected graph, idle graph
 chains are reclaimed in least-recently-used order only until the complete load fits. Without a
-declared memory limit, loaded graphs remain resident. <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_resource_maintenance_contract::unlimited_memory_keeps_loaded_graphs_warm_across_search_and_idle_maintenance, vector_resource_maintenance_contract::working_set_releases_other_partitions_before_the_next_selected_load --> Charged bytes are ContextDB's memory-accountant
+declared memory limit, loaded graphs remain resident. <!-- enforced by: vector_lazy_restart_residency_contract::reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_route_under_pressure, vector_resource_maintenance_contract::unlimited_memory_keeps_loaded_graphs_warm_across_search_and_idle_maintenance, vector_resource_maintenance_contract::working_set_releases_other_partitions_before_the_next_selected_load --> A read session searching saved graphs keeps the graph pages it filled warm across repeated
+queries when its declared memory covers every selected graph's pages: after the first wide query,
+repeating it reads no further pages. Under a tighter declaration the selected graphs share the
+remaining memory, and a declaration too small to hold the graphs a query needs is refused with
+`MemoryBudgetExceeded` while its charge stays within the declaration. <!-- enforced by: a_wide_find_keeps_its_entry_pages_warm::repeated_wide_finds_stop_filling_pages_within_the_declared_memory, a_wide_find_keeps_its_entry_pages_warm::a_short_declaration_keeps_its_charge_and_refuses_missing_topologies --> Charged bytes are ContextDB's memory-accountant
 view, not a claim about the operating system's physical mapped pages. Disk budget covers durable
 vector and index state before a write is accepted. The memory target is the product declaration
 `SET MEMORY_LIMIT 2G`, exactly 2147483648 bytes. <!-- enforced by: statement_effect_contract::binary_memory_declaration_accepts_quoted_and_unquoted_sizes --> Whole-process RSS, which also covers opening,
 writes, queries, maintenance and replay, is separate from the charged vector/index categories.
+
+Scalar publications keep all vector memberships and intervals while unchanged stored raw bodies
+share one immutable allocation. Sharing requires bit-identical F32/SQ8/SQ4 representations,
+including signed zero and quantized bounds. Body and shared-header charges follow each allocation
+through moves, eviction and store removal until its final holder drops; directories remain charged
+per version. `HISTORY ALL` therefore grows version metadata and writer retention with retained
+version count, even when unchanged vector bodies stay shared and bounded. A finite memory ceiling
+still limits admission of additional history.
+<!-- enforced by: crates/contextdb-vector/src/store/shared_payload_tests.rs::retained_scalar_memberships_share_one_body_and_keep_all_snapshot_intervals, crates/contextdb-vector/src/store/shared_payload_tests.rs::hydration_shares_only_bit_identical_history_in_every_stored_representation, crates/contextdb-vector/src/store/shared_payload_tests.rs::shared_cross_partition_body_survives_source_removal_and_final_external_holder, crates/contextdb-vector/src/store/shared_payload_tests.rs::shared_allocation_header_stays_charged_until_final_holder_after_store_drop, vector_memory_ownership_reconciliation_contract::retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_write -->
+
+Received columns may own accounting without a store-wide accountant. Batch preparation reserves
+each touched column's directory, shared-header and required copied-move body growth with its actual
+funder before publication. Inserted bodies are caller-admitted beforehand; abort or refusal releases
+only preparation reservations and retains that caller-admitted body charge. Publication adopts payload
+charges until the final holder drops; settlement returns unused reserved bytes to their funder. Mixed
+legacy columns keep their existing insertion protocol. Detached-copy hydration moves unique uncharged
+loaded bodies out of shared headers without cloning; shared histories and charged or resident
+sources retain their owners. Refused copy hydration releases workspace and remains retryable.
+<!-- enforced by: crates/contextdb-vector/src/store/received_publication_accounting_tests.rs::received_publication_prepares_next_insert_and_releases_its_last_holder, crates/contextdb-vector/src/store/received_publication_accounting_tests.rs::received_columns_keep_distinct_funders_and_legacy_columns_in_a_mixed_batch, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_unique_unwrap_moves_the_body_and_preserves_shared_or_charged_owners, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_hydration_retains_only_new_singleton_bodies_and_releases_headers, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_header_refusal_releases_loader_body_workspace_and_retries, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_mixed_history_preserves_bits_and_shared_final_holder_charges, crates/contextdb-vector/src/store/detached_copy_payload_tests.rs::detached_copy_already_resident_sources_keep_representation_charge_and_funder -->
 
 ---
 
@@ -384,8 +584,40 @@ and CLI mode, starts no background worker, and uses the same all-needy cycle whe
 A partition-local build refusal is attached to the vector maintenance report alongside successful
 index and partition counts. It does not short-circuit the wake's closing graph reclamation, empty
 partition retirement, automatic-compaction attempt, or cycle stamp; cancellation remains a typed
-interruption and returns immediately.
-<!-- enforced by: vector_resource_maintenance_contract::refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition, vector_resource_maintenance_contract::dropping_a_sampled_vector_column_does_not_abort_cycle_closing -->
+interruption, is checked around inventory, before and after each covered-journal cleanup retry,
+and during normal post-publication cleanup. Both `ReadCancelled` and `PublicationInterrupted`
+return before later partitions advance. Validation, key collection and deletion check cancellation
+every 64 records and before commit. Uncommitted cleanup aborts, temporary reservations
+release, earlier committed cleanup remains valid across restart, and the interrupted cycle receives
+no closing stamp.
+<!-- enforced by: vector_resource_maintenance_contract::refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition, vector_resource_maintenance_contract::dropping_a_sampled_vector_column_does_not_abort_cycle_closing, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::cancellation_after_inventory_capture_skips_all_cleanup_and_releases_reservations, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::cancellation_after_committed_journal_retry_leaves_later_partitions_untouched_on_restart, crates/contextdb-engine/src/database/vector_journal_cleanup_cancellation_tests.rs::publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_frontier, crates/contextdb-engine/src/persistence/bounded_catalog_tests.rs::journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion -->
+
+Public and background cycles use an admitted committed catalog inventory, separate from startup
+inspection. A caller-refused singleton body permits the root-pinned cursor to continue to siblings;
+navigation or container refusal makes the inventory incomplete and authorizes no catalog-dependent
+reclaim or retirement. Already-clean installed catalogs skip journal cleanup. Pending cleanup
+admits its existing three-key reservation before materialization and retains that owner throughout.
+Source pins and borrowed views end inside the commit boundary before scalar marks are applied;
+sampling and marking do not copy giant partition keys. Candidate sorting admits its heap scratch
+before allocation, releases partial work on refusal and retries from a fresh inventory.
+The cursor continues when a refused giant body follows a healthy catalog and can still discover a
+later durable-only catalog. Closing route-slot refusal preserves publication and skips removal;
+wide typed route metadata is admitted before a cold catalog lookup.
+<!-- enforced by: crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_continues_after_refused_singleton_in_every_sibling_position, crates/contextdb-redb/src/tree_store/bounded_bytes.rs::cursor_navigation_refusal_is_terminal_and_has_no_backend_read, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_incomplete_container_sample_preserves_serving_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_sampled_route_slot_refusal_drops_partial_work_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_candidate_slot_refusal_drops_partial_work_and_closes, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_closing_route_slot_refusal_preserves_publication_and_skips_removal, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_candidate_sort_heap_refusal_releases_and_retries_stably, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_cold_covered_cleanup_refusal_keeps_serving_and_closes, crates/contextdb-vector/tests/borrowed_route_metadata_adapter.rs::giant_source_metadata_and_marking_allocate_no_giant_key_copy_or_encoding -->
+
+Frontier metadata can reject unrelated extents through charged bounded windows; selected or
+possibly matching metadata admits the complete physical extent before backend read or decoding,
+using `prepare_vector_generation`. Generation-body admission starts after construction reservation
+succeeds. Cleanup-only journal pages use `truncate_vector_partition_journal`; catalog reclamation
+uses the preparation operation. Unknown invalid catalogs do not quarantine unrelated routes;
+miskeyed authenticated catalogs quarantine their canonical route, and raised limits retry fresh.
+<!-- enforced by: crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_catalog_extent_refuses_during_preparation_before_decode, crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_journal_extent_refuses_during_frontier_count_before_decode, crates/contextdb-engine/src/database/vector_frontier_metadata_admission_tests.rs::cold_oversized_membership_extent_refuses_before_fallback_count_decode, crates/contextdb-engine/src/database/vector_quarantine_inventory_admission_tests.rs::missing_catalog_inventory_admits_cold_oversized_source_after_construction, crates/contextdb-engine/src/database/vector_quarantine_inventory_admission_tests.rs::corrupt_catalog_inventory_admits_cold_oversized_source_after_construction, crates/contextdb-engine/src/database/vector_source_page_admission.rs::cleanup_page_admissions_keep_typed_attribution_and_release_their_source_owner, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_small_unknown_invalid_catalog_does_not_quarantine, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_miskey_before_valid_catalog_quarantines_canonical_route, crates/contextdb-engine/src/database/vector_public_cycle_admission_tests.rs::public_cycle_possible_match_blocks_until_raised_limit_retries_fresh -->
+
+A covered-journal refusal skips only that route's build and keeps its serving/catalog state while a
+sibling publishes. An incomplete `INDEXED` frontier refuses; `AUTO` uses that partition's complete
+exact fallback and preserves the sibling's indexed route. Historical raw-only routes with uncovered
+deletes remain candidates and physically clean their journals before retirement.
+<!-- enforced by: crates/contextdb-engine/src/database/vector_retry_frontier_integrity_tests.rs::cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_progress, vector_delete_only_journal_progress_contract::delete_only_unpinned_final_route_physically_cleans_its_journal_before_retirement, vector_delete_only_journal_progress_contract::delete_only_final_route_truncates_covered_history_before_snapshot_release_can_retire_it -->
 
 **Version cleanup and a held read snapshot.** Every in-flight statement registers its own read snapshot for the call's duration, and a caller that needs to reuse a `SnapshotId` ACROSS separate calls (on a table declaring `HISTORY CURRENT ONLY`) registers it explicitly via `Database::pin_snapshot`, holding the returned guard for as long as the snapshot is still wanted. A version-cleanup pass samples every currently-registered snapshot (not merely the oldest) plus the committed watermark, atomically, once at the start of the pass, and defers any superseded version still visible to ANY of those registered snapshots to a later cycle — a version created between two registered snapshots and superseded after both is protected by the higher one even though the lower one alone would not see it. Protection begins when `pin_snapshot` RETURNS: a pin requested while a removal pass is already mid-flight, for a snapshot at or before that pass's sampled watermark, waits for the pass to finish first (bounded by one pass duration) before registering, so the pin can never return with a false promise of protection the SAME in-flight pass is still free to violate — the next cleanup cycle honors it instead. A pin for a snapshot strictly after the pass's watermark registers immediately: nothing that pass can prune was ever visible to it. Versions a pass already reclaimed before the pin is requested cannot come back; that boundary is unchanged.
 
@@ -399,6 +631,21 @@ Registered readers defer versions they still need. Immutable graphs may still na
 query merge scores each distinct candidate from its snapshot-visible native vector before ordering
 and applying the limit, even after cleanup leaves only one directory version.
 <!-- enforced by: tests/integration/version_cleanup_scoping_tests.rs::version_cleanup_releases_a_pruned_rows_vector_copy, tests/integration/version_cleanup_scoping_tests.rs::version_cleanup_cost_is_invariant_to_unrelated_vector_ballast, tests/integration/version_cleanup_scoping_tests.rs::a_registered_snapshot_defers_cleanup_instead_of_losing_the_version, vector_serving_merge_contract::current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart -->
+
+Retention selects due versions from RETAIN tables at one commit frontier, borrowing source
+payloads and FK references instead of cloning table histories. The shared memory accountant
+admits candidate identities and expiry mutations before allocation; reclamation uses the same
+borrowed selection and preserves complete-lifetime checks without copying unrelated payloads.
+An empty or not-due retained table reserves no expiry workspace as unrelated history grows.
+Reclamation admits selected vector directory identities and edge deletion keys, without loading
+vector bodies or copying edge properties merely to remove them. Reader-deferred edge identities
+retain their own memory charge between cycles; carry-only retries admit copied identities and
+durable encoding before allocation, including after restart. Position-map and surviving index-key
+rebuilds for selected tables, generation catalogs/reader chains and affected-LSN sibling buffers
+are admitted before durable reclamation commits. Resident vector removal visits selected
+indexes and updates whole-row reverse maps in place.
+Selected-row identity repair admits the borrowed durable encoding before decoding bodies omitted
+from the resident directory, and holds that charge through identity publication.
 
 Retention first commits expiry as a visibility boundary: newly opened reads exclude expired rows,
 while already-registered snapshots retain their complete row/vector/graph view. Physical reclamation
@@ -439,7 +686,7 @@ from `.maintenance run` and from the scoped cleanup reports.
 
 **Eligibility is declared, not named.** A table is version-cleanup-eligible because it declares `HISTORY CURRENT ONLY`, never because of its name. The three built-in fabric tables (`work_capabilities`, `peer_directory`, `work_node_contacts`) declare it in their own `CREATE TABLE` text like any other table would.
 
-**Those three tables' declared policy, plus `work_inputs`' `RETAIN 7 DAYS`, is engine-owned, not operator policy.** All four are built-in work-fabric tables (see the [work-fabric skill](../skills/work-fabric/SKILL.md)) whose own bookkeeping depends on staying at the shape declared in their own `CREATE TABLE` text: `work_inputs`' retention window is what keeps ledger-carried input copies bounded, and the three currency tables' `HISTORY CURRENT ONLY` plus their `SYNC CONFLICT KEEP LATEST` (or `SYNC OFF`) is what makes version-cleanup safe to reclaim their superseded rows at all. A locally-typed `ALTER TABLE` refuses any `RETAIN` / `HISTORY` / `SYNC CONFLICT` / `SYNC ...` / `SYNC SAFE` value that mismatches one of these four tables' own canonical declaration, with a message naming the table as engine-owned infrastructure — including `SET SYNC ...` (`work_node_contacts`' own `SYNC OFF` declaration is guarded on this axis exactly like the others); silence, or an explicit restate of the table's already-declared value on that axis, still passes, the same mismatch-only contract the rest of this paragraph describes for the other doors. A locally-typed `CREATE TABLE` of one of these four names is guarded too: it refuses unless the declared shape structurally matches the owning installer's own `CREATE TABLE` text — every column (name, type, nullability, primary key, uniqueness, default, references, `EXPIRES`, `IMMUTABLE`) AND every table-level option (a table-level `IMMUTABLE`, `STATE_MACHINE`, `DAG`, or `PROPAGATE` clause, none of which any of the nine reserved names' own DDL declares) — and refuses an explicit non-canonical policy clause the same way the ALTER door does — a table outside the nine reserved names remains entirely unrestricted (silence on policy, i.e. the pre-declaration legacy shape, still passes). A locally-typed `ALTER TABLE ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` naming one of the nine reserved names is refused outright too, before any other ALTER validation runs — column shape on these nine is exactly as fixed against a column-level ALTER as it is against `SET RETAIN` / `SET HISTORY` / `SET SYNC CONFLICT` / `SET SYNC ...`. Existence is checked first: on a store where the table was never installed, this ALTER reports "table not found," not the engine-owned refusal — the same existence-before-ownership ordering every other clause in this door already follows, so an absent table and a governed one are never confused. The arriving-sync-DDL mirror of both guards reconstructs the wire columns and table-level constraint text into real `CREATE TABLE` SQL and runs it through the same parser and the same shape judgment, so a peer cannot smuggle a table-level option (or a per-column attribute) past the wire path that the local path already refuses. The shape guard actually spans **nine** reserved names, not four: the same four plus the five hub-refereed work-ledger tables (`work_jobs`, `work_claims`, `work_results`, `work_failures`, `work_cancellations`), whose real arbitration is a hardcoded `keep_first` override applied at every sync chokepoint rather than a fully declared policy shape. Those five get a narrower, SYNC-CONFLICT-only counterpart of the policy guard: a `CREATE TABLE` or `ALTER TABLE`, locally or over an arriving sync DDL, that declares a SYNC CONFLICT value other than `keep_first` refuses; silence, or an explicit restate of `keep_first`, still passes. `SHOW SYNC_CONFLICT_POLICY` renders every one of these seven work-ledger tables, plus `peer_directory` (also engine-owned, via its own declared `SYNC CONFLICT KEEP LATEST`), actually present in the store as `{table}={word} (engine-owned)`, distinct from an operator-declared row. `work_node_contacts` declares no conflict policy at all, so it never renders in `SHOW SYNC_CONFLICT_POLICY`, in any form. An arriving sync DDL naming one of the original four is held to the identical shape by THREE guards because a peer's own DDL always carries the table's FULL current shape, whether or not a given axis actually changed: an EXPLICIT differing value — spelled as an `AlterTable`, as a `CreateTable` adopting an already-existing table, or as a fresh `CreateTable` of a reserved name (guarding against DROP + CREATE circumvention) — is refused atomically for the whole batch before any of it is written; an axis the arriving DDL is simply SILENT on PRESERVES the table's current declared value instead of being read as an implicit clear, which is what lets a half-healed peer's own in-progress multi-step reconcile interoperate. This is not a workaround for a missing knob: an installer (or a peer) that only ever heals a legacy root back to its own declared shape needs no exception, because a healing call always restates that same declared shape verbatim, and a verbatim restatement always applies — locally, and over sync.
+**Those three tables' declared policy, plus `work_inputs`' `RETAIN 7 DAYS`, is engine-owned, not operator policy.** All four are built-in work-fabric tables (see the [work-fabric skill](../skills/work-fabric/SKILL.md)) whose own bookkeeping depends on staying at the shape declared in their own `CREATE TABLE` text: `work_inputs`' retention window is what keeps ledger-carried input copies bounded, and the three currency tables' `HISTORY CURRENT ONLY` plus their `SYNC CONFLICT KEEP LATEST` (or `SYNC OFF`) is what makes version-cleanup safe to reclaim their superseded rows at all. A locally-typed `ALTER TABLE` refuses any `RETAIN` / `HISTORY` / `SYNC CONFLICT` / `SYNC ...` / `SYNC SAFE` value that mismatches one of these four tables' own canonical declaration, with a message naming the table as engine-owned infrastructure — including `SET SYNC ...` (`work_node_contacts`' own `SYNC OFF` declaration is guarded on this axis exactly like the others); silence, or an explicit restate of the table's already-declared value on that axis, still passes, the same mismatch-only contract the rest of this paragraph describes for the other doors. A locally-typed `CREATE TABLE` of one of these four names is guarded too: it refuses unless the declared shape structurally matches the owning installer's own `CREATE TABLE` text — every column (name, type, nullability, primary key, uniqueness, default, references, `EXPIRES`, `IMMUTABLE`) AND every table-level option (a table-level `IMMUTABLE`, `STATE_MACHINE`, `DAG`, or `PROPAGATE` clause, none of which any of the nine reserved names' own DDL declares) — and refuses an explicit non-canonical policy clause the same way the ALTER door does — a table outside the nine reserved names remains entirely unrestricted (silence on policy still passes). A locally-typed `ALTER TABLE ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` naming one of the nine reserved names is refused outright too, before any other ALTER validation runs — column shape on these nine is exactly as fixed against a column-level ALTER as it is against `SET RETAIN` / `SET HISTORY` / `SET SYNC CONFLICT` / `SET SYNC ...`. Existence is checked first: on a store where the table was never installed, this ALTER reports "table not found," not the engine-owned refusal — the same existence-before-ownership ordering every other clause in this door already follows, so an absent table and a governed one are never confused. The arriving-sync-DDL mirror of both guards reconstructs the wire columns and table-level constraint text into real `CREATE TABLE` SQL and runs it through the same parser and the same shape judgment, so a peer cannot smuggle a table-level option (or a per-column attribute) past the wire path that the local path already refuses. The shape guard actually spans **nine** reserved names, not four: the same four plus the five hub-refereed work-ledger tables (`work_jobs`, `work_claims`, `work_results`, `work_failures`, `work_cancellations`), whose real arbitration is a hardcoded `keep_first` override applied at every sync chokepoint rather than a fully declared policy shape. Those five get a narrower, SYNC-CONFLICT-only counterpart of the policy guard: a `CREATE TABLE` or `ALTER TABLE`, locally or over an arriving sync DDL, that declares a SYNC CONFLICT value other than `keep_first` refuses; silence, or an explicit restate of `keep_first`, still passes. `SHOW SYNC_CONFLICT_POLICY` renders every one of these seven work-ledger tables, plus `peer_directory` (also engine-owned, via its own declared `SYNC CONFLICT KEEP LATEST`), actually present in the store as `{table}={word} (engine-owned)`, distinct from an operator-declared row. `work_node_contacts` declares no conflict policy at all, so it never renders in `SHOW SYNC_CONFLICT_POLICY`, in any form. An arriving sync DDL naming one of the original four is held to the identical shape by THREE guards because a peer's own DDL always carries the table's FULL current shape, whether or not a given axis actually changed: an EXPLICIT differing value — spelled as an `AlterTable`, as a `CreateTable` adopting an already-existing table, or as a fresh `CreateTable` of a reserved name (guarding against DROP + CREATE circumvention) — is refused atomically for the whole batch before any of it is written; an axis the arriving DDL is simply SILENT on PRESERVES the table's current declared value instead of being read as an implicit clear, which is what lets a half-healed peer's own in-progress multi-step reconcile interoperate. This is not a workaround for a missing knob: an installer (or a peer) that restates the canonical declaration needs no exception, because a healing call always restates that same declared shape verbatim, and a verbatim restatement always applies — locally, and over sync.
 
 `pre_commit` can reject a transaction by returning `Err`. `post_commit` fires after the write is durable. Downstream applications use contextdb as a library and accept `Database` via dependency injection — they are database **users**, not plugin authors.
 
@@ -533,8 +780,8 @@ a typed diagnostic naming the table, missing capability, and node to upgrade. Un
 continue syncing and the held table resumes after the capability is available.
 <!-- enforced by: vector_schema_mixed_version_compatibility_contract::older_receiver_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_upgrade, vector_schema_mixed_version_push_compatibility_contract::newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_hub_upgrade -->
 
-The supported skew window is the current protocol version plus the two immediately previous
-released versions. The current wire retains row arrival ordering, the serving-store incarnation in
+This release emits and accepts only protocol 7; envelopes using any other protocol version are
+refused. The current wire retains row arrival ordering, the serving-store incarnation in
 pull responses, the purge instruction lane, schema provenance, and the structured
 authoritative-hub purge refusal.
 <!-- enforced by: protocol_version_bump_tests::current_wire_arrival_and_source_fields_round_trip, protocol_version_bump_tests::current_wire_purge_instruction_and_typed_authority_error_round_trip, schema_provenance_wire_contract::nonempty_schema_provenance_round_trips_and_validates -->
@@ -747,6 +994,39 @@ participates.
 
 Schema changes (CREATE TABLE, ALTER TABLE, DROP TABLE) are synced alongside data. Constraints (PRIMARY KEY, NOT NULL, UNIQUE, single-column and composite FOREIGN KEY, STATE MACHINE, DAG) are preserved across sync.
 
+A synced `ALTER TABLE` carries the operation its author ran, not just the resulting column list.
+`DROP COLUMN` and `RENAME COLUMN` travel as explicit, signed markers inside the authenticated DDL,
+and a receiving machine removes or renames a column only when such a marker names it: a dropped
+column leaves with its stored values, vectors and index, and a renamed one keeps its values,
+vectors and index under the new name, on the author, on every receiver, and after a restart. A
+column that an arriving `ALTER TABLE` simply does not mention is kept, with its data, whether or
+not the statement restates the primary key. A receiver never infers a drop from an omitted column
+or a rename from two columns that happen to share a type. A node that relays a received `ALTER`
+logs the same markers, so a machine further down the line applies the same operation.
+<!-- enforced by: sql_surface_other::sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns, sql_surface_other::sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column, sql_surface_other::sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename, sql_surface_other::sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_operation, sql_surface_other::sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors_operation, declared_memory_limit_bounds_a_writer::an_authors_signature_travels_two_hops_a_restart_and_a_third_peer -->
+
+An authored `SET MAINTAIN COUNT` declaration travels through authenticated push to the hub.
+The hub installs the declaration and answers a matching exact `COUNT(*)`. A peer
+without that schema capability holds back the affected table while other tables keep syncing;
+once the peer supports it, the held declaration can be pushed.
+<!-- enforced by: authenticated_sync_contract_tests::a_maintained_count_declaration_crosses_sync_or_holds_back_its_table -->
+
+Received schema history replays one source transaction at a time, in author order. A table or
+trigger created and later dropped still participates in the intervening transactions; the
+receiver does not reduce the history to its final schema before applying the rows.
+<!-- enforced by: tests/acceptance/trigger.rs::t3_sync_trigger_table_create_drop_history_replays_chronologically, tests/acceptance/trigger.rs::t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks, tests/acceptance/trigger.rs::t3_sync_trigger_ddl_replay_respects_sender_lsn_order -->
+
+An arriving `CREATE TABLE` declaration whose columns differ from the existing table is reported
+as a schema mismatch instead of silently replacing that table.
+<!-- enforced by: tests/acceptance/schema_lifecycle.rs::f23_schema_mismatch_between_edge_and_server_is_detected, tests/integration/ddl_sync_tests.rs::ds10_schema_divergence_detected -->
+
+A repeated received schema unit with the same recorded migration identity returns its original
+apply result without changing the installed schema or rows, including after the receiver reopens.
+The engine's `received_schema_atomic_retry_tests::identical_received_marker_vector_retry_returns_its_original_observation_without_mutation`
+asserts the returned result and stored state are equal before and after the retry. An authenticated
+push retry after a lost reply also leaves the receiver's DDL history unchanged.
+<!-- enforced by: schema_migration_chunked_transport::oversized_authenticated_schema_stays_invisible_until_one_commit_and_retry -->
+
 Hub declarations persist before an application table exists. The first authenticated binding
 freezes each declared policy. Bound local and arriving DDL must match the binding; arriving DDL
 cannot overwrite an explicitly declared local policy. A per-table refusal leaves unrelated tables
@@ -934,39 +1214,12 @@ let bytes_written = blob_store
 
 ---
 
-## Upgrades and Recovery
-
-### Upgrading the store format
+## Store Format and Recovery
 
 The on-disk store carries a format-version marker (current: `1.0.0`). Opening a
-data root written by an incompatible older release — either the top-level
-marker doesn't match, or the marker matches but the underlying
-`TableMeta`/`ColumnDef` row-meta layout still predates this release (see
-`v1.0.0`, below) — fails closed with `LegacyVectorStoreDetected` rather than
-silently corrupting or misreading it. The error names the recovery command:
-
-```bash
-contextdb migrate ./my.db
-```
-
-`migrate` writes a `./my.db.bak` backup of the untouched original BEFORE
-changing anything, reads every row/edge/vector/DDL statement out of the legacy
-root through a dedicated legacy-format reader, writes it into a fresh
-current-format root, and atomically swaps it in. A second `migrate` run on the
-now-current-format path is a safe no-op; running it on a path that was never
-legacy refuses without touching the file. Sync-from-a-1.0+-peer remains an
-alternative when you would rather populate a fresh store by a normal sync pull
-than migrate the file directly.
-
-The `v1.0.0`-specific case `migrate` was built against: that release's
-`TableMeta`/`ColumnDef` structs had fewer trailing fields than today's, and
-because the on-disk struct-as-tuple encoding carries no field-count marker, a
-decoder that optimistically reads past its OWN declared fields (the pattern
-this crate uses to tolerate an OLDER, shorter *current*-shaped payload) does
-not cleanly detect "no more fields for me" on a genuinely OLDER struct shape —
-it keeps consuming bytes belonging to the next field, and only surfaces once a
-borrowed byte lands somewhere it can't satisfy. `migrate`'s legacy reader
-matches the exact old field layout instead of leaning on that same tolerance.
+store with an incompatible marker, schema layout, or versioned-key shape fails
+with `LegacyVectorStoreDetected`. A store written by an earlier build is not
+read. Move it aside and create the store again.
 
 ### Recovering a wedged or corrupt data root
 
@@ -981,7 +1234,7 @@ contextdb reset ./my.db --force   # destructive: recreates a fresh, empty curren
 
 `diagnose` reads the store's format marker and top-level schema layout through a
 read-only handle and reports its diagnosis (current-format and readable,
-legacy-format, or corrupt/truncated with the underlying reason) — it never
+written by an earlier build, or corrupt/truncated with the underlying reason) — it never
 opens the store read-write and never writes to the path, so running it is
 always safe. `reset` refuses without `--force` (see [CLI Reference](cli.md) for
 the exit code it uses); with `--force` it deletes the existing file and
@@ -1036,4 +1289,4 @@ File-backed databases also support a persisted disk budget:
 - runtime control via `SET DISK_LIMIT` / `SHOW DISK_LIMIT`
 - persisted live config in the redb file so reopen preserves the limit
 
-Disk enforcement happens in the engine write paths before `INSERT`, `UPDATE`, and sync-apply work begins. Once the on-disk file is at or above the configured limit, further file-backed writes fail with `DiskBudgetExceeded`. In-memory databases accept the SQL but ignore disk budgeting because there is no backing file to measure.
+Disk enforcement happens in the engine write paths before `INSERT`, `UPDATE`, and sync-apply work begins. The storage allocator also reserves each projected physical file growth before allocating it, so pages retained for a live file reader and newly allocated writer pages cannot carry the file past the configured limit. Once the on-disk file is at or above the configured limit, or an allocator growth would cross it, further file-backed writes fail with `DiskBudgetExceeded` without poisoning the writer. In-memory databases accept the SQL but ignore disk budgeting because there is no backing file to measure.

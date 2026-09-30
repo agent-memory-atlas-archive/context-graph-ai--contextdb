@@ -179,6 +179,7 @@ fn sync_tail_admission_refuses_rows_vectors_and_the_authenticated_receipt() {
                 incarnation,
                 source_lsn,
                 dependency_complete: false,
+                hub_contact_ms: None,
             },
         )
         .unwrap_err();
@@ -332,28 +333,45 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         "SELECT id FROM items ORDER BY embedding <=> $q USE VECTOR AUTO USE RANK priority LIMIT 1";
     let bound = HashMap::from([("q".to_owned(), Value::Vector(vec![1.0, 0.0]))]);
     let indexed = db.execute(sql, &bound).unwrap();
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     assert_eq!(
         indexed.rows[0][0],
         Value::Int64(3),
         "declared breadth includes all three vector candidates"
     );
     assert_eq!(bounded_ids(&db, sql, bound.clone()), vec![3]);
-    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     db.execute(
         "ALTER TABLE items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 1)",
         &HashMap::new(),
     )
     .unwrap();
-    assert_ne!(db.execute(sql, &bound).unwrap().rows[0][0], Value::Int64(3));
-    assert_ne!(bounded_ids(&db, sql, bound.clone()), vec![3]);
+    // AUTO decides once for the statement: comparing three rows costs less
+    // than any walk the declared breadth could buy, so a narrower breadth
+    // leaves the automatic route exhaustive and its answer unchanged.
+    assert_eq!(db.execute(sql, &bound).unwrap().rows[0][0], Value::Int64(3));
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    assert_eq!(bounded_ids(&db, sql, bound.clone()), vec![3]);
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
+    // The declared breadth is still the ranked walk's breadth: the walk asked
+    // for outright keeps one candidate and misses the distant high-weight row.
+    let indexed_sql = sql.replace("USE VECTOR AUTO", "USE VECTOR INDEXED");
+    assert_ne!(
+        db.execute(&indexed_sql, &bound).unwrap().rows[0][0],
+        Value::Int64(3)
+    );
+    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    assert_ne!(bounded_ids(&db, &indexed_sql, bound.clone()), vec![3]);
+    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
     let mut semantic =
         contextdb_engine::SemanticQuery::new("items", "embedding", vec![1.0, 0.0], 1);
     semantic.sort_key = Some("priority".into());
+    semantic.search_mode = Some(contextdb_core::VectorSearchMode::Indexed);
     assert_ne!(
         db.semantic_search(semantic.clone()).unwrap()[0].values["id"],
         Value::Int64(3)
     );
+    semantic.search_mode = None;
     db.execute(
         "ALTER TABLE items ALTER COLUMN embedding SET HNSW (EF_SEARCH = 17)",
         &HashMap::new(),
@@ -363,6 +381,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         db.semantic_search(semantic).unwrap()[0].values["id"],
         Value::Int64(3)
     );
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
 
     db.execute(
         "ALTER TABLE items ALTER COLUMN embedding SET AUTO_INDEX_AT 4",

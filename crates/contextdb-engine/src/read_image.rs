@@ -12,17 +12,17 @@ use crate::OwnerReadCancellation;
 use crate::cli_render::{render_column_type, render_table_meta};
 use crate::database::{Database, MaintenancePolicy};
 use crate::direct_file_reader::{
-    DirectChangeState, DirectColumnReference, DirectConfigurationState, DirectEventTypeStatus,
-    DirectEventsStatus, DirectFileReaderError, DirectImageMetadataKind, DirectImageState,
-    DirectIndexColumn, DirectIndexDirection, DirectMaintenanceStatus, DirectMetadataBody,
-    DirectMetadataRequest, DirectMetadataResponse, DirectOwnedImage, DirectPropagationRule,
-    DirectRankPolicy, DirectReferencePropagation, DirectRetainPolicy, DirectRouteStatus,
-    DirectScheduleStatus, DirectSchema, DirectSchemaColumn, DirectSchemaIndex,
-    DirectScopeLabelKind, DirectSinkStatus, DirectSnapshot, DirectStateMachine, DirectStoredEdge,
-    DirectStoredRow, DirectStoredVector, DirectSyncSource, DirectSyncState, DirectTableSyncPolicy,
-    DirectTypedImageDigest, DirectVectorQuantization,
+    DirectChangeFrontiers, DirectChangeState, DirectColumnReference, DirectConfigurationState,
+    DirectEventTypeStatus, DirectEventsStatus, DirectFileReaderError, DirectImageMetadataKind,
+    DirectImageState, DirectIndexColumn, DirectIndexDirection, DirectMaintenanceStatus,
+    DirectMetadataBody, DirectMetadataRequest, DirectMetadataResponse, DirectOwnedImage,
+    DirectPropagationRule, DirectRankPolicy, DirectReferencePropagation, DirectRetainPolicy,
+    DirectRouteStatus, DirectScheduleStatus, DirectSchema, DirectSchemaColumn, DirectSchemaIndex,
+    DirectScopeLabelKind, DirectSinkStatus, DirectSnapshot, DirectStateMachine, DirectSyncSource,
+    DirectSyncState, DirectTableSyncPolicy, DirectTypedImageDigest, DirectVectorQuantization,
 };
 use crate::executor::ReadExecutionTarget;
+#[cfg(feature = "test-seams")]
 use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::ReadPersistenceImageParts;
 use contextdb_core::read_contract::{
@@ -31,7 +31,7 @@ use contextdb_core::read_contract::{
 use contextdb_core::{
     ColumnType, ContextId, Direction, Error, HistoryPolicy, IndexKind, Lsn, Principal,
     PropagationRule, Result, RetainUnit, ScopeLabel, ScopeLabelKind, SortDirection, SyncDirection,
-    TxId, Value, VectorIndexRef, VectorQuantization,
+    TxId, Value, VectorQuantization,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -70,13 +70,14 @@ impl crate::persistence::ReadPersistenceImage {
     /// with the owned projection and identity that ride alongside it.
     pub(crate) fn into_committed_image(
         self,
+        retained_source: Arc<crate::persistence::RetainedReadSource>,
         memory_limit: Option<usize>,
         contexts: Option<BTreeSet<ContextId>>,
         scope_labels: Option<BTreeSet<ScopeLabel>>,
         principal: Option<Principal>,
     ) -> std::result::Result<CommittedImage, DirectFileReaderError> {
         build_committed_image(
-            self.into_runtime_parts(),
+            self.into_runtime_parts(retained_source),
             memory_limit,
             DeclaredReadVisibility {
                 contexts,
@@ -110,23 +111,19 @@ fn build_committed_image(
     memory_limit: Option<usize>,
     declared: DeclaredReadVisibility,
 ) -> Result<CommittedImage> {
+    let digest = parts.content_identity.clone();
     let memory = parts.memory.clone();
     let accountant = memory.accountant.clone();
     if let Some(limit) = memory_limit {
         accountant.set_budget(Some(limit))?;
     }
-    // The Database and its immutable projection coexist with the hydrated
-    // source during construction. Reserve their source-shaped copies before
-    // either projection clones a row, vector, schema, or change record.
-    memory.reserve(memory.held().saturating_mul(2))?;
-    let graph_edges = project_edges(&parts);
-    let vectors = project_vectors(&parts);
-    let commit_index = parts
-        .commit_index
-        .iter()
-        .map(|(lsn, tx)| (*lsn, *tx))
-        .collect::<Vec<_>>();
-
+    // The committed database consumes the decoded rows below, so it needs one
+    // additional image-sized reservation during construction. The typed image
+    // projection still exists until its incremental identity replacement is
+    // ready, but it does not justify reserving a second Database image.
+    if !parts.lazy_relational {
+        memory.reserve(memory.held())?;
+    }
     // Keep durable configuration separate from this process's startup ceiling,
     // so the same committed image keeps the same identity for every reader.
     let declared_memory_limit = parts
@@ -138,15 +135,9 @@ fn build_committed_image(
     let mut database =
         Database::open_committed_image(parts, Arc::new(crate::plugin::CorePlugin), accountant)?;
 
-    // The image projection is read back before any narrowing is applied. It
-    // answers what tables and columns EXIST, which is a declaration-level
-    // question the store answers the same way to everyone; deciding which of
-    // them a consumer should be shown is the consumer's own filtering, and
-    // hiding a table here would make a narrowed session report a different
-    // store rather than a narrowed view of the same one.
-    let mut image = project_owned_image(&database, graph_edges, vectors, commit_index)?;
+    // The metadata projection is read back before any narrowing is applied.
+    let mut image = project_owned_image(&database)?;
     image.configuration.memory_limit_bytes = declared_memory_limit;
-    let digest = typed_digest(&image, &memory.accountant)?;
     let image = DirectOwnedImage {
         snapshot: DirectSnapshot {
             image_id: digest.complete,
@@ -171,115 +162,9 @@ fn build_committed_image(
     })
 }
 
-fn project_edges(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredEdge> {
-    // One edge identity can carry several stored occurrences -- a later write
-    // that adds properties does not erase the one that introduced the edge --
-    // and an image holds current state, so the latest occurrence is the one
-    // an edge reads as.
-    let mut current = BTreeMap::new();
-    for edge in &parts.forward_edges {
-        if edge.deleted_tx.is_some() {
-            continue;
-        }
-        let identity = (edge.edge_type.clone(), edge.source, edge.target);
-        let order = (edge.lsn, edge.created_tx);
-        match current.get(&identity) {
-            Some((seen, _)) if *seen >= order => {}
-            _ => {
-                current.insert(identity, (order, edge));
-            }
-        }
-    }
-    let mut edges = current
-        .into_values()
-        .map(|(_, edge)| DirectStoredEdge {
-            source: edge.source,
-            target: edge.target,
-            edge_type: edge.edge_type.clone(),
-            properties: edge
-                .properties
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
-        })
-        .collect::<Vec<_>>();
-    edges.sort_by(|left, right| {
-        (&left.edge_type, left.source, left.target).cmp(&(
-            &right.edge_type,
-            right.source,
-            right.target,
-        ))
-    });
-    edges
-}
-
-fn project_vectors(parts: &ReadPersistenceImageParts) -> Vec<DirectStoredVector> {
-    let mut vectors = parts
-        .current_vectors
-        .iter()
-        .map(|((index, row_id), values)| DirectStoredVector {
-            index: index.clone(),
-            row_id: *row_id,
-            quantization: quantization_for_index(parts, index),
-            values: values.clone(),
-        })
-        .collect::<Vec<_>>();
-    vectors.sort_by(|left, right| {
-        (&left.index.table, &left.index.column, left.row_id).cmp(&(
-            &right.index.table,
-            &right.index.column,
-            right.row_id,
-        ))
-    });
-    vectors
-}
-
-fn quantization_for_index(
-    parts: &ReadPersistenceImageParts,
-    index: &VectorIndexRef,
-) -> DirectVectorQuantization {
-    parts
-        .table_meta
-        .get(&index.table)
-        .and_then(|meta| {
-            meta.columns
-                .iter()
-                .find(|column| column.name == index.column)
-                .map(|column| direct_quantization(column.quantization))
-        })
-        .unwrap_or(DirectVectorQuantization::F32)
-}
-
-fn direct_quantization(quantization: VectorQuantization) -> DirectVectorQuantization {
-    match quantization {
-        VectorQuantization::F32 => DirectVectorQuantization::F32,
-        VectorQuantization::SQ8 => DirectVectorQuantization::Sq8,
-        VectorQuantization::SQ4 => DirectVectorQuantization::Sq4,
-    }
-}
-
-fn project_owned_image(
-    database: &Database,
-    graph_edges: Vec<DirectStoredEdge>,
-    vectors: Vec<DirectStoredVector>,
-    commit_index: Vec<(Lsn, TxIdAlias)>,
-) -> Result<DirectOwnedImage> {
-    let snapshot_id = database.snapshot();
+fn project_owned_image(database: &Database) -> Result<DirectOwnedImage> {
     let mut table_names = database.table_names();
     table_names.sort();
-
-    let mut relational_rows = Vec::new();
-    for table in &table_names {
-        for row in database.scan(table, snapshot_id)? {
-            relational_rows.push(DirectStoredRow {
-                table: table.clone(),
-                row_id: row.row_id,
-                values: row.values.into_iter().collect(),
-            });
-        }
-    }
-    relational_rows
-        .sort_by(|left, right| (&left.table, left.row_id).cmp(&(&right.table, right.row_id)));
 
     let schemas = table_names
         .iter()
@@ -290,28 +175,16 @@ fn project_owned_image(
         })
         .collect::<Vec<_>>();
 
-    let (changes, arrivals) = database.changes_since_with_arrivals(Lsn(0));
-    let changes_state = DirectChangeState {
+    // Open authenticates the committed root, but it must not point-load every
+    // historical row to manufacture metadata no caller requested. The target
+    // projects and authenticates change/sync bodies when that metadata surface
+    // is touched. Keep only the frontiers and declared table policy here.
+    let changes_state = DirectChangeFrontiers {
         current_lsn: database.current_lsn(),
         committed_watermark: database.committed_watermark(),
         next_tx: database.next_tx(),
-        commit_index,
-        rows: changes.rows.clone(),
-        edges: changes.edges.clone(),
-        vectors: changes.vectors.clone(),
-        ddl: changes.ddl.clone(),
-        ddl_lsn: changes.ddl_lsn.clone(),
     };
-
-    let mut sources = arrivals
-        .into_iter()
-        .map(|(row_lsn, source_lsn)| DirectSyncSource {
-            row_lsn,
-            source_lsn,
-        })
-        .collect::<Vec<_>>();
-    sources.sort_by_key(|source| source.row_lsn);
-    let mut tables = schemas
+    let policies = schemas
         .iter()
         .map(|schema| DirectTableSyncPolicy {
             table: schema.table.clone(),
@@ -324,13 +197,8 @@ fn project_owned_image(
                 .clone()
                 .unwrap_or_else(|| "keep_first".to_owned()),
         })
-        .collect::<Vec<_>>();
-    tables.sort_by(|left, right| left.table.cmp(&right.table));
-    let sync = DirectSyncState {
-        watermark: database.sync_watermark(),
-        sources,
-        tables,
-    };
+        .collect();
+    let sync = direct_sync_state(database, policies, HashMap::new());
 
     let configuration = DirectConfigurationState {
         memory_limit_bytes: database.memory_limit(),
@@ -357,15 +225,339 @@ fn project_owned_image(
 
     Ok(DirectOwnedImage {
         snapshot: DirectSnapshot { image_id: [0; 32] },
-        relational_rows,
-        graph_edges,
-        vectors,
         changes: changes_state,
         sync,
         configuration,
         events,
         maintenance,
     })
+}
+
+fn direct_quantization(quantization: VectorQuantization) -> DirectVectorQuantization {
+    match quantization {
+        VectorQuantization::F32 => DirectVectorQuantization::F32,
+        VectorQuantization::SQ8 => DirectVectorQuantization::Sq8,
+        VectorQuantization::SQ4 => DirectVectorQuantization::Sq4,
+    }
+}
+
+/// The reading surface's diagnosis of a history request the engine refused:
+/// damage is the typed corrupt-store answer and a memory refusal is the typed
+/// budget answer, so neither is flattened into an untyped engine message.
+fn history_answer_error(error: Error) -> DirectFileReaderError {
+    match error {
+        Error::StoreCorrupted { path, reason } => DirectFileReaderError::CorruptStore(
+            crate::direct_file_reader::DirectStoreDiagnostic::MalformedRecord,
+            format!("store {path} is corrupt: {reason}"),
+        ),
+        Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        } => DirectFileReaderError::MemoryBudget {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint,
+        },
+        Error::ReadCancelled => DirectFileReaderError::Cancelled,
+        Error::ReadFailure(failure) => DirectFileReaderError::ReadFailure(failure),
+        other => DirectFileReaderError::Engine(other.to_string()),
+    }
+}
+
+/// A history that could not be read keeps its diagnosis: an engine refusal
+/// as above, and the commit-index cross-check an open deferred to this read
+/// as exactly the typed answer that open would have given.
+fn image_history_answer_error(error: crate::database::ImageHistoryError) -> DirectFileReaderError {
+    match error {
+        crate::database::ImageHistoryError::Engine(error) => history_answer_error(error),
+        crate::database::ImageHistoryError::Store { diagnosis, .. } => {
+            (*diagnosis).into_direct_reader_error()
+        }
+    }
+}
+
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static ANSWER_ENCODING_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` on this thread each time a metadata answer's encoding is
+/// written, before the request's last check -- so a proof can cancel a
+/// request while its answer is being encoded. Dropping the guard removes it.
+#[cfg(feature = "test-seams")]
+pub fn while_encoding_answers_for_test(hook: impl Fn() + 'static) -> AnswerEncodingHookGuard {
+    ANSWER_ENCODING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    AnswerEncodingHookGuard(())
+}
+
+#[cfg(feature = "test-seams")]
+pub struct AnswerEncodingHookGuard(());
+
+#[cfg(feature = "test-seams")]
+impl Drop for AnswerEncodingHookGuard {
+    fn drop(&mut self) {
+        ANSWER_ENCODING_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) fn answer_encoded_for_test() {
+    ANSWER_ENCODING_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook();
+        }
+    });
+}
+
+/// Settle a history answer's charge on what the finished answer retains:
+/// the transient copies its construction admitted are gone once it returns,
+/// the answer itself is not, and it stays charged for as long as its
+/// response is held.
+fn settle_answer_charge(
+    charge: &crate::read_image_memory::ImageMemory,
+    retained: usize,
+) -> Result<()> {
+    let held = charge.held();
+    if retained > held {
+        charge.reserve(retained - held)?;
+    } else {
+        charge.release(held - retained);
+    }
+    Ok(())
+}
+
+/// Build the history answer from the sealed read target on demand. Rows and
+/// vectors are authenticated as their retained pages are touched. Every copy
+/// the construction keeps or builds is admitted to `charge` before it is
+/// made, and `checkpoint` runs between records, so a request stops inside its
+/// memory limit, its cancellation and its active time rather than after the
+/// whole answer exists.
+pub(crate) fn project_change_state(
+    database: &Database,
+    checkpoint: &dyn Fn() -> Result<()>,
+    charge: &crate::read_image_memory::ImageMemory,
+) -> std::result::Result<DirectChangeState, DirectFileReaderError> {
+    // The history is read here, with its refusal reported, before the
+    // inspection below that would answer an unreadable history as empty.
+    database
+        .ensure_image_history_within(checkpoint)
+        .map_err(image_history_answer_error)?;
+    project_loaded_change_state(database, checkpoint, charge).map_err(history_answer_error)
+}
+
+fn project_loaded_change_state(
+    database: &Database,
+    checkpoint: &dyn Fn() -> Result<()>,
+    charge: &crate::read_image_memory::ImageMemory,
+) -> Result<DirectChangeState> {
+    let admit = |bytes: usize| charge.reserve(bytes);
+    let projection = crate::database::ChangeProjection {
+        checkpoint,
+        admit: &admit,
+        bounded: true,
+        ddl: true,
+    };
+    let (changes, _) = database.projected_changes_with_arrivals(&projection, false)?;
+    checkpoint()?;
+    charge.reserve(
+        database
+            .commit_index_len_for_read_image()
+            .saturating_mul(std::mem::size_of::<(Lsn, TxId)>()),
+    )?;
+    let commit_index = database.commit_index_for_read_image()?;
+    checkpoint()?;
+    let answer = direct_change_state(database, commit_index, changes);
+    settle_answer_charge(charge, change_state_bytes(&answer))?;
+    Ok(answer)
+}
+
+/// What one projected change history holds: its lists at their capacities,
+/// everything their elements own, and the commit index.
+fn change_state_bytes(state: &DirectChangeState) -> usize {
+    use crate::sync_types::held;
+    fn list<T>(items: &[T], capacity: usize, element: impl Fn(&T) -> usize) -> usize {
+        let owned = items
+            .iter()
+            .map(|item| element(item).saturating_sub(std::mem::size_of::<T>()))
+            .sum::<usize>();
+        if capacity == 0 {
+            owned
+        } else {
+            capacity
+                .saturating_mul(std::mem::size_of::<T>())
+                .saturating_add(held::ALLOCATION_BYTES)
+                .saturating_add(owned)
+        }
+    }
+    list(
+        &state.rows,
+        state.rows.capacity(),
+        crate::sync_types::RowChange::held_bytes,
+    )
+    .saturating_add(list(
+        &state.edges,
+        state.edges.capacity(),
+        crate::sync_types::EdgeChange::held_bytes,
+    ))
+    .saturating_add(list(
+        &state.vectors,
+        state.vectors.capacity(),
+        crate::sync_types::VectorChange::held_bytes,
+    ))
+    .saturating_add(list(&state.ddl, state.ddl.capacity(), |ddl| {
+        std::mem::size_of::<crate::sync_types::DdlChange>().saturating_add(ddl.estimated_bytes())
+    }))
+    .saturating_add(list(&state.ddl_lsn, state.ddl_lsn.capacity(), |_| {
+        std::mem::size_of::<Lsn>()
+    }))
+    .saturating_add(list(
+        &state.commit_index,
+        state.commit_index.capacity(),
+        |_| std::mem::size_of::<(Lsn, TxId)>(),
+    ))
+}
+
+/// Build sync provenance from the same authenticated retained rows only when
+/// a caller requests that metadata surface, under the same admission and
+/// checkpoints as the change history. The change set it is derived from is
+/// charged while it exists; the answer keeps only the arrivals and the
+/// per-table policy.
+pub(crate) fn project_sync_state(
+    database: &Database,
+    checkpoint: &dyn Fn() -> Result<()>,
+    charge: &crate::read_image_memory::ImageMemory,
+) -> std::result::Result<DirectSyncState, DirectFileReaderError> {
+    database
+        .ensure_image_history_within(checkpoint)
+        .map_err(image_history_answer_error)?;
+    project_loaded_sync_state(database, checkpoint, charge).map_err(history_answer_error)
+}
+
+fn project_loaded_sync_state(
+    database: &Database,
+    checkpoint: &dyn Fn() -> Result<()>,
+    charge: &crate::read_image_memory::ImageMemory,
+) -> Result<DirectSyncState> {
+    let admit = |bytes: usize| charge.reserve(bytes);
+    let projection = crate::database::ChangeProjection {
+        checkpoint,
+        admit: &admit,
+        bounded: true,
+        ddl: false,
+    };
+    let (changes, arrivals) = database.projected_changes_with_arrivals(&projection, true)?;
+    drop(changes);
+    checkpoint()?;
+    // Each table's policy is read from its declaration in place: the answer
+    // holds two words per table, never a copy of the table's schema.
+    let tables = {
+        let metas = database.relational_store().table_meta.read();
+        charge.reserve(
+            metas
+                .keys()
+                .map(|table| {
+                    std::mem::size_of::<DirectTableSyncPolicy>()
+                        .saturating_add(crate::sync_types::held::text(table))
+                        .saturating_add(64)
+                })
+                .sum(),
+        )?;
+        metas
+            .iter()
+            .map(|(table, meta)| table_sync_policy(table, meta))
+            .collect::<Vec<_>>()
+    };
+    checkpoint()?;
+    let answer = direct_sync_state(database, tables, arrivals);
+    settle_answer_charge(charge, sync_state_bytes(&answer))?;
+    Ok(answer)
+}
+
+/// One table's declared sync policy, in the words an answer carries.
+fn table_sync_policy(table: &str, meta: &contextdb_core::TableMeta) -> DirectTableSyncPolicy {
+    DirectTableSyncPolicy {
+        table: table.to_owned(),
+        direction: meta
+            .sync_direction
+            .map(sync_direction_word)
+            .unwrap_or_else(|| "two_way".to_owned()),
+        conflict_policy: conflict_policy_word(meta).unwrap_or_else(|| "keep_first".to_owned()),
+    }
+}
+
+/// What one projected sync-provenance answer holds.
+fn sync_state_bytes(state: &DirectSyncState) -> usize {
+    use crate::sync_types::held;
+    state
+        .sources
+        .capacity()
+        .saturating_mul(std::mem::size_of::<DirectSyncSource>())
+        .saturating_add(held::ALLOCATION_BYTES)
+        .saturating_add(
+            state
+                .tables
+                .capacity()
+                .saturating_mul(std::mem::size_of::<DirectTableSyncPolicy>()),
+        )
+        .saturating_add(held::ALLOCATION_BYTES)
+        .saturating_add(
+            state
+                .tables
+                .iter()
+                .map(|table| {
+                    held::text(&table.table)
+                        .saturating_add(held::text(&table.direction))
+                        .saturating_add(held::text(&table.conflict_policy))
+                })
+                .sum(),
+        )
+}
+
+fn direct_sync_state(
+    database: &Database,
+    mut tables: Vec<DirectTableSyncPolicy>,
+    arrivals: HashMap<Lsn, Option<Lsn>>,
+) -> DirectSyncState {
+    let mut sources = arrivals
+        .into_iter()
+        .map(|(row_lsn, source_lsn)| DirectSyncSource {
+            row_lsn,
+            source_lsn,
+        })
+        .collect::<Vec<_>>();
+    sources.sort_by_key(|source| source.row_lsn);
+    tables.sort_by(|left, right| left.table.cmp(&right.table));
+    DirectSyncState {
+        watermark: database.sync_watermark(),
+        sources,
+        tables,
+    }
+}
+
+fn direct_change_state(
+    database: &Database,
+    commit_index: Vec<(Lsn, TxId)>,
+    changes: crate::sync_types::ChangeSet,
+) -> DirectChangeState {
+    DirectChangeState {
+        current_lsn: database.current_lsn(),
+        committed_watermark: database.committed_watermark(),
+        next_tx: database.next_tx(),
+        commit_index,
+        rows: changes.rows,
+        edges: changes.edges,
+        vectors: changes.vectors,
+        ddl: changes.ddl,
+        ddl_lsn: changes.ddl_lsn,
+    }
 }
 
 /// The event surface as the engine reports it right now.
@@ -395,6 +587,7 @@ pub(crate) fn project_events(database: &Database) -> DirectEventsStatus {
                 delivered: sink.metrics.delivered,
                 queued: sink.metrics.queued,
                 retried: sink.metrics.retried,
+                uncertain: sink.metrics.uncertain,
                 permanent_failures: sink.metrics.permanent_failures,
                 examined: sink.metrics.examined,
             })
@@ -653,20 +846,22 @@ fn propagation_sort_key(rule: &DirectPropagationRule) -> (u8, String, String) {
 }
 
 /// Length-prefixed absorption, so two different shapes cannot hash alike.
+#[cfg(feature = "test-seams")]
 struct FamilyDigest {
     hasher: blake3::Hasher,
-    accountant: Arc<MemoryAccountant>,
 }
 
+#[cfg(feature = "test-seams")]
 impl FamilyDigest {
-    fn new(accountant: &Arc<MemoryAccountant>) -> Self {
+    fn new(_accountant: &Arc<MemoryAccountant>) -> Self {
         Self {
             hasher: blake3::Hasher::new(),
-            accountant: accountant.clone(),
         }
     }
 
     fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        #[cfg(feature = "test-seams")]
+        crate::read_work_probe::note_hashed_bytes(bytes.len());
         self.hasher.update(&(bytes.len() as u64).to_le_bytes());
         self.hasher.update(bytes);
         self
@@ -685,91 +880,23 @@ impl FamilyDigest {
         self.number(u64::from(value))
     }
 
-    /// Absorb a collection by content rather than by the order it arrived
-    /// in, and by each item's content rather than by the order its own maps
-    /// happen to iterate. The durable encoder preserves map iteration order,
-    /// which is per-process, so identity is taken over a key-sorted rendering
-    /// instead.
-    fn canonical_set<T: serde::Serialize>(&mut self, values: &[T]) -> Result<&mut Self> {
-        let mut workspace =
-            crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone());
-        workspace.try_grow_for(
-            crate::read_image_memory::canonical_workspace(values)?,
-            "direct_read",
-            "canonical_image_identity",
-            "Raise MEMORY_LIMIT to admit canonical image identity workspace.",
-        )?;
-        let mut rendered = values
-            .iter()
-            .map(|value| {
-                // Going through the generic document sorts every map by key;
-                // serializing the typed value directly would keep whatever
-                // order this process's maps happen to iterate in.
-                serde_json::to_value(value)
-                    .and_then(|document| serde_json::to_vec(&document))
-                    .map_err(|error| {
-                        Error::Other(format!("render committed image identity: {error}"))
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        rendered.sort();
-        self.number(rendered.len() as u64);
-        for bytes in &rendered {
-            self.bytes(bytes);
-        }
-        Ok(self)
-    }
-
     fn finish(&self) -> [u8; 32] {
         *self.hasher.finalize().as_bytes()
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn typed_digest(
     image: &DirectOwnedImage,
     accountant: &Arc<MemoryAccountant>,
 ) -> Result<DirectTypedImageDigest> {
-    let mut relational = FamilyDigest::new(accountant);
-    for row in &image.relational_rows {
-        relational.text(&row.table).number(row.row_id.0);
-        for (column, value) in &row.values {
-            relational.text(column);
-            relational.canonical_set(std::slice::from_ref(value))?;
-        }
-    }
-
-    let mut graph = FamilyDigest::new(accountant);
-    for edge in &image.graph_edges {
-        graph
-            .text(&edge.edge_type)
-            .bytes(edge.source.as_bytes())
-            .bytes(edge.target.as_bytes());
-        for (name, value) in &edge.properties {
-            graph.text(name);
-            graph.canonical_set(std::slice::from_ref(value))?;
-        }
-    }
-
-    let mut families = [
+    let relational = FamilyDigest::new(accountant);
+    let graph = FamilyDigest::new(accountant);
+    let families = [
         FamilyDigest::new(accountant),
         FamilyDigest::new(accountant),
         FamilyDigest::new(accountant),
     ];
-    for vector in &image.vectors {
-        let family = match vector.quantization {
-            DirectVectorQuantization::F32 => &mut families[0],
-            DirectVectorQuantization::Sq8 => &mut families[1],
-            DirectVectorQuantization::Sq4 => &mut families[2],
-        };
-        family
-            .text(&vector.index.table)
-            .text(&vector.index.column)
-            .number(vector.row_id.0)
-            .number(vector.values.len() as u64);
-        for component in &vector.values {
-            family.number(u64::from(component.to_bits()));
-        }
-    }
 
     let mut schema_and_indexes = FamilyDigest::new(accountant);
     let mut policy = FamilyDigest::new(accountant);
@@ -843,23 +970,8 @@ fn typed_digest(
         .number(image.changes.current_lsn.0)
         .number(image.changes.committed_watermark.0)
         .number(image.changes.next_tx.0);
-    for (lsn, tx) in &image.changes.commit_index {
-        change_and_ddl.number(lsn.0).number(tx.0);
-    }
-    // The change view is assembled from maps, so two readers of the same
-    // committed bytes can list the same changes in different orders. Identity
-    // is about what the image contains, not about the order a particular
-    // process happened to walk it, so each change is absorbed in sorted
-    // encoded order.
-    change_and_ddl.canonical_set(&image.changes.rows)?;
-    change_and_ddl.canonical_set(&image.changes.edges)?;
-    change_and_ddl.canonical_set(&image.changes.vectors)?;
-    change_and_ddl.canonical_set(&image.changes.ddl)?;
-    let mut ddl_lsn = image.changes.ddl_lsn.clone();
-    ddl_lsn.sort();
-    for lsn in ddl_lsn {
-        change_and_ddl.number(lsn.0);
-    }
+    // The open-time image carries history frontiers only; the history itself
+    // is the on-request change-log state and is not part of this digest.
 
     let mut configuration = FamilyDigest::new(accountant);
     configuration
@@ -881,6 +993,7 @@ fn typed_digest(
             .number(sink.delivered)
             .number(sink.queued)
             .number(sink.retried)
+            .number(sink.uncertain)
             .number(sink.permanent_failures)
             .number(sink.examined);
     }
@@ -950,9 +1063,10 @@ fn typed_digest(
     })
 }
 
-// The commit index rides through as ordinary pairs; naming the transaction
-// type once here keeps the projection signature readable.
-type TxIdAlias = contextdb_core::TxId;
+#[cfg(feature = "test-seams")]
+pub(crate) fn typed_digest_for_test(image: &DirectOwnedImage) -> Result<DirectTypedImageDigest> {
+    typed_digest(image, &Arc::new(MemoryAccountant::no_limit()))
+}
 
 impl std::fmt::Debug for CommittedImage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -978,6 +1092,10 @@ fn write_vector_search_disclosure(
     };
     bytes
         .tag(1)
+        .tag(match disclosure.route_evidence {
+            crate::database::VectorSearchRouteEvidence::PassivePrediction => 0,
+            crate::database::VectorSearchRouteEvidence::Executed => 1,
+        })
         .tag(mode(disclosure.requested_mode))
         .tag(mode(disclosure.resolved_mode));
     // An unresolved count is absent, never zero: zero is a complete empty
@@ -1034,12 +1152,35 @@ fn write_vector_search_disclosure(
     for partition in &disclosure.partition_hnsw {
         bytes
             .text(&partition.partition)
+            .tag(match partition.route {
+                None => 0,
+                Some(crate::database::VectorSearchRoute::Exact) => 1,
+                Some(crate::database::VectorSearchRoute::Indexed) => 2,
+                Some(crate::database::VectorSearchRoute::FilteredIndexed) => 3,
+            })
+            .optional_text(partition.reason.as_deref())
             .count(partition.hnsw_m as u64)
             .count(partition.hnsw_ef_construction as u64)
             .count(partition.hnsw_ef_search as u64)
             .text(&partition.ef_search_source)
             .count(partition.policy_revision);
     }
+    for count in [
+        disclosure.global_candidate_budget,
+        disclosure.admission_evaluations,
+        disclosure.expansion_evaluations,
+        disclosure.layers_admitted,
+    ] {
+        match count {
+            Some(count) => {
+                bytes.tag(1).count(count as u64);
+            }
+            None => {
+                bytes.tag(0);
+            }
+        }
+    }
+    bytes.optional_text(disclosure.budget_terminal.as_deref());
 }
 
 fn read_vector_search_disclosure(
@@ -1058,6 +1199,11 @@ fn read_vector_search_disclosure(
         1 => Ok(contextdb_core::VectorSearchMode::Exact),
         2 => Ok(contextdb_core::VectorSearchMode::Indexed),
         _ => Err(invalid_metadata_payload()),
+    };
+    let route_evidence = match bytes.tag()? {
+        0 => crate::database::VectorSearchRouteEvidence::PassivePrediction,
+        1 => crate::database::VectorSearchRouteEvidence::Executed,
+        _ => return Err(invalid_metadata_payload()),
     };
     let requested_mode = mode(bytes.tag()?)?;
     let resolved_mode = mode(bytes.tag()?)?;
@@ -1119,6 +1265,14 @@ fn read_vector_search_disclosure(
     for _ in 0..partition_count {
         partition_hnsw.push(crate::database::VectorPartitionHnswDisclosure {
             partition: bytes.text()?,
+            route: match bytes.tag()? {
+                0 => None,
+                1 => Some(crate::database::VectorSearchRoute::Exact),
+                2 => Some(crate::database::VectorSearchRoute::Indexed),
+                3 => Some(crate::database::VectorSearchRoute::FilteredIndexed),
+                _ => return Err(invalid_metadata_payload()),
+            },
+            reason: bytes.optional_text()?,
             hnsw_m: usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?,
             hnsw_ef_construction: usize::try_from(bytes.count()?)
                 .map_err(|_| invalid_metadata_payload())?,
@@ -1128,7 +1282,17 @@ fn read_vector_search_disclosure(
             policy_revision: bytes.count()?,
         });
     }
+    let mut budget_counts = [None; 4];
+    for count in &mut budget_counts {
+        *count = match bytes.tag()? {
+            0 => None,
+            1 => Some(usize::try_from(bytes.count()?).map_err(|_| invalid_metadata_payload())?),
+            _ => return Err(invalid_metadata_payload()),
+        };
+    }
+    let budget_terminal = bytes.optional_text()?;
     Ok(Some(crate::database::VectorSearchDisclosure {
+        route_evidence,
         requested_mode,
         resolved_mode,
         aggregate_allowed_vectors,
@@ -1146,6 +1310,11 @@ fn read_vector_search_disclosure(
         recovery,
         query_source,
         partition_hnsw,
+        global_candidate_budget: budget_counts[0],
+        admission_evaluations: budget_counts[1],
+        expansion_evaluations: budget_counts[2],
+        layers_admitted: budget_counts[3],
+        budget_terminal,
     }))
 }
 
@@ -1749,6 +1918,7 @@ fn read_events(
             delivered: bytes.count()?,
             queued: bytes.count()?,
             retried: bytes.count()?,
+            uncertain: bytes.count()?,
             permanent_failures: bytes.count()?,
             examined: bytes.count()?,
         });
@@ -2049,6 +2219,7 @@ fn write_events(bytes: &mut crate::read_contract::CanonicalWriter, events: &Dire
             .count(sink.delivered)
             .count(sink.queued)
             .count(sink.retried)
+            .count(sink.uncertain)
             .count(sink.permanent_failures)
             .count(sink.examined);
     }
@@ -2215,6 +2386,36 @@ pub(crate) fn project_metadata(
         request,
         DirectMetadataRequest::Tables | DirectMetadataRequest::EventsStatus
     );
+    let reads_history = matches!(
+        request,
+        DirectMetadataRequest::ImageState {
+            kind: DirectImageMetadataKind::ChangeLog | DirectImageMetadataKind::Sync
+        }
+    );
+    // What this answer costs the reader's memory while it is built, encoded
+    // and then held by the caller: released when the last copy of the
+    // response is dropped.
+    let charge = crate::read_image_memory::ImageMemory::charging(target.bounded_read_accountant());
+    // A history this request has to read is walked record by record; the walk
+    // stops at the request's cancellation or its active-time budget instead
+    // of finishing a history nobody is waiting for.
+    let started_ms = clock.now_ms();
+    let history_checkpoint = || -> Result<()> {
+        if cancellation.is_cancelled() {
+            return Err(Error::ReadCancelled);
+        }
+        if clock.now_ms().saturating_sub(started_ms) > limits.active_ms {
+            return Err(Error::ReadFailure(ReadFailure::owner_limit_exceeded(
+                contextdb_core::read_contract::OwnerLimitExceededDetail {
+                    limit: contextdb_core::read_contract::ReadFailureLimit::ActiveMs,
+                    value: limits.active_ms,
+                    required: None,
+                    statement: None,
+                },
+            )));
+        }
+        Ok(())
+    };
     let mut resume_at = None;
     let body = match request {
         request @ (DirectMetadataRequest::DeliveryStatus { .. }
@@ -2284,32 +2485,68 @@ pub(crate) fn project_metadata(
         },
         DirectMetadataRequest::ImageState { kind } => DirectMetadataBody::ImageState {
             state: match kind {
-                DirectImageMetadataKind::Sync => DirectImageState::Sync(image.sync.clone()),
-                DirectImageMetadataKind::ChangeLog => {
-                    DirectImageState::ChangeLog(image.changes.clone())
-                }
+                DirectImageMetadataKind::Sync => DirectImageState::Sync(
+                    target.committed_sync_state(&history_checkpoint, &charge)?,
+                ),
+                DirectImageMetadataKind::ChangeLog => DirectImageState::ChangeLog(
+                    target.committed_change_state(&history_checkpoint, &charge)?,
+                ),
                 DirectImageMetadataKind::Configuration => {
+                    // The copy is admitted at the size of what it copies.
+                    charge
+                        .reserve(configuration_state_bytes(&image.configuration))
+                        .map_err(history_answer_error)?;
                     DirectImageState::Configuration(image.configuration.clone())
                 }
             },
         },
     };
-    let canonical_bytes = crate::read_contract::encode_metadata_body(&body)
-        .map_err(|error| DirectFileReaderError::Engine(error.to_string()))?;
-    if arrives_whole
-        && let Some(failure) = crate::metadata_page::admit_complete_metadata(
-            canonical_bytes.len(),
-            limits.result_bytes,
-        )
-    {
-        return Err(DirectFileReaderError::ReadFailure(failure));
+    // The encoding is measured before it is built: an answer larger than the
+    // request's result ceiling is refused on its own size, and the bytes
+    // that carry it are admitted before they exist.
+    let encoded_len = crate::read_contract::encoded_metadata_body_len(&body);
+    if arrives_whole {
+        if let Some(failure) =
+            crate::metadata_page::admit_complete_metadata(encoded_len, limits.result_bytes)
+        {
+            return Err(DirectFileReaderError::ReadFailure(failure));
+        }
+        charge.reserve(encoded_len).map_err(history_answer_error)?;
+    }
+    if reads_history {
+        history_checkpoint().map_err(history_answer_error)?;
+    }
+    let canonical_bytes = crate::read_contract::encode_metadata_body_measured(&body, encoded_len);
+    if reads_history {
+        // A request cancelled, or out of active time, while its answer was
+        // being encoded is refused rather than answered.
+        history_checkpoint().map_err(history_answer_error)?;
     }
     Ok(DirectMetadataResponse {
         body,
         canonical_bytes,
         snapshot: image.snapshot,
         continuation: resume_at,
+        charge: crate::read_image_memory::AnswerCharge::holding(charge),
     })
+}
+
+/// What one copy of a committed image's configuration holds: its schemas,
+/// measured by their canonical encoding -- which visits every field once --
+/// and tripled, because a decoded copy costs more than its wire bytes once
+/// its containers are counted.
+fn configuration_state_bytes(configuration: &DirectConfigurationState) -> usize {
+    64usize.saturating_add(
+        configuration
+            .schemas
+            .iter()
+            .map(|schema| {
+                let mut counter = crate::read_contract::CanonicalWriter::counting();
+                write_schema(&mut counter, schema);
+                counter.len().saturating_mul(3)
+            })
+            .sum::<usize>(),
+    )
 }
 
 /// What the engine would do with this statement, without running it.

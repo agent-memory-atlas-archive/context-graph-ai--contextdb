@@ -84,13 +84,7 @@ impl Database {
                 }
             } else {
                 if let Some(image) = &self.committed_image_startup {
-                    entries.extend(
-                        image
-                            .config_values
-                            .iter()
-                            .filter(|(k, _)| owned_key(k))
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
+                    entries.extend(image.config_source.load_image_custody_config()?);
                 }
                 entries.extend(
                     self.custody_metadata
@@ -241,6 +235,7 @@ impl Database {
                 incarnation,
                 source_lsn: frontier,
                 dependency_complete,
+                hub_contact_ms: None,
             },
             Some(hub),
             lineages,
@@ -252,12 +247,24 @@ impl Database {
         &self,
         reference: &crate::custody::records::RowRef,
     ) -> Result<Option<VersionedRow>> {
-        self.visible_row_by_natural_key(
+        // Custody digests cover every committed column, so a file-backed
+        // writer's paged-out bodies are read back for the row it hands on.
+        let Some(mut row) = self.visible_row_by_natural_key(
             &reference.table,
             &reference.key,
             self.snapshot(),
             &HashSet::new(),
-        )
+        )?
+        else {
+            return Ok(None);
+        };
+        let shed = self.shed_committed_values_for_change(
+            &reference.table,
+            &row,
+            &crate::database::ChangeProjection::unbounded(),
+        )?;
+        row.values.extend(shed);
+        Ok(Some(row))
     }
 
     // A replacement or deletion ends ownership of the

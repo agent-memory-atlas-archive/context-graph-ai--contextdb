@@ -1,8 +1,9 @@
-use contextdb_core::{SyncDirection, TenantId, Value};
+use contextdb_core::{Incarnation, SyncDirection, TenantId, Value};
 use contextdb_engine::Database;
 use contextdb_server::protocol::{
     DependencyCompletePullResponse, MessageType, PullResponse, WireChangeSet,
-    canonical_ddl_provenance_digest, decode, encode, validate_wire_ddl_provenance,
+    canonical_ddl_provenance_digest, decode, encode, signed_ddl_author_for_test,
+    validate_wire_ddl_provenance,
 };
 use contextdb_server::subjects::pull_subject;
 use contextdb_server::transport::{ClientTransport, TransportFuture, TransportStatusFuture};
@@ -50,6 +51,7 @@ fn insert(db: &Database, table: &str, id: i64, value: &str) {
 
 struct Hub {
     db: Arc<Database>,
+    identity: Arc<FabricIdentity>,
     stop: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -70,8 +72,8 @@ fn start_hub(broker: &InProcessBroker) -> Hub {
             db.clone(),
             broker.server_as(&node_id),
             TenantId::from(TENANT),
-            node_id,
-            identity,
+            node_id.clone(),
+            identity.clone(),
         ),
     );
     let stop = Arc::new(AtomicBool::new(false));
@@ -80,7 +82,12 @@ fn start_hub(broker: &InProcessBroker) -> Hub {
         let stop = stop.clone();
         async move { server.run_until(stop).await }
     });
-    Hub { db, stop, task }
+    Hub {
+        db,
+        identity,
+        stop,
+        task,
+    }
 }
 
 fn create_push_only(db: &Database, table: &str) {
@@ -114,9 +121,18 @@ struct ProjectedDirectionPull {
     inner: Arc<dyn ClientTransport>,
     pull_subject: String,
     before_projection: Arc<Mutex<Option<Vec<WireChangeSet>>>>,
+    /// The identity that authored these tables. A peer that restates schema
+    /// on the wire restates schema it wrote, and signs the restatement with
+    /// its own key -- a peer rewriting somebody else's schema is refused.
+    author: Arc<FabricIdentity>,
+    author_incarnation: Incarnation,
 }
 
-fn project_final_directions(changeset: &mut WireChangeSet) {
+fn project_final_directions(
+    changeset: &mut WireChangeSet,
+    author: &FabricIdentity,
+    author_incarnation: Incarnation,
+) {
     for ((ddl, ddl_lsn), provenance) in changeset
         .ddl
         .iter_mut()
@@ -158,6 +174,23 @@ fn project_final_directions(changeset: &mut WireChangeSet) {
                 provenance.table_generation,
             )
             .expect("canonical schema provenance digest");
+            // The restatement keeps the author's own account of its unit.
+            let unit_statements = provenance
+                .author
+                .as_ref()
+                .expect("the served record names its author")
+                .unit_statements;
+            provenance.author = Some(
+                signed_ddl_author_for_test(
+                    &TenantId::from(TENANT),
+                    author,
+                    author_incarnation,
+                    ddl,
+                    provenance,
+                    unit_statements,
+                )
+                .expect("the author signs the restatement of its own schema"),
+            );
         }
     }
     validate_wire_ddl_provenance(changeset).expect("projected schema provenance remains valid");
@@ -200,6 +233,8 @@ impl ClientTransport for ProjectedDirectionPull {
         let inner = self.inner.clone();
         let subject = subject.to_string();
         let before_projection = self.before_projection.clone();
+        let author = self.author.clone();
+        let author_incarnation = self.author_incarnation;
         Box::pin(async move {
             let response_bytes = inner.request(&subject, request_bytes, timeout).await?;
             let envelope = decode(&response_bytes).expect("decode pull response envelope");
@@ -211,7 +246,7 @@ impl ClientTransport for ProjectedDirectionPull {
                         .lock()
                         .expect("wire capture lock must not poison") =
                         Some(vec![response.changeset.clone()]);
-                    project_final_directions(&mut response.changeset);
+                    project_final_directions(&mut response.changeset, &author, author_incarnation);
                     Ok(encode(MessageType::PullResponse, &response).expect("encode pull response"))
                 }
                 MessageType::DependencyCompletePullResponse => {
@@ -223,9 +258,13 @@ impl ClientTransport for ProjectedDirectionPull {
                     *before_projection
                         .lock()
                         .expect("wire capture lock must not poison") = Some(source_pages);
-                    project_final_directions(&mut response.ordinary.changeset);
+                    project_final_directions(
+                        &mut response.ordinary.changeset,
+                        &author,
+                        author_incarnation,
+                    );
                     for unit in &mut response.units {
-                        project_final_directions(unit);
+                        project_final_directions(unit, &author, author_incarnation);
                     }
                     Ok(
                         encode(MessageType::DependencyCompletePullResponse, &response)
@@ -352,6 +391,11 @@ async fn received_page_projection_excludes_wire_rows_after_final_direction_chang
         inner: broker.client_as(&node_id),
         pull_subject: pull_subject(TENANT),
         before_projection: before_projection.clone(),
+        author: hub.identity.clone(),
+        author_incarnation: hub
+            .db
+            .sync_incarnation(&TenantId::from(TENANT))
+            .expect("the hub's own database life"),
     });
     let edge = Arc::new(Database::open_memory());
     let client = SyncClient::with_authenticated_transport_and_identity_for_test(

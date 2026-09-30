@@ -801,7 +801,7 @@ fn r19_pruning_removes_vector_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// R20 — Legacy rows without created_at are never age-pruned (unit test)
+// R20 — Rows without created_at are never age-pruned (unit test)
 //
 // The engine stamps `created_at` on ALL inserts, so there is no SQL-level
 // way to produce a row with `created_at: None`. This test verifies the
@@ -810,8 +810,8 @@ fn r19_pruning_removes_vector_entries() {
 //
 // Test strategy:
 //   Part A (unit): Construct two VersionedRows directly — one with
-//     `created_at: None` (legacy) and one with `created_at` in the past.
-//     Call the pruning-eligibility function. Assert the legacy row is
+//     `created_at: None` (unstamped) and one with `created_at` in the past.
+//     Call the pruning-eligibility function. Assert the unstamped row is
 //     NOT eligible and the timestamped row IS eligible.
 //   Part B (integration, via SQL): Insert a row, ALTER TABLE SET RETAIN
 //     with short TTL, sleep, prune. The row HAS `created_at` and IS old
@@ -829,7 +829,7 @@ fn r20_legacy_rows_without_created_at_survive() {
         created_tx: TxId(1),
         deleted_tx: None,
         lsn: Lsn(1),
-        created_at: None, // legacy: no timestamp
+        created_at: None, // unstamped: no timestamp
     };
     let old_row = VersionedRow {
         row_id: RowId(2),
@@ -846,7 +846,7 @@ fn r20_legacy_rows_without_created_at_survive() {
         .unwrap()
         .as_millis() as u64;
 
-    // Legacy row: created_at is None → NOT eligible for age-based pruning
+    // Unstamped row: created_at is None → NOT eligible for age-based pruning
     let legacy_eligible = legacy_row
         .created_at
         .map(|ts| now_millis.saturating_sub(ts.0) > ttl_millis)

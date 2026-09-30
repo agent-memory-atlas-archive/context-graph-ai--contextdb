@@ -20,6 +20,19 @@ pub struct WriteSet {
     pub commit_lsn: Option<Lsn>,
     pub relational_insert_source_lsns: HashMap<TableName, HashMap<RowId, Lsn>>,
     pub relational_insert_source_kinds: HashMap<TableName, HashMap<RowId, u8>>,
+    /// What each staged row version's admission actually charged, keyed the
+    /// same way the two sidecars above are.
+    ///
+    /// A version has to be released by exactly what its admission charged. A
+    /// release that re-prices the row instead answers whatever the table's
+    /// index set costs AT THE RELEASE, which is a different number whenever
+    /// that index set changed while the row sat staged -- one posting per row
+    /// too many after a CREATE INDEX landed mid-transaction, one too few
+    /// after a DROP INDEX -- and a table whose schema is gone altogether
+    /// prices as though it had never declared an index at all. Carrying the
+    /// admitted figure with the staged row is what makes the two ends the
+    /// same number by construction.
+    pub relational_insert_admitted_bytes: HashMap<TableName, HashMap<RowId, usize>>,
     /// Sync provenance for rows this transaction does NOT rewrite. The sidecars
     /// above ride a staged row version, so they cannot describe a row whose
     /// stored values are already correct — the case where an incoming row
@@ -143,6 +156,58 @@ impl WriteSet {
                 *tx = to;
             }
         }
+    }
+
+    /// Record what admission charged for one staged row version.
+    pub fn set_relational_insert_admitted_bytes(
+        &mut self,
+        table: impl Into<TableName>,
+        row_id: RowId,
+        bytes: usize,
+    ) {
+        self.relational_insert_admitted_bytes
+            .entry(table.into())
+            .or_default()
+            .insert(row_id, bytes);
+    }
+
+    /// What admission charged for one staged row version, if it was recorded.
+    /// `None` means nothing has re-priced the row since it was staged, so the
+    /// table's current shape still answers what admission charged.
+    pub fn admitted_bytes_for_staged_row(&self, table: &str, row_id: RowId) -> Option<usize> {
+        self.relational_insert_admitted_bytes
+            .get(table)
+            .and_then(|rows| rows.get(&row_id))
+            .copied()
+    }
+
+    /// Forget the record for a staged row version that is no longer staged.
+    pub fn forget_relational_insert_admitted_bytes(&mut self, table: &str, row_id: RowId) {
+        if let Some(rows) = self.relational_insert_admitted_bytes.get_mut(table) {
+            rows.remove(&row_id);
+            if rows.is_empty() {
+                self.relational_insert_admitted_bytes.remove(table);
+            }
+        }
+    }
+
+    /// Drop every record whose row version is no longer staged. Truncating to
+    /// a checkpoint, restoring a savepoint and discarding rows all remove
+    /// staged versions in bulk; a record left behind for one of them would be
+    /// read again if the same row identity were staged a second time.
+    pub fn forget_admitted_bytes_for_unstaged_rows(&mut self) {
+        if self.relational_insert_admitted_bytes.is_empty() {
+            return;
+        }
+        let staged = self
+            .relational_inserts
+            .iter()
+            .map(|(table, row)| (table.clone(), row.row_id))
+            .collect::<HashSet<_>>();
+        self.relational_insert_admitted_bytes.retain(|table, rows| {
+            rows.retain(|row_id, _| staged.contains(&(table.clone(), *row_id)));
+            !rows.is_empty()
+        });
     }
 
     pub fn set_relational_insert_source_lsn(

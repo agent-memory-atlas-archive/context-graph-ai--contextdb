@@ -13,7 +13,10 @@ fn historical_phrases() -> Vec<String> {
         ["this", "run"].join(" "),
         ["this", "round"].join(" "),
         ["separately", "tracked", "gap"].join(" "),
-        ["cold", "review", "#4"].join(" "),
+        ["cold", "review"].join(" "),
+        ["A", "19"].concat(),
+        ["B1", "gate"].join(" "),
+        ["B2", "gate"].join(" "),
         ["Finding", "1"].join(" "),
         ["Finding", "2"].join(" "),
         ["own", "commit"].join(" "),
@@ -21,6 +24,11 @@ fn historical_phrases() -> Vec<String> {
         ["fix", "round"].join(" "),
         ["owner", "ruling"].join(" "),
         ["review", "must-fix"].join(" "),
+        ["gate", "row"].join(" "),
+        ["gate", "row"].join("_"),
+        ["gate", "rows"].join("_"),
+        ["this", "campaign"].join(" "),
+        ["previous", "campaign"].join(" "),
     ]
 }
 
@@ -46,6 +54,8 @@ fn planning_citation_phrases() -> Vec<String> {
         ["the", "lane's"].join(" "),
         ["lane", "target"].join(" "),
         ["fixture", "lane"].join(" "),
+        ["the", "brief", "names"].join(" "),
+        ["DL", "CDB"].join("-"),
         ["concurrent", "lane"].join(" "),
         [".claude", "plans"].join("/"),
     ]
@@ -96,6 +106,20 @@ fn is_scanned_text(rel: &str) -> bool {
     let documentation =
         name.ends_with(".md") && (!rel.contains('/') || rel.split('/').count() == 3);
     text && (code_scope || documentation)
+}
+
+#[test]
+fn executor_and_database_source_are_in_vocabulary_scope() {
+    for path in [
+        "crates/contextdb-engine/src/executor.rs",
+        "crates/contextdb-engine/src/executor/bounded.rs",
+        "crates/contextdb-engine/src/database.rs",
+    ] {
+        assert!(
+            is_scanned_text(path),
+            "source excluded from vocabulary scan: {path}"
+        );
+    }
 }
 
 /// `git ls-files` over the same scanned top-level paths, walked directly off

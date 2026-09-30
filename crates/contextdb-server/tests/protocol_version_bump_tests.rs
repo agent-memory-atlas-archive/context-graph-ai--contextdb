@@ -343,9 +343,9 @@ async fn a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advanci
         "the refusal must name the protocol version mismatch: {message}"
     );
     assert!(
-        message.to_lowercase().contains("upgrade"),
-        "the refusal must name the remedy (upgrade both ends), not just the \
-         two version numbers: {message}"
+        message.contains("supported range")
+            && message.contains("a contextdb release supporting a protocol version in this range"),
+        "the refusal must name the supported protocol range and required release: {message}"
     );
 
     assert_eq!(
@@ -413,8 +413,9 @@ async fn a_version_mismatched_peer_is_refused_on_pull_moving_no_rows_and_advanci
         .expect_err("a version-mismatched pull must be refused, not silently accepted");
     let message = err.to_string();
     assert!(
-        message.to_lowercase().contains("upgrade"),
-        "the refusal must name the remedy (upgrade both ends): {message}"
+        message.contains("supported range")
+            && message.contains("a contextdb release supporting a protocol version in this range"),
+        "the refusal must name the supported protocol range and required release: {message}"
     );
 
     assert_eq!(
@@ -463,6 +464,7 @@ async fn a_version_mismatched_peer_is_refused_on_the_status_exchange() {
     });
     let request = SyncStatusRequest {
         incarnation: contextdb_core::Incarnation::mint(),
+        ..Default::default()
     };
     let encoded = encode(MessageType::StatusRequest, &request).expect("encode status request");
 
@@ -604,7 +606,8 @@ fn every_noncurrent_envelope_is_rejected_by_encoding_and_decoding() {
                 version,
                 MessageType::StatusRequest,
                 &SyncStatusRequest {
-                    incarnation: Incarnation::mint()
+                    incarnation: Incarnation::mint(),
+                    ..Default::default()
                 }
             )
             .is_err(),

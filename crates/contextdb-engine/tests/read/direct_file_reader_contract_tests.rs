@@ -11,8 +11,8 @@ use contextdb_engine::direct_file_reader::test_seams::{
     DirectConfigurationState, DirectCursorPage, DirectCursorUnavailable, DirectEventTypeStatus,
     DirectEventsStatus, DirectFileReader, DirectFileReaderError, DirectImageMetadataKind,
     DirectImageState, DirectIndexColumn, DirectIndexDirection, DirectMaintenanceStatus,
-    DirectMetadataBody, DirectMetadataRequest, DirectMetadataResponse, DirectOwnedImage,
-    DirectPropagationRule, DirectRankPolicy, DirectReaderConfig, DirectReaderCounters,
+    DirectMetadataBody, DirectMetadataRequest, DirectMetadataResponse, DirectPropagationRule,
+    DirectQuery, DirectRankPolicy, DirectReaderConfig, DirectReaderCounters,
     DirectReferencePropagation, DirectRepairRequiredCause, DirectRetainPolicy, DirectRouteStatus,
     DirectScheduleStatus, DirectSchema, DirectSchemaColumn, DirectSchemaIndex,
     DirectScopeLabelKind, DirectSinkStatus, DirectSnapshot, DirectStateMachine,
@@ -22,12 +22,13 @@ use contextdb_engine::direct_file_reader::test_seams::{
     canonical_metadata_bytes_for_test, counters_for_test, cursor_resource_witness_for_test,
     open_for_test, open_with_hydration_observer_for_test, owned_image_for_test,
     reset_counters_for_test, verified_image_digest_for_test, verified_image_digest_wire_for_test,
+    with_isolated_bounded_source_touches_for_test,
 };
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
     DurableStoreDamage, ReadImageSourceEvent, arm_read_image_hydration_pause_for_test,
-    prepare_durable_store_damage_for_test, read_image_source_events_for_test,
-    reset_read_image_source_events_for_test,
+    observe_read_image_source_events_for_test, prepare_durable_store_damage_for_test,
 };
+use contextdb_engine::read_content_test_adapter::committed_content_for_test;
 use contextdb_engine::read_contract::{encode_cursor_page, encode_query_result};
 use contextdb_engine::{Database, MaintenancePolicy};
 use contextdb_vector::stored_vector_value;
@@ -69,7 +70,7 @@ const CHILD_CLOSE: &str = "close";
 static DIRECT_FILE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 static DIRECT_FILE_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn serialise_direct_file_test() -> MutexGuard<'static, ()> {
+pub(crate) fn serialise_direct_file_test() -> MutexGuard<'static, ()> {
     DIRECT_FILE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -995,6 +996,7 @@ fn seed_fixture_from_seed(
                 delivered: sink.metrics.delivered,
                 queued: sink.metrics.queued,
                 retried: sink.metrics.retried,
+                uncertain: sink.metrics.uncertain,
                 permanent_failures: sink.metrics.permanent_failures,
                 examined: sink.metrics.examined,
             })
@@ -1039,6 +1041,7 @@ fn seed_fixture_from_seed(
             delivered: 0,
             queued: rows.len() as u64,
             retried: 0,
+            uncertain: 0,
             permanent_failures: 0,
             examined: 0,
         }]
@@ -1404,55 +1407,76 @@ fn metadata_responses(fixture: &Fixture, reader: &DirectFileReader) -> Vec<Direc
     responses
 }
 
-fn sorted_image_rows(image: &DirectOwnedImage) -> Vec<DirectStoredRow> {
-    let mut rows = image.relational_rows.clone();
-    rows.sort_by(|left, right| (&left.table, left.row_id).cmp(&(&right.table, right.row_id)));
-    rows
-}
-
-fn sorted_image_edges(image: &DirectOwnedImage) -> Vec<DirectStoredEdge> {
-    let mut edges = image.graph_edges.clone();
-    edges.sort_by(|left, right| {
-        (&left.edge_type, left.source, left.target).cmp(&(
-            &right.edge_type,
-            right.source,
-            right.target,
-        ))
-    });
-    edges
-}
-
-fn sorted_expected_edges(fixture: &Fixture) -> Vec<DirectStoredEdge> {
-    let mut edges = fixture.expected_graph_edges.clone();
-    edges.sort_by(|left, right| {
-        (&left.edge_type, left.source, left.target).cmp(&(
-            &right.edge_type,
-            right.source,
-            right.target,
-        ))
-    });
-    edges
-}
-
-fn sorted_image_vectors(image: &DirectOwnedImage) -> Vec<DirectStoredVector> {
-    let mut vectors = image.vectors.clone();
-    vectors.sort_by(|left, right| {
-        (&left.index.table, &left.index.column, left.row_id).cmp(&(
-            &right.index.table,
-            &right.index.column,
-            right.row_id,
-        ))
-    });
-    vectors
-}
-
-fn assert_complete_owned_image(fixture: &Fixture, reader: &DirectFileReader) -> DirectSnapshot {
+fn assert_complete_public_image_state(
+    fixture: &Fixture,
+    reader: &DirectFileReader,
+) -> DirectSnapshot {
     let image = owned_image_for_test(reader)
-        .unwrap_or_else(|error| panic!("observe complete owned image: {error}"));
-    assert_eq!(sorted_image_rows(&image), fixture.expected_relational_rows);
-    assert_eq!(sorted_image_edges(&image), sorted_expected_edges(fixture));
-    assert_eq!(sorted_image_vectors(&image), fixture.expected_vectors);
-    assert_eq!(image.changes, fixture.changes);
+        .unwrap_or_else(|error| panic!("observe owned image metadata: {error}"));
+    assert_eq!(
+        fixture.queries[..4]
+            .iter()
+            .map(|answer| answer.rows.len())
+            .sum::<usize>(),
+        fixture.expected_relational_rows.len(),
+        "the complete table queries cover every committed relational row"
+    );
+    assert_eq!(
+        fixture.changes.vectors.len(),
+        fixture.expected_vectors.len(),
+        "the public change answer covers every committed vector"
+    );
+    let mut expected_edges = fixture
+        .expected_graph_edges
+        .iter()
+        .map(|edge| (edge.source, edge.edge_type.clone(), edge.target))
+        .collect::<Vec<_>>();
+    expected_edges.sort();
+    let mut answered_edges = Vec::new();
+    for edge in &fixture.expected_graph_edges {
+        let answer = reader
+            .execute(
+                &format!(
+                    "SELECT target FROM GRAPH_TABLE({} MATCH (a)-[:{}]->(b) WHERE a.id = $source COLUMNS (b.id AS target))",
+                    fixture.edges_table, edge.edge_type
+                ),
+                &HashMap::from([("source".to_owned(), Value::Uuid(edge.source))]),
+            )
+            .unwrap_or_else(|error| panic!("read complete graph edge set: {error}"));
+        for row in answer.result.rows {
+            match row.as_slice() {
+                [Value::Uuid(target)] => {
+                    answered_edges.push((edge.source, edge.edge_type.clone(), *target));
+                }
+                other => panic!("graph completeness query returned the wrong row: {other:?}"),
+            }
+        }
+    }
+    answered_edges.sort();
+    assert_eq!(
+        answered_edges, expected_edges,
+        "the public graph answers contain the complete committed edge set"
+    );
+    // The open image carries history frontiers only; the history itself is
+    // read on request and must be exactly the committed history.
+    assert_eq!(image.changes.current_lsn, fixture.changes.current_lsn);
+    assert_eq!(
+        image.changes.committed_watermark,
+        fixture.changes.committed_watermark
+    );
+    assert_eq!(image.changes.next_tx, fixture.changes.next_tx);
+    match reader
+        .metadata(DirectMetadataRequest::ImageState {
+            kind: DirectImageMetadataKind::ChangeLog,
+        })
+        .expect("the change history answers on request")
+        .body
+    {
+        DirectMetadataBody::ImageState {
+            state: DirectImageState::ChangeLog(changes),
+        } => assert_eq!(changes, fixture.changes),
+        other => panic!("change history answers as change-log state: {other:?}"),
+    }
     assert_eq!(image.sync, fixture.sync);
     assert_eq!(image.configuration, fixture.configuration);
     assert_eq!(image.events, fixture.events);
@@ -1538,7 +1562,7 @@ fn representative_reads(fixture: &Fixture, reader: &DirectFileReader) -> ReadEvi
         .collect::<Vec<_>>();
     let metadata = metadata_responses(fixture, reader);
     let cursor = cursor_pages(fixture, reader);
-    let owned_snapshot = assert_complete_owned_image(fixture, reader);
+    let owned_snapshot = assert_complete_public_image_state(fixture, reader);
     let typed_digest = verified_image_digest_for_test(reader)
         .unwrap_or_else(|error| panic!("verify complete typed image identity: {error}"));
     let snapshot = queries[0].1;
@@ -1722,7 +1746,8 @@ fn released_image_is_the_first_gate_and_survives_complete_source_removal() {
             extension,
             "post-release-complete-source-tree-removal",
         );
-        reset_read_image_source_events_for_test();
+        let source_events = observe_read_image_source_events_for_test(&fixture.path);
+        source_events.reset();
         let observer = Arc::new(RecordingObserver::default());
         let reader = open_with_hydration_observer_for_test(
             &fixture.path,
@@ -1735,7 +1760,7 @@ fn released_image_is_the_first_gate_and_survives_complete_source_removal() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(checkpoints.len(), 3);
-        let breadcrumb = assert_exact_released_source_trace(&read_image_source_events_for_test()).0;
+        let breadcrumb = assert_exact_released_source_trace(&source_events.events()).0;
         assert_eq!(
             checkpoints[0],
             HydrationCheckpoint::PersistenceReleaseSealed {
@@ -1756,13 +1781,13 @@ fn released_image_is_the_first_gate_and_survives_complete_source_removal() {
         );
         drop(checkpoints);
 
-        let released_events = read_image_source_events_for_test();
+        let released_events = source_events.events();
         let (_, source_access_count) = assert_exact_released_source_trace(&released_events);
         detach_store_tree(&fixture);
         let first = representative_reads(&fixture, &reader);
         let second = representative_reads(&fixture, &reader);
         assert_eq!(second, first);
-        assert_eq!(read_image_source_events_for_test(), released_events);
+        assert_eq!(source_events.events(), released_events);
         assert_eq!(
             released_events
                 .iter()
@@ -1893,6 +1918,7 @@ fn legal_direct_dependency(path: &[String]) -> bool {
                 | "DeadlineClock"
                 | "Debug"
                 | "Default"
+                | "DirectChangeFrontiers"
                 | "DirectChangeState"
                 | "DirectColumnReference"
                 | "DirectConfigurationState"
@@ -1935,6 +1961,7 @@ fn legal_direct_dependency(path: &[String]) -> bool {
                 | "DirectScopeLabelKind"
                 | "DirectSinkStatus"
                 | "DirectSnapshot"
+                | "DirectStorageRegistrationObservation"
                 | "DirectStateMachine"
                 | "DirectStoredEdge"
                 | "DirectStoredRow"
@@ -1977,6 +2004,7 @@ fn legal_direct_dependency(path: &[String]) -> bool {
                 | "Some"
                 | "String"
                 | "Sync"
+                | "T"
                 | "TxId"
                 | "Uuid"
                 | "Value"
@@ -2009,32 +2037,48 @@ fn legal_direct_dependency(path: &[String]) -> bool {
                 | "load"
                 | "observation"
                 | "observer"
+                | "opened"
                 | "params"
                 | "path"
                 | "pending_image"
                 | "phase"
                 | "principal"
+                | "publication"
+                | "published"
                 | "reader"
+                | "registration"
+                | "response"
+                | "result"
+                | "retained_source"
                 | "release_receipt"
                 | "request"
+                | "root_table"
                 | "rows"
+                | "scope"
                 | "scope_labels"
                 | "self"
+                | "snapshot_registration"
                 | "sql"
+                | "started_ms"
                 | "std"
                 | "str"
                 | "super"
                 | "u8"
                 | "u32"
                 | "u64"
+                | "u128"
                 | "usize"
                 | "uuid"
+                | "value"
+                | "tables"
                 | "construct_backend_neutral_target"
                 | "consume_released_persistence_load"
                 | "execute_on_backend_neutral_target"
                 | "fetch_backend_neutral_cursor"
                 | "handoff_to_backend_neutral_reader"
                 | "open_cursor_on_backend_neutral_target"
+                | "metadata_publication_tables"
+                | "publish_direct_result"
                 | "drop"
                 | "write"
         );
@@ -2074,8 +2118,12 @@ fn legal_direct_dependency(path: &[String]) -> bool {
             &["contextdb_core", "Value"][..],
             &["contextdb_core", "VectorIndexRef"][..],
             &["contextdb_core", "VectorSearchMode"][..],
+            &["contextdb_core", "Result"][..],
+            &["contextdb_core", "Error", "ReadFailure"][..],
+            &["contextdb_core", "Error", "ReadCancelled"][..],
             &["contextdb_core", "read_contract"][..],
             &["contextdb_core", "read_contract", "CursorPage"][..],
+            &["contextdb_core", "read_contract", "DatabaseIdentity"][..],
             &["contextdb_core", "read_contract", "DeadlineClock"][..],
             &["contextdb_core", "read_contract", "OwnerReadCancellation"][..],
             &["contextdb_core", "read_contract", "ReadFailure"][..],
@@ -2092,12 +2140,14 @@ fn legal_direct_dependency(path: &[String]) -> bool {
             first,
             "Arc"
                 | "BackendTargetConstructionReceipt"
+                | "BTreeSet"
                 | "DirectCursorState"
                 | "DirectCursorUnavailable"
                 | "DirectFileReader"
                 | "DirectFileReaderError"
                 | "DirectImageState"
                 | "DirectMetadataBody"
+                | "DirectMetadataRequest"
                 | "DirectReaderPrerequisite"
                 | "DirectRepairRequiredCause"
                 | "DirectStoreDiagnostic"
@@ -2123,10 +2173,24 @@ fn legal_direct_dependency(path: &[String]) -> bool {
         || path_equals(path, &["crate", "database", "VectorSearchDisclosure"])
         || path_equals(
             path,
-            &["crate", "persistence", "load_read_image_with_memory"],
+            &[
+                "crate",
+                "persistence",
+                "load_read_image_with_memory_in_runtime_dir",
+            ],
+        )
+        || path_equals(
+            path,
+            &["crate", "persistence", "load_read_image_at_registration"],
         )
         || path_equals(path, &["crate", "executor", "ReadExecutionTarget"])
+        || path_equals(path, &["crate", "executor", "ReadPublicationScope"])
+        || path_equals(
+            path,
+            &["crate", "executor", "ReadPublicationScope", "bounded"],
+        )
         || path_equals(path, &["crate", "read_image_memory", "ImageMemory"])
+        || path_equals(path, &["crate", "read_image_memory", "AnswerCharge"])
     {
         return true;
     }
@@ -2146,6 +2210,8 @@ fn legal_direct_dependency(path: &[String]) -> bool {
             &["crate", "persistence", "ReadPersistenceImage"][..],
             &["crate", "persistence", "ReadPersistenceLoad"][..],
             &["crate", "persistence", "ReadPersistenceReleaseReceipt"][..],
+            &["crate", "persistence", "ReadSnapshotRegistrationGuard"][..],
+            &["crate", "persistence", "RetainedReadSource"][..],
         ]
         .iter()
         .any(|expected| path_equals(path, expected));
@@ -2342,6 +2408,7 @@ fn test_observation_item(item: &Item) -> bool {
         Some(
             "DirectCursorResourceWitness"
                 | "DirectReaderCounters"
+                | "DirectStorageRegistrationObservation"
                 | "HydrationCheckpoint"
                 | "HydrationObservation"
                 | "HydrationObserver"
@@ -2794,6 +2861,8 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
     }
     let files = direct_module_files();
     let mut loader_calls = 0;
+    let mut retained_loader_calls = 0;
+    let mut retained_constructor_calls = 0;
     for source in &files {
         let syntax = syn::parse_file(
             &fs::read_to_string(source)
@@ -2807,9 +2876,19 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
         for dependency in collector.paths {
             if path_equals(
                 &dependency,
-                &["crate", "persistence", "load_read_image_with_memory"],
+                &[
+                    "crate",
+                    "persistence",
+                    "load_read_image_with_memory_in_runtime_dir",
+                ],
             ) {
                 loader_calls += 1;
+            }
+            if path_equals(
+                &dependency,
+                &["crate", "persistence", "load_read_image_at_registration"],
+            ) {
+                retained_loader_calls += 1;
             }
             if !legal_direct_dependency(&dependency) {
                 illegal_dependencies.insert(dependency.join("::"));
@@ -2842,10 +2921,27 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
                 if paths.paths.iter().any(|path| {
                     path_equals(
                         path,
-                        &["crate", "persistence", "load_read_image_with_memory"],
+                        &[
+                            "crate",
+                            "persistence",
+                            "load_read_image_with_memory_in_runtime_dir",
+                        ],
                     )
                 }) {
                     assert_eq!(method.sig.ident, "open_inner");
+                }
+                if paths.paths.iter().any(|path| {
+                    path_equals(
+                        path,
+                        &["crate", "persistence", "load_read_image_at_registration"],
+                    )
+                }) {
+                    retained_constructor_calls += 1;
+                    assert_eq!(method.sig.ident, "from_owner_snapshot");
+                    assert!(matches!(
+                        &method.vis,
+                        Visibility::Restricted(visibility) if visibility.path.is_ident("crate")
+                    ));
                 }
             }
         }
@@ -2865,16 +2961,19 @@ fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
         );
     }
     assert_eq!(loader_calls, 1);
+    assert_eq!(retained_loader_calls, 1);
+    assert_eq!(retained_constructor_calls, 1);
     assert_shared_prerequisite_shapes();
 
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "writable-subsystem-containment");
-    reset_read_image_source_events_for_test();
+    let source_events = observe_read_image_source_events_for_test(&fixture.path);
+    source_events.reset();
     reset_counters_for_test().unwrap_or_else(|error| panic!("install real probes: {error}"));
     let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
     let _ = assert_query(&reader, &fixture.queries[0]);
-    let _ = assert_exact_released_source_trace(&read_image_source_events_for_test());
+    let _ = assert_exact_released_source_trace(&source_events.events());
     let counters = counters_for_test().unwrap_or_else(|error| panic!("read real probes: {error}"));
     assert_no_writable_subsystems(&counters);
 }
@@ -2896,7 +2995,10 @@ impl HydrationObserver for PipeHydrationObserver {
         let marker = match &checkpoint {
             HydrationCheckpoint::PersistenceReleaseSealed { breadcrumb_path } => {
                 assert_eq!(
-                    assert_exact_released_source_trace(&read_image_source_events_for_test()).0,
+                    assert_exact_released_source_trace(
+                        &observe_read_image_source_events_for_test(&child_path()).events()
+                    )
+                    .0,
                     breadcrumb_path.clone(),
                     "sealed receipt preserves persistence's optional breadcrumb outcome"
                 );
@@ -3273,7 +3375,7 @@ fn multiple_child_readers_hold_only_their_real_hydration_windows() {
 }
 
 #[test]
-fn absent_best_effort_breadcrumb_keeps_the_real_lock_and_generic_holder_diagnostic() {
+fn unavailable_authenticated_registration_refuses_the_reader_and_releases_the_writer() {
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "best-effort-breadcrumb-absence");
@@ -3281,33 +3383,17 @@ fn absent_best_effort_breadcrumb_keeps_the_real_lock_and_generic_holder_diagnost
     let runtime_bytes = format!("unusable-runtime:{}", fixture.identity_seed).into_bytes();
     fs::write(&unusable_runtime, &runtime_bytes).expect("create unusable runtime location");
 
-    // The unusable pathname is this child's DEFAULT per-user runtime location,
-    // which is where a reader writes itself down. Handing it only as the
-    // channel directory would leave the child publishing normally in the real
-    // default, and this journey would be about a reader that CAN be named.
+    // This child has no supplied runtime root, so its platform default is the
+    // complete runtime root. An unusable default must refuse registration.
+    // Reader registration requires a usable platform runtime root.
     let mut reader = spawn_child_reader_with_default_runtime_location(&fixture, &unusable_runtime);
-    assert_eq!(
-        reader.wait_for_prefix(CHILD_HYDRATION_STARTED),
-        format!("{CHILD_HYDRATION_STARTED}unverified")
+    let status = reader.child.wait().expect("wait for refused child reader");
+    reader.finished = true;
+    assert!(
+        !status.success(),
+        "an authenticated retained reader refuses an unusable registration runtime"
     );
-    assert_eq!(
-        assert_writer_is_held_by_hydrating_readers(&fixture.path),
-        (1, 0),
-        "an absent breadcrumb reports one generic lock holder and no fabricated identity"
-    );
-    reader.send(CHILD_FINISH_HYDRATION);
-    reader.wait_for(CHILD_RELEASE_SEALED);
     assert_writer_opens_after_release(&fixture.path);
-    reader.send(CHILD_CONSTRUCT_TARGET);
-    reader.wait_for(CHILD_TARGET_CONSTRUCTED);
-    reader.send(CHILD_PUBLISH);
-    reader.wait_for(CHILD_EXTERNALLY_USABLE);
-    reader.wait_for(CHILD_SESSION_ACTIVE);
-    let digest = reader.wait_for_prefix(CHILD_TYPED_DIGEST);
-    assert_complete_digest_wire(&digest);
-    reader.send(CHILD_QUERY);
-    reader.wait_for(CHILD_QUERY_OK);
-    reader.close();
 
     assert_eq!(
         fs::read(&unusable_runtime).expect("runtime location remains caller-owned"),
@@ -3494,14 +3580,78 @@ fn direct_file_damage_child() {
         return;
     }
     let case = parse_damage(&std::env::var(CHILD_DAMAGE_ENV).expect("child damage case"));
-    let error = match open_for_test(
+    let opened = open_for_test(
         child_path(),
         default_reader_config(Arc::new(ManualClock::default())),
+    );
+    if matches!(
+        case,
+        DurableStoreDamage::RowVectorDivergence | DurableStoreDamage::WritableSanitizerWouldChange
     ) {
-        Ok(_) => panic!("damaged store must not open directly"),
-        Err(error) => error,
-    };
-    assert_damage_diagnostic(case, error);
+        let reader = opened.expect("untouched corrupt body does not block open");
+        let tables = match reader
+            .metadata(DirectMetadataRequest::Tables)
+            .expect("list damaged fixture tables")
+            .body
+        {
+            DirectMetadataBody::Tables { items, .. } => items,
+            other => panic!("table inventory has the wrong body: {other:?}"),
+        };
+        let mut diagnosed = false;
+        'tables: for table in tables {
+            if case == DurableStoreDamage::WritableSanitizerWouldChange {
+                let result = reader.execute(&format!("SELECT * FROM {table}"), &HashMap::new());
+                if result.is_err() {
+                    assert_loaded_embedding_corruption(
+                        result,
+                        "a loaded row body requiring writable sanitization",
+                    );
+                    diagnosed = true;
+                    break 'tables;
+                }
+                continue;
+            }
+            let schema = match reader
+                .metadata(DirectMetadataRequest::Schema {
+                    table: table.clone(),
+                })
+                .expect("inspect damaged fixture schema")
+                .body
+            {
+                DirectMetadataBody::Schema { schema } => schema,
+                other => panic!("schema inspection has the wrong body: {other:?}"),
+            };
+            for column in schema.columns {
+                let Some(dimension) = column
+                    .data_type
+                    .strip_prefix("VECTOR(")
+                    .and_then(|value| value.strip_suffix(')'))
+                    .and_then(|value| value.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                let result = reader.execute(
+                    &format!(
+                        "SELECT row_id FROM {table} ORDER BY {} <=> $probe LIMIT 1",
+                        column.name
+                    ),
+                    &HashMap::from([("probe".to_owned(), Value::Vector(vec![0.0; dimension]))]),
+                );
+                if result.is_err() {
+                    assert_loaded_embedding_corruption(
+                        result,
+                        "a loaded vector body diverging from the committed root",
+                    );
+                    diagnosed = true;
+                    break 'tables;
+                }
+            }
+        }
+        assert!(diagnosed, "the damaged body is refused when selected");
+    } else {
+        let error = opened.err().expect("structural damage must block open");
+        assert_damage_diagnostic(case, error);
+    }
 }
 
 fn manifest_paths(entries: &[ManifestEntry]) -> Vec<(PathBuf, ManifestKind)> {
@@ -3553,10 +3703,11 @@ fn existing_readers_and_cursor_keep_original_snapshot_and_canonical_bytes_after_
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "snapshot-after-separate-writer-change");
     let clock = Arc::new(ManualClock::default());
-    reset_read_image_source_events_for_test();
+    let source_events = observe_read_image_source_events_for_test(&fixture.path);
+    source_events.reset();
     let first = direct_open(&fixture, Arc::clone(&clock));
     let second = direct_open(&fixture, Arc::clone(&clock));
-    let released_source_events = read_image_source_events_for_test();
+    let released_source_events = source_events.events();
     let first_before = representative_reads(&fixture, &first);
     let second_before = representative_reads(&fixture, &second);
     assert_eq!(first_before, second_before);
@@ -3578,7 +3729,7 @@ fn existing_readers_and_cursor_keep_original_snapshot_and_canonical_bytes_after_
     assert_eq!(pages, first_before.cursor);
     assert_eq!(representative_reads(&fixture, &first), first_before);
     assert_eq!(representative_reads(&fixture, &second), second_before);
-    assert_eq!(read_image_source_events_for_test(), released_source_events);
+    assert_eq!(source_events.events(), released_source_events);
 
     let fresh = direct_open(&fixture, Arc::clone(&clock));
     let fresh_digest = verified_image_digest_for_test(&fresh)
@@ -3648,37 +3799,44 @@ fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() 
         .unwrap_or_else(|error| panic!("install cancellation probes: {error}"));
     let reader = direct_open(&fixture, Arc::new(ManualClock::default()));
 
+    // `bounded_source_touches` (read via `observed_counters`) is a process-wide counter
+    // (crates/contextdb-engine/src/read_probe.rs:113-121, "the process-wide count answers
+    // 'what has this process done' ... a proof that reads the process-wide number while
+    // other reads are running is measuring its neighbours"); the local `DIRECT_FILE_TEST_SERIAL`
+    // mutex only excludes sibling tests in this one file, not the other files compiled into the
+    // same `read` test binary that also drive bounded source reads under default parallelism.
+    // `with_isolated_bounded_source_touches_for_test` installs this thread's own counter for
+    // exactly the span of one call (the same pattern `read_session.rs`'s owner/file routes
+    // already use), so what it reports is this call's own touches, not the process's.
     let execute_cancel = DirectCancellation::new();
     execute_cancel.cancel();
-    let before_execute = observed_counters("before cancelled execute").bounded_source_touches;
-    assert_cancelled(
+    let (execute_result, execute_touches) = with_isolated_bounded_source_touches_for_test(|| {
         reader.execute_with_cancellation(
             &fixture.relation_sql(),
             &fixture.relation_params(),
             &execute_cancel,
-        ),
-        "execute",
-    );
+        )
+    });
+    assert_cancelled(execute_result, "execute");
     assert_eq!(
-        observed_counters("after cancelled execute").bounded_source_touches,
-        before_execute
+        execute_touches, 0,
+        "a pre-cancelled execute must do no bounded source work"
     );
 
     let open_cancel = DirectCancellation::new();
     open_cancel.cancel();
-    let before_open = observed_counters("before cancelled open").bounded_source_touches;
-    assert_cancelled(
+    let (open_result, open_touches) = with_isolated_bounded_source_touches_for_test(|| {
         reader.open_cursor_with_cancellation(
             &fixture.cursor_sql,
             &HashMap::new(),
             NonZeroUsize::new(1).expect("one row"),
             &open_cancel,
-        ),
-        "cursor open",
-    );
+        )
+    });
+    assert_cancelled(open_result, "cursor open");
     assert_eq!(
-        observed_counters("after cancelled open").bounded_source_touches,
-        before_open
+        open_touches, 0,
+        "a pre-cancelled cursor open must do no bounded source work"
     );
 
     let one = NonZeroUsize::new(1).expect("one row");
@@ -3691,17 +3849,17 @@ fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() 
     let fetch_cancel = DirectCancellation::new();
     fetch_cancel.cancel();
     let before_fetch = observed_counters("before cancelled fetch");
-    assert_cancelled(
+    let (fetch_result, fetch_touches) = with_isolated_bounded_source_touches_for_test(|| {
         opened
             .cursor
-            .fetch_with_cancellation(Some(one), &fetch_cancel),
-        "cursor fetch",
+            .fetch_with_cancellation(Some(one), &fetch_cancel)
+    });
+    assert_cancelled(fetch_result, "cursor fetch");
+    assert_eq!(
+        fetch_touches, 0,
+        "a pre-cancelled cursor fetch must do no bounded source work"
     );
     let after_cancel = observed_counters("after cancelled fetch");
-    assert_eq!(
-        after_cancel.bounded_source_touches,
-        before_fetch.bounded_source_touches
-    );
     assert_eq!(after_cancel.active_cursors, before_fetch.active_cursors);
     assert_eq!(
         after_cancel.retained_cursor_bytes,
@@ -4115,15 +4273,60 @@ fn seed_absent_embedding_store(
 }
 
 fn stored_row_by_identity<'a>(
-    image: &'a DirectOwnedImage,
+    rows: &'a [DirectStoredRow],
     table: &str,
     id: Uuid,
 ) -> &'a DirectStoredRow {
-    image
-        .relational_rows
-        .iter()
+    rows.iter()
         .find(|row| row.table == table && row.values.get("id") == Some(&Value::Uuid(id)))
-        .unwrap_or_else(|| panic!("owned image carries row {id} of {table}"))
+        .unwrap_or_else(|| panic!("committed image carries row {id} of {table}"))
+}
+
+fn query_embedding_rows(
+    reader: &DirectFileReader,
+    store: &AbsentEmbeddingStore,
+    declaration: &str,
+) -> (Vec<Value>, Vec<Value>) {
+    let query = reader
+        .execute(
+            &format!(
+                "SELECT id, note, {} FROM {} ORDER BY id",
+                store.column, store.table
+            ),
+            &HashMap::new(),
+        )
+        .unwrap_or_else(|error| panic!("query {declaration} column directly: {error:?}"));
+    assert_eq!(
+        query.result.columns,
+        vec!["id".to_owned(), "note".to_owned(), store.column.clone()]
+    );
+    let row = |id| {
+        query
+            .result
+            .rows
+            .iter()
+            .find(|row| row.first() == Some(&Value::Uuid(id)))
+            .cloned()
+            .unwrap_or_else(|| panic!("direct query returns row {id}"))
+    };
+    (row(store.embedded_id), row(store.absent_id))
+}
+
+fn assert_loaded_embedding_corruption(
+    result: Result<DirectQuery, DirectFileReaderError>,
+    expected: &str,
+) {
+    match result {
+        Err(DirectFileReaderError::CorruptStore(
+            DirectStoreDiagnostic::MalformedRecord,
+            reason,
+        )) => assert!(
+            !reason.is_empty(),
+            "{expected} carries a concrete diagnosis"
+        ),
+        Ok(_) => panic!("{expected} must not contribute an answer"),
+        Err(other) => panic!("{expected} has the wrong diagnosis: {other:?}"),
+    }
 }
 
 /// An absent embedding is a value, not damage. A row whose nullable F32 vector
@@ -4149,23 +4352,23 @@ fn a_row_with_no_embedding_keeps_the_store_directly_readable() {
     .unwrap_or_else(|error| {
         panic!("a row without an embedding keeps the store directly readable: {error:?}")
     });
-    let image = owned_image_for_test(&reader).expect("observe the owned image");
+    let (embedded, absent) = query_embedding_rows(&reader, &store, "nullable F32");
     drop(reader);
 
-    let absent = stored_row_by_identity(&image, &store.table, store.absent_id);
     assert_eq!(
-        absent.values.get(&store.column),
+        absent.get(2),
         Some(&Value::Null),
         "the absent embedding is served back as the NULL that was stored, not dropped"
     );
-    let embedded = stored_row_by_identity(&image, &store.table, store.embedded_id);
     assert_eq!(
-        embedded.values.get(&store.column),
+        embedded.get(2),
         Some(&Value::Vector(store.embedding.clone())),
         "the neighbouring embedding is unchanged"
     );
+    let content = committed_content_for_test(&store.path)
+        .unwrap_or_else(|error| panic!("inspect committed F32 vectors: {error}"));
     assert_eq!(
-        image
+        content
             .vectors
             .iter()
             .map(|vector| (vector.index.column.clone(), vector.values.clone()))
@@ -4211,20 +4414,21 @@ fn a_vector_column_holding_a_non_vector_value_still_refuses_a_direct_read() {
         .unwrap_or_else(|error| panic!("persistence plants {case:?} durably: {error}"));
     let damaged = directory_manifest(&store.root);
 
-    match open_for_test(
+    let reader = open_for_test(
         &store.path,
         default_reader_config(Arc::new(ManualClock::default())),
-    ) {
-        Err(DirectFileReaderError::DirectReadRequiresWriter { failure, cause }) => {
-            assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);
-            assert_eq!(
-                cause,
-                DirectRepairRequiredCause::WritableSanitizerWouldChange
-            );
-        }
-        Ok(_) => panic!("a value that is not an embedding must not be served directly"),
-        Err(other) => panic!("a value that is not an embedding needs a writer: {other:?}"),
-    }
+    )
+    .unwrap_or_else(|error| panic!("unrelated pages do not block open: {error:?}"));
+    assert_loaded_embedding_corruption(
+        reader.execute(
+            &format!(
+                "SELECT id, {} FROM {} ORDER BY id",
+                store.column, store.table
+            ),
+            &HashMap::new(),
+        ),
+        "a non-vector value loaded from a vector cell",
+    );
 
     assert_eq!(
         directory_manifest(&store.root),
@@ -4248,17 +4452,21 @@ fn a_row_with_no_embedding_does_not_hide_a_diverged_vector() {
     prepare_durable_store_damage_for_test(&store.path, DurableStoreDamage::RowVectorDivergence)
         .unwrap_or_else(|error| panic!("diverge the stored vector: {error}"));
 
-    match open_for_test(
+    let reader = open_for_test(
         &store.path,
         default_reader_config(Arc::new(ManualClock::default())),
-    ) {
-        Err(DirectFileReaderError::DirectReadRequiresWriter { failure, cause }) => {
-            assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);
-            assert_eq!(cause, DirectRepairRequiredCause::RowVectorDivergence);
-        }
-        Ok(_) => panic!("a diverged vector must not be served directly"),
-        Err(other) => panic!("a diverged vector must still ask for a writer: {other:?}"),
-    }
+    )
+    .unwrap_or_else(|error| panic!("untouched vector bodies do not block open: {error:?}"));
+    assert_loaded_embedding_corruption(
+        reader.execute(
+            &format!(
+                "SELECT id FROM {} ORDER BY {} <=> $probe LIMIT 2",
+                store.table, store.column
+            ),
+            &HashMap::from([("probe".to_owned(), Value::Vector(store.embedding.clone()))]),
+        ),
+        "a diverged vector body selected by a vector search",
+    );
 }
 
 /// The damage case that plants a NULL where a full-precision vector column
@@ -4289,20 +4497,21 @@ fn a_null_in_a_required_vector_cell_still_needs_a_writer() {
         .unwrap_or_else(|error| panic!("persistence plants {case:?} durably: {error}"));
     let damaged = directory_manifest(&store.root);
 
-    match open_for_test(
+    let reader = open_for_test(
         &store.path,
         default_reader_config(Arc::new(ManualClock::default())),
-    ) {
-        Err(DirectFileReaderError::DirectReadRequiresWriter { failure, cause }) => {
-            assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);
-            assert_eq!(
-                cause,
-                DirectRepairRequiredCause::WritableSanitizerWouldChange
-            );
-        }
-        Ok(_) => panic!("a NULL in a NOT NULL vector cell must not be served directly"),
-        Err(other) => panic!("a NULL in a NOT NULL vector cell needs a writer: {other:?}"),
-    }
+    )
+    .unwrap_or_else(|error| panic!("untouched row bodies do not block open: {error:?}"));
+    assert_loaded_embedding_corruption(
+        reader.execute(
+            &format!(
+                "SELECT id, {} FROM {} ORDER BY id",
+                store.column, store.table
+            ),
+            &HashMap::new(),
+        ),
+        "a NULL loaded from a required vector cell",
+    );
 
     assert_eq!(
         directory_manifest(&store.root),
@@ -4325,12 +4534,10 @@ fn a_required_vector_column_and_a_nullable_one_are_told_apart_by_their_declarati
         default_reader_config(Arc::new(ManualClock::default())),
     )
     .unwrap_or_else(|error| panic!("a nullable vector column still reads directly: {error:?}"));
-    let image = owned_image_for_test(&reader).expect("observe the owned image");
+    let (_, absent) = query_embedding_rows(&reader, &nullable, "nullable F32");
     drop(reader);
     assert_eq!(
-        stored_row_by_identity(&image, &nullable.table, nullable.absent_id)
-            .values
-            .get(&nullable.column),
+        absent.get(2),
         Some(&Value::Null),
         "the nullable column serves the absent embedding back as NULL"
     );
@@ -4353,13 +4560,12 @@ fn quantized_declaration(quantization: &str, nullability: &str) -> String {
 
 /// Every vector the image carries for one column, ordered by the row that
 /// owns it.
-fn image_vectors_for_column<'a>(
-    image: &'a DirectOwnedImage,
+fn vectors_for_column<'a>(
+    vectors: &'a [DirectStoredVector],
     table: &str,
     column: &str,
 ) -> Vec<&'a DirectStoredVector> {
-    let mut vectors = image
-        .vectors
+    let mut vectors = vectors
         .iter()
         .filter(|vector| vector.index.table == table && vector.index.column == column)
         .collect::<Vec<_>>();
@@ -4393,18 +4599,16 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
         .unwrap_or_else(|error| {
             panic!("a required {word} column reads back through the direct reader: {error:?}")
         });
-        let image = owned_image_for_test(&reader).expect("observe the owned image");
+        let (embedded, absent) = query_embedding_rows(&reader, &store, word);
         drop(reader);
 
-        let embedded = stored_row_by_identity(&image, &store.table, store.embedded_id);
-        let absent = stored_row_by_identity(&image, &store.table, store.absent_id);
         let quantized = stored_vector_value(&store.embedding, quantization);
         assert_eq!(
-            embedded.values.get(&store.column),
+            embedded.get(2),
             Some(&Value::Vector(quantized.clone())),
             "the required column is served from the vector entry its placeholder stands for"
         );
-        match absent.values.get(&store.column) {
+        match absent.get(2) {
             Some(Value::Vector(vector)) => {
                 assert_eq!(
                     vector.len(),
@@ -4420,7 +4624,13 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
                 "every row of a required {word} column is served the embedding it promises: {other:?}"
             ),
         }
-        let vectors = image_vectors_for_column(&image, &store.table, &store.column);
+        let content = committed_content_for_test(&store.path)
+            .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
+        let embedded_row =
+            stored_row_by_identity(&content.relational_rows, &store.table, store.embedded_id);
+        let absent_row =
+            stored_row_by_identity(&content.relational_rows, &store.table, store.absent_id);
+        let vectors = vectors_for_column(&content.vectors, &store.table, &store.column);
         assert_eq!(
             vectors
                 .iter()
@@ -4428,8 +4638,8 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
                 .collect::<Vec<_>>(),
             {
                 let mut owners = vec![
-                    (embedded.row_id, direct_quantization(quantization)),
-                    (absent.row_id, direct_quantization(quantization)),
+                    (embedded_row.row_id, direct_quantization(quantization)),
+                    (absent_row.row_id, direct_quantization(quantization)),
                 ];
                 owners.sort_by_key(|(row_id, _)| *row_id);
                 owners
@@ -4438,7 +4648,7 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
         );
         let embedded_vector = vectors
             .iter()
-            .find(|vector| vector.row_id == embedded.row_id)
+            .find(|vector| vector.row_id == embedded_row.row_id)
             .expect("the embedded row owns a vector");
         assert_eq!(
             embedded_vector.values, quantized,
@@ -4450,6 +4660,125 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
             "reading the file directly leaves every byte of the source tree alone"
         );
     }
+}
+
+/// A selected SQ8 or SQ4 value must be linked to the committed vector-family
+/// root just like F32. Changing the separately durable body after commit is
+/// detected when that column is selected, while open still touches no body.
+#[test]
+fn selected_quantized_vectors_are_authenticated_before_they_are_returned() {
+    let _serial = serialise_direct_file_test();
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    for (word, label, damage_name) in [
+        ("SQ8", "sq8", "Sq8VectorDivergence"),
+        ("SQ4", "sq4", "Sq4VectorDivergence"),
+    ] {
+        let store = seed_embedding_store(
+            scratch.path(),
+            &format!("selected-{label}-body-is-authenticated"),
+            &quantized_declaration(word, " NOT NULL"),
+            None,
+        );
+        let damage = required_damage_case(
+            damage_name,
+            "a changed quantized vector body under an unchanged committed identity root",
+        );
+        prepare_durable_store_damage_for_test(&store.path, damage)
+            .unwrap_or_else(|error| panic!("diverge the stored {word} body: {error}"));
+
+        let reader = open_for_test(
+            &store.path,
+            default_reader_config(Arc::new(ManualClock::default())),
+        )
+        .unwrap_or_else(|error| panic!("untouched vector bodies do not block open: {error:?}"));
+        assert_loaded_embedding_corruption(
+            reader.execute(
+                &format!(
+                    "SELECT id, {} FROM {} ORDER BY id",
+                    store.column, store.table
+                ),
+                &HashMap::new(),
+            ),
+            &format!("a changed {word} body selected for a public answer"),
+        );
+    }
+}
+
+/// A live row cannot disappear because its untrusted body claims a deletion.
+/// The reader checks the physical identity and then proves that claimed
+/// absence against the retained logical root before applying visibility.
+#[test]
+fn a_changed_row_tombstone_is_refused_instead_of_suppressing_the_row() {
+    let _serial = serialise_direct_file_test();
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let store = seed_embedding_store(
+        scratch.path(),
+        "changed-row-tombstone-cannot-hide-a-live-row",
+        "",
+        None,
+    );
+    let damage = required_damage_case(
+        "RowVisibilitySuppression",
+        "a deletion transaction in a live relational row body",
+    );
+    prepare_durable_store_damage_for_test(&store.path, damage)
+        .unwrap_or_else(|error| panic!("change the live row's tombstone: {error}"));
+
+    let reader = open_for_test(
+        &store.path,
+        default_reader_config(Arc::new(ManualClock::default())),
+    )
+    .unwrap_or_else(|error| panic!("an untouched row body does not block open: {error:?}"));
+    assert_loaded_embedding_corruption(
+        reader.execute(
+            &format!("SELECT id FROM {} ORDER BY id", store.table),
+            &HashMap::new(),
+        ),
+        "a changed tombstone that would otherwise suppress a committed row",
+    );
+}
+
+/// Retained old versions remain legitimate storage. Only the newest physical
+/// version at the reader's snapshot is compared with the current logical
+/// root, so history does not become corruption merely because it is history.
+#[test]
+fn historical_row_versions_remain_readable_through_their_current_version() {
+    let _serial = serialise_direct_file_test();
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let path = scratch.path().join("historical-row-versions.db");
+    let database = Database::open(&path).expect("open history fixture writer");
+    database
+        .execute(
+            "CREATE TABLE history_rows (id INTEGER PRIMARY KEY, payload TEXT NOT NULL) HISTORY ALL",
+            &HashMap::new(),
+        )
+        .expect("create retained-history table");
+    database
+        .execute(
+            "INSERT INTO history_rows (id, payload) VALUES (1, 'old')",
+            &HashMap::new(),
+        )
+        .expect("insert historical value");
+    database
+        .execute(
+            "UPDATE history_rows SET payload = 'current' WHERE id = 1",
+            &HashMap::new(),
+        )
+        .expect("replace historical value");
+    database.close().expect("close history fixture writer");
+
+    let reader = open_for_test(
+        &path,
+        default_reader_config(Arc::new(ManualClock::default())),
+    )
+    .expect("open retained-history reader");
+    let answer = reader
+        .execute("SELECT id, payload FROM history_rows", &HashMap::new())
+        .expect("read the authenticated current version");
+    assert_eq!(
+        answer.result.rows,
+        vec![vec![Value::Int64(1), Value::Text("current".to_owned())]]
+    );
 }
 
 /// The other half of the same reading. Where a quantized column accepts an
@@ -4476,33 +4805,35 @@ fn a_nullable_quantized_column_with_no_embedding_stays_directly_readable() {
             default_reader_config(Arc::new(ManualClock::default())),
         )
         .unwrap_or_else(|error| panic!("a nullable {word} column still reads directly: {error:?}"));
-        let image = owned_image_for_test(&reader).expect("observe the owned image");
+        let (embedded, absent) = query_embedding_rows(&reader, &store, word);
         drop(reader);
 
-        let embedded = stored_row_by_identity(&image, &store.table, store.embedded_id);
-        let absent = stored_row_by_identity(&image, &store.table, store.absent_id);
         assert_eq!(
-            absent.values.get(&store.column),
-            None,
+            absent.get(2),
+            Some(&Value::Null),
             "a nullable {word} column serves the row without an embedding on it"
         );
         assert!(
-            matches!(absent.values.get("note"), Some(Value::Text(note)) if note.starts_with("absent-")),
+            matches!(absent.get(1), Some(Value::Text(note)) if note.starts_with("absent-")),
             "the rest of the row is served whole"
         );
         let quantized = stored_vector_value(&store.embedding, quantization);
         assert_eq!(
-            embedded.values.get(&store.column),
+            embedded.get(2),
             Some(&Value::Vector(quantized.clone())),
             "the neighbouring embedding is served unchanged"
         );
-        let vectors = image_vectors_for_column(&image, &store.table, &store.column);
+        let content = committed_content_for_test(&store.path)
+            .unwrap_or_else(|error| panic!("inspect committed {word} vectors: {error}"));
+        let embedded_row =
+            stored_row_by_identity(&content.relational_rows, &store.table, store.embedded_id);
+        let vectors = vectors_for_column(&content.vectors, &store.table, &store.column);
         assert_eq!(
             vectors
                 .iter()
                 .map(|vector| (vector.row_id, vector.values.clone()))
                 .collect::<Vec<_>>(),
-            vec![(embedded.row_id, quantized)],
+            vec![(embedded_row.row_id, quantized)],
             "only the row that has an embedding contributes one"
         );
         assert_eq!(
@@ -4521,12 +4852,10 @@ const MISSING_QUANTIZED_VECTOR_ENTRY: &str = "MissingQuantizedVectorEntry";
 /// embedding. The relational cell holds NULL only as a placeholder for the
 /// separately durable vector entry the row is served from, so damage that
 /// removes that entry leaves the file unable to keep the promise the schema
-/// records. An operator reading such a file directly must be told a writer is
-/// the next step, not handed a row whose required column has quietly
-/// vanished -- the same declaration-integrity promise a required
-/// full-precision column already keeps.
+/// records. A direct reader reports the missing authoritative body as
+/// corruption, instead of serving a row whose required column has vanished.
 #[test]
-fn a_required_quantized_column_without_its_durable_vector_still_needs_a_writer() {
+fn a_required_quantized_column_without_its_durable_vector_is_corrupt() {
     let _serial = serialise_direct_file_test();
     let case = required_damage_case(
         MISSING_QUANTIZED_VECTOR_ENTRY,
@@ -4549,16 +4878,15 @@ fn a_required_quantized_column_without_its_durable_vector_still_needs_a_writer()
             &store.path,
             default_reader_config(Arc::new(ManualClock::default())),
         ) {
-            Err(DirectFileReaderError::DirectReadRequiresWriter { failure, .. }) => {
-                assert_eq!(failure.kind(), ReadFailureKind::DirectReadRequiresWriter);
+            Err(DirectFileReaderError::CorruptStore(DirectStoreDiagnostic::MalformedRecord, _)) => {
             }
             Ok(_) => panic!(
                 "a required {word} column whose embedding the file no longer holds must not be \
                  served directly"
             ),
             Err(other) => panic!(
-                "a required {word} column whose embedding the file no longer holds needs a \
-                 writer: {other:?}"
+                "a required {word} column whose embedding the file no longer holds is \
+                 corrupt: {other:?}"
             ),
         }
 

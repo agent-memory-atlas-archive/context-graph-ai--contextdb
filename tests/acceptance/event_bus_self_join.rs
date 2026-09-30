@@ -809,9 +809,8 @@ fn t34_04_panic_isolation_counter_exact_and_same_event_delivered_to_sibling() {
     }
 
     // No test-authored wall-clock deadline or sleep-based synchronization:
-    // wait on the exact settled counters this test asserts below (the
-    // panicking sink's permanent_failures and the sibling's own delivered
-    // count), not on the callback-populated id list, which is written
+    // wait on the uncertain attempt and the sibling's own delivered count,
+    // not on the callback-populated id list, which is written
     // *before* the engine's post-batch metrics write
     // (crates/contextdb-engine/src/database/event_bus.rs:2166-2181) and can
     // therefore race a poll keyed on its length. A genuinely stuck dispatch
@@ -820,7 +819,7 @@ fn t34_04_panic_isolation_counter_exact_and_same_event_delivered_to_sibling() {
     loop {
         let panic_metrics = db.sink_metrics_for_test("s_panic");
         let count_metrics = db.sink_metrics_for_test("s_count");
-        if panic_metrics.permanent_failures == 3 && count_metrics.delivered == 3 {
+        if panic_metrics.uncertain >= 1 && count_metrics.delivered == 3 {
             break;
         }
         thread::yield_now();
@@ -828,7 +827,9 @@ fn t34_04_panic_isolation_counter_exact_and_same_event_delivered_to_sibling() {
 
     let panic_metrics = db.sink_metrics_for_test("s_panic");
     let count_metrics = db.sink_metrics_for_test("s_count");
-    assert_eq!(panic_metrics.permanent_failures, 3);
+    assert!(panic_metrics.uncertain >= 1);
+    assert_eq!(panic_metrics.queued, 3, "panicked actions remain pending");
+    assert_eq!(panic_metrics.permanent_failures, 0);
     assert_eq!(panic_metrics.delivered, 0);
     assert_eq!(count_metrics.delivered, 3);
     assert_eq!(count_metrics.permanent_failures, 0);

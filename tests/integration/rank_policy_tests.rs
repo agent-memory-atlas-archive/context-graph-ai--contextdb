@@ -1,6 +1,7 @@
-use contextdb_core::{Error, Lsn, Value, VectorIndexRef};
+use contextdb_core::{Error, Lsn, Value, VectorIndexRef, VectorQuantization, VectorSearchMode};
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
 use contextdb_engine::{Database, MaintenancePolicy, SearchResult, SemanticQuery};
+use contextdb_vector::VectorIndexLayout;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -1719,12 +1720,14 @@ fn seed_many_hnsw_frontier_policy(db: &Database, count: usize) -> Vec<Uuid> {
 #[test]
 fn hnsw_threshold_999_brute_force_boundary() {
     let db = Database::open_memory();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     create_policy_schema(&db, "coalesce({confidence}, 0.0)");
     let expected = seed_many_with_policy_boost(&db, 999, 500);
     let results = semantic_results(&db, Some("effective_confidence"), 10);
     assert_eq!(results.len(), 10);
     assert_eq!(result_ids(&results), expected);
     assert!(results.iter().all(|r| r.rank == 1.0));
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     assert_eq!(db.__rank_policy_eval_count(), 999);
 }
 
@@ -1759,9 +1762,26 @@ fn hnsw_threshold_1001_hnsw_boundary() {
             .collect::<Vec<_>>()
     );
     assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    // AUTO evaluates the rank pool at the store's resolved search breadth,
+    // strictly below this partition's size, while retaining exact top-k quality.
+    let resolved =
+        VectorIndexLayout::unpartitioned(2, VectorQuantization::F32).resolve_policy(1001, 10);
+    assert_eq!(
+        db.__rank_policy_eval_count(),
+        u64::try_from(resolved.hnsw_ef_search).unwrap()
+    );
+    assert!(db.__rank_policy_eval_count() < 1001);
+    db.__reset_rank_policy_eval_count();
+    let mut exact_query = SemanticQuery::new("decisions", "embedding", query_vec(), 10);
+    exact_query.sort_key = Some("effective_confidence".to_string());
+    exact_query.search_mode = Some(VectorSearchMode::Exact);
+    let exact = db
+        .semantic_search(exact_query)
+        .expect("exact semantic search");
+    assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     assert_eq!(db.__rank_policy_eval_count(), 1001);
-    // The compatibility breadth covers this whole small partition. A declared
-    // narrower breadth bounds the rank pool without rebuilding its ready graph.
+    assert_eq!(result_ids(&results), result_ids(&exact));
+    // A declared breadth bounds the rank pool without rebuilding its ready graph.
     db.execute(
         "ALTER TABLE decisions ALTER COLUMN embedding SET HNSW (EF_SEARCH = 128)",
         &empty_params(),

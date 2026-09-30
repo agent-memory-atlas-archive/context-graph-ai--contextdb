@@ -9,7 +9,7 @@ pub enum SyncError {
     #[error("serialization error: {0}")]
     Serde(String),
     #[error(
-        "protocol version mismatch: received {received}, supported {supported} — upgrade both ends to the same contextdb release so they speak the same sync protocol"
+        "protocol version mismatch: received {received}, supported {supported} — both peers must use contextdb releases with this sync protocol version"
     )]
     ProtocolVersionMismatch { received: u8, supported: u8 },
     #[error("chunk reassembly error: {0}")]

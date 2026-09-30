@@ -50,10 +50,12 @@ fn p() -> HashMap<String, Value> {
     HashMap::new()
 }
 
-/// Bounded so a red state can never hang the suite. This is a deadline on a
-/// transport exchange, never a sleep and never a timing assertion.
+/// Bounded so a red state can never hang the suite. A single authenticated
+/// exchange can spend over a minute building the oversized staging payload
+/// under host load; completion and the assertions below prove the behavior.
+/// This deadline only bounds a stalled exchange.
 async fn within<F: std::future::Future>(future: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(60), future)
+    tokio::time::timeout(Duration::from_secs(300), future)
         .await
         .expect("bounded authenticated sync exchange")
 }

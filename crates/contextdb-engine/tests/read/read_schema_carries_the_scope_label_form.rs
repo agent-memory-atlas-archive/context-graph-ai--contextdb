@@ -291,9 +291,8 @@ fn a_column_with_no_scope_label_declaration_answers_no_scope_constraint() {
 
 /// Proof 4 --- the control. Declaring a scope label changes nothing else the
 /// schema answer says: every other field of the column reads exactly as it
-/// does on the same column without the declaration, and the rendered DDL --- a
-/// doc-frozen surface whose scope-label round-trip loss is ledgered as
-/// DL-CDB-38 --- is byte-identical.
+/// does on the same column without the declaration. The rendered DDL differs
+/// only by the declared scope clause and table name.
 #[test]
 fn declaring_a_scope_label_changes_no_other_schema_fact() {
     let directory = tempfile::TempDir::new().expect("task-scoped scope-schema directory");

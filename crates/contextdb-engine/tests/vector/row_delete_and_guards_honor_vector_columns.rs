@@ -18,9 +18,13 @@
 //! Expected values come from the vector crate's own quantizer.
 
 use contextdb_core::table_meta::VectorQuantization;
-use contextdb_core::{RowId, Value};
+use contextdb_core::{Error, RowId, Value};
 use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::direct_file_reader::test_seams::{ReadWorkObservationScope, ReadWorkPhase};
 use contextdb_vector::stored_vector_value;
+#[cfg(feature = "test-seams")]
+use serial_test::serial;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -150,7 +154,11 @@ fn a_row_deleted_through_the_row_api_takes_its_vectors_with_it() {
     let doomed = id_of(1);
     let row_id = row_id_of(&database, doomed);
     let counts_before = vector_counts(&database);
-    let held_before = database.accountant().usage().used;
+    let held_before = database
+        .accountant()
+        .usage()
+        .used
+        .saturating_sub(database.__durable_writer_charged_bytes_for_test());
 
     let tx = database.begin().expect("begin a writing transaction");
     database
@@ -196,7 +204,12 @@ fn a_row_deleted_through_the_row_api_takes_its_vectors_with_it() {
         );
     }
     assert!(
-        database.accountant().usage().used < held_before,
+        database
+            .accountant()
+            .usage()
+            .used
+            .saturating_sub(database.__durable_writer_charged_bytes_for_test())
+            < held_before,
         "and the store releases what the deleted row's vectors were costing it"
     );
 
@@ -250,4 +263,181 @@ fn a_row_condition_guard_sees_the_vector_the_store_holds() {
         );
     }
     database.close().expect("the writer closes cleanly");
+}
+
+#[test]
+fn a_quantized_vector_guard_commits_when_unchanged_and_refuses_a_competing_replacement() {
+    let directory = tempfile::TempDir::new().expect("task-scoped guarded-row directory");
+    let database = seeded(&directory.path().join("guard-revalidation.db"));
+    let subject = id_of(1);
+    let held = Value::Vector(stored(&doomed_vector(), Some(VectorQuantization::SQ8)));
+
+    let unchanged = database
+        .begin()
+        .expect("begin the unchanged guarded transaction");
+    assert!(
+        database
+            .guard_row_conditions_in_tx(
+                unchanged,
+                "points",
+                "id",
+                &Value::Uuid(subject),
+                &[("compact".to_owned(), held.clone())],
+            )
+            .expect("the quantized vector guard is admitted"),
+        "the stored quantized vector matches when the claim starts"
+    );
+    database
+        .execute_in_tx(
+            unchanged,
+            "UPDATE points SET label = 'unchanged-claim' WHERE id = $id",
+            &params(vec![("id", Value::Uuid(subject))]),
+        )
+        .expect("stage an ordinary claim update in the guarded transaction");
+    database
+        .commit(unchanged)
+        .expect("an unchanged quantized vector still validates at commit");
+
+    let competing = database
+        .begin()
+        .expect("begin the competing guarded transaction");
+    assert!(
+        database
+            .guard_row_conditions_in_tx(
+                competing,
+                "points",
+                "id",
+                &Value::Uuid(subject),
+                &[("compact".to_owned(), held)],
+            )
+            .expect("the pre-replacement vector guard is admitted"),
+        "the guard sees the snapshot the transaction claimed"
+    );
+    database
+        .execute_in_tx(
+            competing,
+            "UPDATE points SET label = 'must-not-commit' WHERE id = $id",
+            &params(vec![("id", Value::Uuid(subject))]),
+        )
+        .expect("stage the guarded side effect");
+    database
+        .execute(
+            "UPDATE points SET compact = $replacement WHERE id = $id",
+            &params(vec![
+                ("id", Value::Uuid(subject)),
+                ("replacement", Value::Vector(surviving_vector())),
+            ]),
+        )
+        .expect("a competing replacement commits before the guarded transaction");
+
+    let conflict = database
+        .commit(competing)
+        .expect_err("a changed quantized vector must refuse the stale guarded transaction");
+    assert!(
+        matches!(conflict, Error::ConditionalUpdateConflict { count: 1 }),
+        "the competing replacement keeps the typed conflict, got {conflict:?}"
+    );
+    let label = database
+        .execute(
+            "SELECT label FROM points WHERE id = $id",
+            &params(vec![("id", Value::Uuid(subject))]),
+        )
+        .expect("read the row after the refused transaction");
+    assert_eq!(
+        label.rows,
+        vec![vec![Value::Text("unchanged-claim".to_owned())]],
+        "the typed conflict rolls the guarded overlay back instead of retrying it unconditionally"
+    );
+    database.close().expect("the writer closes cleanly");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+#[serial]
+fn a_non_vector_guard_commit_loads_no_unrelated_vector_body() {
+    let directory = tempfile::TempDir::new().expect("task-scoped guard-work directory");
+    let path = directory.path().join("guard-work.db");
+    let subject = id_of(1);
+    {
+        let database = seeded(&path);
+        database
+            .close()
+            .expect("close before the physical guard proof");
+    }
+    let database = Database::open(&path).expect("reopen the guard-work fixture");
+    let guarded = database.begin().expect("begin the guarded transaction");
+    assert!(
+        database
+            .guard_row_conditions_in_tx(
+                guarded,
+                "points",
+                "id",
+                &Value::Uuid(subject),
+                &[("label".to_owned(), Value::Text("row-1".to_owned()))],
+            )
+            .expect("the non-vector guard is admitted")
+    );
+    database
+        .execute_in_tx(
+            guarded,
+            "UPDATE points SET label = 'claimed' WHERE id = $id",
+            &params(vec![("id", Value::Uuid(subject))]),
+        )
+        .expect("stage the guarded update");
+
+    let commit_work = ReadWorkObservationScope::enter(ReadWorkPhase::Commit);
+    database
+        .commit(guarded)
+        .expect("the unchanged non-vector guard validates");
+    assert_eq!(
+        commit_work.counters().decoded_vectors,
+        0,
+        "commit validation of a label predicate does not decode plain, SQ8, or SQ4 vector bodies"
+    );
+    assert_eq!(
+        commit_work.counters().vector_body_accesses,
+        0,
+        "the negative control must observe no resident or durable vector-body access"
+    );
+    drop(commit_work);
+
+    let vector_guarded = database
+        .begin()
+        .expect("begin the positive vector-access control");
+    assert!(
+        database
+            .guard_row_conditions_in_tx(
+                vector_guarded,
+                "points",
+                "id",
+                &Value::Uuid(subject),
+                &[(
+                    "compact".to_owned(),
+                    Value::Vector(stored(&doomed_vector(), Some(VectorQuantization::SQ8))),
+                )],
+            )
+            .expect("the resident vector guard is admitted")
+    );
+    database
+        .execute_in_tx(
+            vector_guarded,
+            "UPDATE points SET label = 'vector-claimed' WHERE id = $id",
+            &params(vec![("id", Value::Uuid(subject))]),
+        )
+        .expect("stage the vector-guarded update");
+    let vector_commit_work = ReadWorkObservationScope::enter(ReadWorkPhase::Commit);
+    database
+        .commit(vector_guarded)
+        .expect("the unchanged resident vector validates");
+    assert!(
+        vector_commit_work.counters().vector_body_accesses > 0,
+        "the positive control must prove the access counter observes resident vector loads"
+    );
+    assert_eq!(
+        vector_commit_work.counters().decoded_vectors,
+        0,
+        "the positive control stays resident, proving decoded-only accounting is insufficient"
+    );
+    drop(vector_commit_work);
+    database.close().expect("close the guard-work fixture");
 }

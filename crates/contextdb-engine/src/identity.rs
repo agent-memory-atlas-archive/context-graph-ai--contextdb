@@ -100,6 +100,14 @@ impl FabricIdentity {
             .to_vec()
     }
 
+    /// Sign as this identity from a test that stands in for a peer holding
+    /// this key -- the same signature a transport-owned signer would make.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn sign_for_test(&self, bytes: &[u8]) -> Vec<u8> {
+        self.sign_lineage(bytes)
+    }
+
     /// Verify a lineage signature using the creator identity carried on the
     /// wire.  `node_id` is the lowercase hex Ed25519 public key used by the
     /// fabric, so verification never needs a local key registry.

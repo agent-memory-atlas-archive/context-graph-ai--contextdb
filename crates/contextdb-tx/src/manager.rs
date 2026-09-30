@@ -1,17 +1,53 @@
 use crate::write_set::{WriteSet, WriteSetApplicator};
+use contextdb_core::read_contract::OwnerReadCancellation;
 use contextdb_core::{AtomicLsn, AtomicTxId, Error, Lsn, Result, RowId, SnapshotId, TxId};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+thread_local! {
+    static COMMIT_WAIT_ENTERED_FOR_TEST: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct CommitRelease {
+    epoch: Mutex<u64>,
+    changed: Condvar,
+}
+
+struct CommitLockGuard<'a> {
+    lock: Option<MutexGuard<'a, ()>>,
+    release: &'a CommitRelease,
+}
+
+impl Drop for CommitLockGuard<'_> {
+    fn drop(&mut self) {
+        // Wake only after the mutex is actually available. The epoch lock
+        // closes the gap between a waiter's failed try_lock and its park.
+        drop(self.lock.take());
+        let mut epoch = self.release.epoch.lock();
+        *epoch = epoch.wrapping_add(1);
+        self.release.changed.notify_all();
+    }
+}
 
 pub struct TransactionManager<S: WriteSetApplicator> {
     next_tx: AtomicTxId,
     committed_watermark: AtomicTxId,
     next_lsn: AtomicLsn,
     committed_lsn: AtomicLsn,
+    /// One independently readable final-publication point. The two public
+    /// atomics above serve existing callers, but cannot be sampled as a pair
+    /// while a commit is between their stores.
+    published_read: Mutex<(SnapshotId, Lsn)>,
     active_txs: Mutex<HashMap<TxId, WriteSet>>,
     commit_index: Mutex<BTreeMap<Lsn, TxId>>,
     commit_mutex: Mutex<()>,
+    commit_release: Arc<CommitRelease>,
     store: S,
 }
 
@@ -53,9 +89,14 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             committed_watermark: AtomicTxId::new(committed_watermark),
             next_lsn: AtomicLsn::new(next_lsn),
             committed_lsn: AtomicLsn::new(Lsn(next_lsn.0.saturating_sub(1))),
+            published_read: Mutex::new((
+                SnapshotId::from_tx(committed_watermark),
+                Lsn(next_lsn.0.saturating_sub(1)),
+            )),
             active_txs: Mutex::new(HashMap::new()),
             commit_index: Mutex::new(commit_index),
             commit_mutex: Mutex::new(()),
+            commit_release: Arc::new(CommitRelease::default()),
             store,
         }
     }
@@ -71,6 +112,13 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         SnapshotId::from_tx(self.committed_watermark.load(Ordering::SeqCst))
     }
 
+    /// The last complete commit's snapshot and LSN, copied together without
+    /// taking the commit mutex. A bounded reader may register this root while
+    /// the next writer is still applying, then inspect only that snapshot.
+    pub fn published_read_snapshot(&self) -> (SnapshotId, Lsn) {
+        *self.published_read.lock()
+    }
+
     pub fn with_write_set<F, R>(&self, tx: TxId, f: F) -> Result<R>
     where
         F: FnOnce(&mut WriteSet) -> R,
@@ -78,6 +126,13 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         let mut active = self.active_txs.lock();
         let ws = active.get_mut(&tx).ok_or(Error::TxNotFound(tx))?;
         Ok(f(ws))
+    }
+
+    /// Observe the mutex used by `with_write_set` without waiting for it.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn write_set_lock_is_held_for_test(&self) -> bool {
+        self.active_txs.try_lock().is_none()
     }
 
     pub fn with_write_set_detached<F, R>(&self, tx: TxId, f: F) -> Result<R>
@@ -131,7 +186,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
-        let _lock = self.commit_mutex.lock();
+        let _lock = self.lock_commit_boundary();
         let reserved_lsn = self.next_lsn.load(Ordering::SeqCst);
         if let Err(error) = before_commit(reserved_lsn) {
             return Err(CommitFailure {
@@ -175,6 +230,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         self.committed_watermark
             .fetch_max(visibility_tx, Ordering::SeqCst);
         self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
+        self.publish_read_snapshot(lsn);
         Ok((lsn, ws))
     }
 
@@ -212,7 +268,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(&mut WriteSet) -> Result<()>,
         G: FnOnce(Lsn, &WriteSet),
     {
-        let _lock = self.commit_mutex.lock();
+        let _lock = self.lock_commit_boundary();
         let mut ws = {
             let mut active = self.active_txs.lock();
             active.remove(&tx).ok_or(CommitFailure {
@@ -252,6 +308,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         self.committed_watermark
             .fetch_max(visibility_tx, Ordering::SeqCst);
         self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
+        self.publish_read_snapshot(lsn);
         Ok((lsn, ws))
     }
 
@@ -266,7 +323,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         F: FnOnce(Lsn, TxId) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
-        let _lock = self.commit_mutex.lock();
+        let _lock = self.lock_commit_boundary();
         let visibility_tx = {
             let mut active = self.active_txs.lock();
             let ws = active.get_mut(&tx).ok_or(CommitFailure {
@@ -333,6 +390,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         self.committed_watermark
             .fetch_max(visibility_tx, Ordering::SeqCst);
         self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
+        self.publish_read_snapshot(lsn);
         Ok((lsn, ws))
     }
 
@@ -340,8 +398,39 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         self.rollback_write_set(tx).map(|_| ())
     }
 
+    /// Remove every transaction still open and hand back what each staged.
+    ///
+    /// A store that is closing will never commit them, and their write sets go
+    /// with it -- so whatever they staged has to be given back to the memory
+    /// accountant first, which is what the caller does with these. Closing
+    /// released only the SESSION transaction before this existed, so a
+    /// transaction opened with `begin()` and abandoned left its whole
+    /// admission charged against a limit nothing was holding any more.
+    pub fn drain_active_write_sets(&self) -> Vec<WriteSet> {
+        let _lock = self.lock_commit_boundary();
+        let mut active = self.active_txs.lock();
+        active.drain().map(|(_, write_set)| write_set).collect()
+    }
+
+    /// Visit every transaction that is still open, so a change to the shape
+    /// a staged row was admitted under can settle that row too.
+    ///
+    /// A staged row lives in its write set until commit, so it is invisible
+    /// to anything that reads committed versions -- and it is charged under
+    /// the index set the table had when its statement ran, then released
+    /// under the one the table has when the transaction ends. The door that
+    /// changes the index set uses this to re-price what is staged alongside
+    /// what is committed.
+    pub fn with_active_write_sets<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HashMap<TxId, WriteSet>) -> R,
+    {
+        let mut active = self.active_txs.lock();
+        f(&mut active)
+    }
+
     pub fn rollback_write_set(&self, tx: TxId) -> Result<WriteSet> {
-        let _lock = self.commit_mutex.lock();
+        let _lock = self.lock_commit_boundary();
         let mut active = self.active_txs.lock();
         active.remove(&tx).ok_or(Error::TxNotFound(tx))
     }
@@ -380,6 +469,10 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
 
     pub fn current_lsn(&self) -> Lsn {
         self.committed_lsn.load(Ordering::SeqCst)
+    }
+
+    fn publish_read_snapshot(&self, lsn: Lsn) {
+        *self.published_read.lock() = (self.snapshot(), lsn);
     }
 
     /// Commit-index entries at or below `up_to`. Read this inside the same
@@ -423,6 +516,20 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     }
 
     /// A copy of the commit index, for a caller computing a retention floor.
+    /// How many committed LSNs the commit index holds.
+    pub fn commit_index_len(&self) -> usize {
+        self.commit_index.lock().len()
+    }
+
+    /// The commit index in LSN order, copied once into exactly the space it
+    /// needs.
+    pub fn commit_index_entries(&self) -> Vec<(Lsn, TxId)> {
+        let index = self.commit_index.lock();
+        let mut entries = Vec::with_capacity(index.len());
+        entries.extend(index.iter().map(|(lsn, tx)| (*lsn, *tx)));
+        entries
+    }
+
     pub fn commit_index_snapshot(&self) -> BTreeMap<Lsn, TxId> {
         self.commit_index
             .lock()
@@ -488,11 +595,12 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce(Lsn) -> Result<R>,
     {
-        let _lock = self.commit_mutex.lock();
+        let _lock = self.lock_commit_boundary();
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         match f(lsn) {
             Ok(result) => {
                 self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
+                self.publish_read_snapshot(lsn);
                 Ok(result)
             }
             Err(err) => {
@@ -506,11 +614,12 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce(Lsn) -> Result<Option<R>>,
     {
-        let _lock = self.commit_mutex.lock();
+        let _lock = self.lock_commit_boundary();
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         match f(lsn) {
             Ok(Some(result)) => {
                 self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
+                self.publish_read_snapshot(lsn);
                 Ok(Some(result))
             }
             Ok(None) => {
@@ -528,8 +637,90 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
     where
         F: FnOnce() -> R,
     {
-        let _lock = self.commit_mutex.lock();
+        let _lock = self.lock_commit_boundary();
         f()
+    }
+
+    fn lock_commit_boundary(&self) -> CommitLockGuard<'_> {
+        CommitLockGuard {
+            lock: Some(self.commit_mutex.lock()),
+            release: &self.commit_release,
+        }
+    }
+
+    /// Wait at most `duration` for the commit boundary, then return control to
+    /// the caller if another operation still owns it. This is for callers with
+    /// an independent cancellation signal: they can remain answerable without
+    /// weakening the single-writer boundary or running the operation twice.
+    pub fn try_with_commit_lock_for<F, R>(&self, duration: std::time::Duration, f: F) -> Option<R>
+    where
+        F: FnOnce() -> R,
+    {
+        let _lock = CommitLockGuard {
+            lock: Some(self.commit_mutex.try_lock_for(duration)?),
+            release: &self.commit_release,
+        };
+        Some(f())
+    }
+
+    /// Wait for the next complete commit boundary, cancellation, or the
+    /// supplied remaining allowance. The release epoch and cancellation use
+    /// one condition variable, so neither event can disappear between the
+    /// failed try_lock and the waiter's park.
+    pub fn try_with_commit_lock_cancellable_for<F, R, D>(
+        &self,
+        duration: Duration,
+        cancelled: &OwnerReadCancellation,
+        deadline_expired: D,
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce() -> R,
+        D: Fn() -> bool,
+    {
+        let release = Arc::clone(&self.commit_release);
+        let wake_on_cancel = Arc::clone(&release);
+        let _cancel_listener = cancelled.tell_on_cancel(move || {
+            let mut epoch = wake_on_cancel.epoch.lock();
+            *epoch = epoch.wrapping_add(1);
+            wake_on_cancel.changed.notify_all();
+        });
+        let started = Instant::now();
+        let mut epoch = release.epoch.lock();
+        loop {
+            if cancelled.is_cancelled() || deadline_expired() {
+                return None;
+            }
+            if let Some(lock) = self.commit_mutex.try_lock() {
+                drop(epoch);
+                let _guard = CommitLockGuard {
+                    lock: Some(lock),
+                    release: &release,
+                };
+                if cancelled.is_cancelled() {
+                    return None;
+                }
+                return Some(f());
+            }
+            #[cfg(test)]
+            COMMIT_WAIT_ENTERED_FOR_TEST.with(|cell| {
+                if let Some(sender) = cell.borrow_mut().take() {
+                    sender
+                        .send(())
+                        .expect("commit-wait observer remains available");
+                }
+            });
+            let remaining = duration.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return None;
+            }
+            // The injected read clock can advance without notifying this
+            // condition variable. Park briefly to recheck that clock; this
+            // cadence never retries the operation or spins on the mutex.
+            release
+                .changed
+                .wait_for(&mut epoch, remaining.min(Duration::from_millis(5)));
+        }
     }
 
     /// Returns the highest-committed TxId (the statement-scoped max for user-SQL
@@ -579,5 +770,91 @@ impl<S: WriteSetApplicator> contextdb_core::TransactionManager for TransactionMa
 
     fn snapshot(&self) -> SnapshotId {
         TransactionManager::snapshot(self)
+    }
+}
+
+#[cfg(test)]
+mod commit_wait_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct NoopStore;
+
+    impl WriteSetApplicator for NoopStore {
+        fn apply(&self, _: &WriteSet) -> Result<()> {
+            Ok(())
+        }
+
+        fn new_row_id(&self) -> RowId {
+            RowId(1)
+        }
+    }
+
+    #[test]
+    fn cancellation_wakes_a_commit_wait_before_the_writer_releases() {
+        let manager = Arc::new(TransactionManager::new(NoopStore));
+        let writer_lock = manager.lock_commit_boundary();
+        let cancellation = OwnerReadCancellation::new();
+        let (entered_send, entered_recv) = std::sync::mpsc::channel();
+        let (done_send, done_recv) = std::sync::mpsc::channel();
+        let called = Arc::new(AtomicBool::new(false));
+        let reader_manager = Arc::clone(&manager);
+        let reader_cancellation = cancellation.clone();
+        let reader_called = Arc::clone(&called);
+        let reader = std::thread::spawn(move || {
+            COMMIT_WAIT_ENTERED_FOR_TEST.with(|cell| *cell.borrow_mut() = Some(entered_send));
+            let result = reader_manager.try_with_commit_lock_cancellable_for(
+                Duration::from_secs(30),
+                &reader_cancellation,
+                || false,
+                || reader_called.store(true, Ordering::SeqCst),
+            );
+            done_send.send(result).unwrap();
+        });
+        entered_recv
+            .recv_timeout(Duration::from_secs(30))
+            .expect("reader reaches commit-boundary wait while writer holds its lock");
+        cancellation.cancel();
+        assert_eq!(
+            done_recv.recv_timeout(Duration::from_secs(30)).unwrap(),
+            None,
+            "cancelled read answers while writer still holds the commit boundary"
+        );
+        assert!(!called.load(Ordering::SeqCst));
+        drop(writer_lock);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn manual_deadline_advance_wakes_commit_wait_without_writer_release() {
+        let manager = Arc::new(TransactionManager::new(NoopStore));
+        let writer_lock = manager.lock_commit_boundary();
+        let cancellation = OwnerReadCancellation::new();
+        let clock_ms = Arc::new(AtomicU64::new(0));
+        let (entered_send, entered_recv) = std::sync::mpsc::channel();
+        let (done_send, done_recv) = std::sync::mpsc::channel();
+        let reader_manager = Arc::clone(&manager);
+        let reader_clock = Arc::clone(&clock_ms);
+        let reader = std::thread::spawn(move || {
+            COMMIT_WAIT_ENTERED_FOR_TEST.with(|cell| *cell.borrow_mut() = Some(entered_send));
+            let result = reader_manager.try_with_commit_lock_cancellable_for(
+                Duration::from_secs(30),
+                &cancellation,
+                || reader_clock.load(Ordering::SeqCst) > 10,
+                || (),
+            );
+            done_send.send(result).unwrap();
+        });
+        entered_recv
+            .recv_timeout(Duration::from_secs(30))
+            .expect("reader reaches commit-boundary wait while writer holds its lock");
+        clock_ms.store(11, Ordering::SeqCst);
+        assert_eq!(
+            done_recv.recv_timeout(Duration::from_secs(30)).unwrap(),
+            None,
+            "advanced read deadline answers before the writer releases"
+        );
+        drop(writer_lock);
+        reader.join().unwrap();
     }
 }

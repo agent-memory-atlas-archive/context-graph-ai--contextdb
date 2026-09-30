@@ -124,7 +124,7 @@ pub const TAG_SCOPE_LABEL_VIOLATION: u16 = 40;
 pub const TAG_STORE_CORRUPTED: u16 = 41;
 /// The store's identity could not be proven.
 pub const TAG_STORE_IDENTITY_UNPROVABLE: u16 = 42;
-/// The store predates the current on-disk format.
+/// The store does not have the required on-disk format.
 pub const TAG_LEGACY_VECTOR_STORE_DETECTED: u16 = 43;
 /// Another process holds the store.
 pub const TAG_DATABASE_LOCKED: u16 = 44;

@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
 use super::canonical::{Encoder, hex, invalid, policy_digest, reference_key};
 use crate::custody_types::ApplicationTablePolicy;
 use crate::protocol::WireRowLineage;
@@ -257,6 +258,43 @@ impl PolicyEvidence {
         Ok(())
     }
 }
+/// The bytes a schema author signs over one DDL record's provenance: who wrote
+/// it, in which life of their database, at which source position, how many
+/// statements that source transaction holds (so the signed ordinal and count
+/// fix the complete unit and its order), over which schema generation, and
+/// the canonical digest of the statement itself. Both
+/// delivery lanes share this one shape -- the custody manifest's
+/// `SchemaDependency` below and the ordinary sync lane's `WireDdlAuthor` --
+/// so a schema author signs its provenance exactly once, one way. A record
+/// that binds no table instance (a trigger or sink drop) passes `None` for
+/// both table fields, which a bound record can never collide with because a
+/// bound record's generation is never zero.
+pub(crate) fn ddl_author_attestation_bytes(
+    tenant: &TenantId,
+    author_node: &str,
+    author_incarnation: Incarnation,
+    source_lsn: Lsn,
+    ordinal: u32,
+    unit_statements: u32,
+    table: Option<&str>,
+    table_generation: Option<u64>,
+    ddl_bytes: &[u8],
+    ddl_digest: &[u8],
+) -> Result<Vec<u8>> {
+    let mut e = Encoder::domain("delivery-schema-dependency.v1");
+    e.string(tenant.as_str());
+    e.node(author_node)?;
+    e.raw(&author_incarnation.0.to_be_bytes());
+    e.u64(source_lsn.0);
+    e.u32(ordinal);
+    e.u32(unit_statements);
+    e.string(table.unwrap_or_default());
+    e.u64(table_generation.unwrap_or_default());
+    e.bytes(ddl_bytes);
+    e.bytes(ddl_digest);
+    Ok(e.0)
+}
+
 /// The actual committed DDL history required to interpret the signed row projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SchemaDependency {
@@ -265,6 +303,7 @@ pub(crate) struct SchemaDependency {
     pub author_incarnation: Incarnation,
     pub source_lsn: Lsn,
     pub ordinal: u32,
+    pub unit_statements: u32,
     pub table: String,
     pub table_generation: u64,
     pub ddl_bytes: Vec<u8>,
@@ -273,17 +312,18 @@ pub(crate) struct SchemaDependency {
 }
 impl SchemaDependency {
     pub fn bytes(&self) -> Result<Vec<u8>> {
-        let mut e = Encoder::domain("delivery-schema-dependency.v1");
-        e.string(self.tenant.as_str());
-        e.node(&self.author_node)?;
-        e.raw(&self.author_incarnation.0.to_be_bytes());
-        e.u64(self.source_lsn.0);
-        e.u32(self.ordinal);
-        e.string(&self.table);
-        e.u64(self.table_generation);
-        e.bytes(&self.ddl_bytes);
-        e.bytes(&self.ddl_digest);
-        Ok(e.0)
+        ddl_author_attestation_bytes(
+            &self.tenant,
+            &self.author_node,
+            self.author_incarnation,
+            self.source_lsn,
+            self.ordinal,
+            self.unit_statements,
+            Some(&self.table),
+            Some(self.table_generation),
+            &self.ddl_bytes,
+            &self.ddl_digest,
+        )
     }
     pub fn verify(&self) -> Result<()> {
         let ddl: crate::protocol::WireDdlChange =

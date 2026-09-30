@@ -10,10 +10,10 @@ use crate::local_transport::{
 use crate::{
     QueryResult, QueryTrace, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
     VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
-    VectorSearchScopeShape, VectorSearchTailState,
+    VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
 use bincode::config::standard;
-use bincode::serde::{decode_from_slice, encode_to_vec};
+use bincode::serde::decode_from_slice;
 use contextdb_core::read_contract::{CursorPage, MetadataPage, ReadLimits};
 use contextdb_core::{Value, VectorIndexRef, VectorSearchMode};
 use serde::de::DeserializeOwned;
@@ -35,11 +35,99 @@ pub struct CanonicalQueryTrace {
     pub query_vector_source: Option<VectorIndexRef>,
     pub vector_search: Option<CanonicalVectorSearchDisclosure>,
     pub rows_examined: u64,
+    /// The maintained-index-count route disclosure, carried across the owner
+    /// channel so a reader of someone else's store sees the same line an
+    /// in-process `.explain` prints.
+    #[serde(default)]
+    pub maintained_count: Option<CanonicalMaintainedCountDisclosure>,
+}
+
+/// `used` is the maintained count serving the answer; `false` with `declared`
+/// is a count the table keeps current that this route counted from the index
+/// range instead; `false` with neither is a count nothing declares, and then
+/// `columns` and `already_declared` are what the advised statement is built
+/// from.
+///
+/// Each column's direction rides as `true` for `DESC`, so the hand-written
+/// preflight walker in `local_transport::framing` needs only the primitives it
+/// already has to admit this shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalMaintainedCountDisclosure {
+    pub used: bool,
+    /// Whether the table DECLARES this count, which is separate from whether
+    /// this route served the answer from it.
+    pub declared: bool,
+    pub table: String,
+    pub columns: Vec<(String, bool)>,
+    /// The lists the table already declares, carried so the advised statement
+    /// a reader of someone else's store is shown keeps them.
+    pub already_declared: Vec<Vec<(String, bool)>>,
+}
+
+fn canonical_count_columns(
+    columns: &[(String, contextdb_core::SortDirection)],
+) -> Vec<(String, bool)> {
+    columns
+        .iter()
+        .map(|(column, direction)| {
+            (
+                column.clone(),
+                matches!(direction, contextdb_core::SortDirection::Desc),
+            )
+        })
+        .collect()
+}
+
+fn restored_count_columns(
+    columns: Vec<(String, bool)>,
+) -> Vec<(String, contextdb_core::SortDirection)> {
+    columns
+        .into_iter()
+        .map(|(column, descending)| {
+            (
+                column,
+                if descending {
+                    contextdb_core::SortDirection::Desc
+                } else {
+                    contextdb_core::SortDirection::Asc
+                },
+            )
+        })
+        .collect()
+}
+
+impl CanonicalMaintainedCountDisclosure {
+    /// The engine-side disclosure this wire shape stands for.
+    pub fn restored(self) -> crate::maintained_counts::MaintainedCountDisclosure {
+        use crate::maintained_counts::MaintainedCountDisclosure;
+        let columns = restored_count_columns(self.columns);
+        match (self.used, self.declared) {
+            (true, _) => MaintainedCountDisclosure::Used {
+                table: self.table,
+                columns,
+            },
+            (false, true) => MaintainedCountDisclosure::DeclaredNotServed {
+                table: self.table,
+                columns,
+            },
+            (false, false) => MaintainedCountDisclosure::NotDeclared {
+                table: self.table,
+                columns,
+                already_declared: self
+                    .already_declared
+                    .into_iter()
+                    .map(restored_count_columns)
+                    .collect(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalVectorPartitionHnswDisclosure {
     pub partition: String,
+    pub route: Option<String>,
+    pub reason: Option<String>,
     pub hnsw_m: u64,
     pub hnsw_ef_construction: u64,
     pub hnsw_ef_search: u64,
@@ -49,6 +137,7 @@ pub struct CanonicalVectorPartitionHnswDisclosure {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalVectorSearchDisclosure {
+    pub route_evidence: String,
     pub requested_mode: String,
     pub resolved_mode: String,
     pub aggregate_allowed_vectors: Option<u64>,
@@ -66,11 +155,22 @@ pub struct CanonicalVectorSearchDisclosure {
     pub recovery: Option<String>,
     pub query_source: String,
     pub partition_hnsw: Vec<CanonicalVectorPartitionHnswDisclosure>,
+    #[serde(default)]
+    pub global_candidate_budget: Option<u64>,
+    #[serde(default)]
+    pub admission_evaluations: Option<u64>,
+    #[serde(default)]
+    pub expansion_evaluations: Option<u64>,
+    #[serde(default)]
+    pub layers_admitted: Option<u64>,
+    #[serde(default)]
+    pub budget_terminal: Option<String>,
 }
 
 impl From<&VectorSearchDisclosure> for CanonicalVectorSearchDisclosure {
     fn from(disclosure: &VectorSearchDisclosure) -> Self {
         Self {
+            route_evidence: disclosure.route_evidence.as_str().to_owned(),
             requested_mode: disclosure.requested_mode.as_str().to_owned(),
             resolved_mode: disclosure.resolved_mode.as_str().to_owned(),
             aggregate_allowed_vectors: disclosure
@@ -89,11 +189,18 @@ impl From<&VectorSearchDisclosure> for CanonicalVectorSearchDisclosure {
             refusal: disclosure.refusal.clone(),
             recovery: disclosure.recovery.clone(),
             query_source: disclosure.query_source.as_str().to_owned(),
+            global_candidate_budget: disclosure.global_candidate_budget.map(|count| count as u64),
+            admission_evaluations: disclosure.admission_evaluations.map(|count| count as u64),
+            expansion_evaluations: disclosure.expansion_evaluations.map(|count| count as u64),
+            layers_admitted: disclosure.layers_admitted.map(|count| count as u64),
+            budget_terminal: disclosure.budget_terminal.clone(),
             partition_hnsw: disclosure
                 .partition_hnsw
                 .iter()
                 .map(|partition| CanonicalVectorPartitionHnswDisclosure {
                     partition: partition.partition.clone(),
+                    route: partition.route.map(|route| route.as_str().to_owned()),
+                    reason: partition.reason.clone(),
                     hnsw_m: partition.hnsw_m as u64,
                     hnsw_ef_construction: partition.hnsw_ef_construction as u64,
                     hnsw_ef_search: partition.hnsw_ef_search as u64,
@@ -114,6 +221,11 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
             "EXACT" => Ok(VectorSearchMode::Exact),
             "INDEXED" => Ok(VectorSearchMode::Indexed),
             _ => Err(()),
+        };
+        let route_evidence = match disclosure.route_evidence.as_str() {
+            "passive-prediction" => VectorSearchRouteEvidence::PassivePrediction,
+            "executed" => VectorSearchRouteEvidence::Executed,
+            _ => return Err(()),
         };
         let scope = match disclosure.scope.as_str() {
             "one" => VectorSearchScopeShape::One,
@@ -154,6 +266,7 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
             _ => return Err(()),
         };
         Ok(Self {
+            route_evidence,
             requested_mode: mode(&disclosure.requested_mode)?,
             resolved_mode: mode(&disclosure.resolved_mode)?,
             aggregate_allowed_vectors: disclosure
@@ -175,12 +288,44 @@ impl TryFrom<CanonicalVectorSearchDisclosure> for VectorSearchDisclosure {
             refusal: disclosure.refusal,
             recovery: disclosure.recovery,
             query_source,
+            global_candidate_budget: disclosure
+                .global_candidate_budget
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| ())?,
+            admission_evaluations: disclosure
+                .admission_evaluations
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| ())?,
+            expansion_evaluations: disclosure
+                .expansion_evaluations
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| ())?,
+            layers_admitted: disclosure
+                .layers_admitted
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| ())?,
+            budget_terminal: disclosure.budget_terminal,
             partition_hnsw: disclosure
                 .partition_hnsw
                 .into_iter()
                 .map(|partition| {
                     Ok(VectorPartitionHnswDisclosure {
                         partition: partition.partition,
+                        route: partition
+                            .route
+                            .as_deref()
+                            .map(|value| match value {
+                                "exact" => Ok(VectorSearchRoute::Exact),
+                                "indexed" => Ok(VectorSearchRoute::Indexed),
+                                "filtered-indexed" => Ok(VectorSearchRoute::FilteredIndexed),
+                                _ => Err(()),
+                            })
+                            .transpose()?,
+                        reason: partition.reason,
                         hnsw_m: usize::try_from(partition.hnsw_m).map_err(|_| ())?,
                         hnsw_ef_construction: usize::try_from(partition.hnsw_ef_construction)
                             .map_err(|_| ())?,
@@ -217,6 +362,32 @@ impl From<&QueryTrace> for CanonicalQueryTrace {
             query_vector_source: trace.query_vector_source.clone(),
             vector_search: trace.vector_search.as_ref().map(Into::into),
             rows_examined: trace.rows_examined,
+            maintained_count: trace.maintained_count.as_deref().map(|disclosure| {
+                use crate::maintained_counts::MaintainedCountDisclosure;
+                let (used, declared, table, columns, already_declared) = match disclosure {
+                    MaintainedCountDisclosure::Used { table, columns } => {
+                        (true, true, table, columns, Vec::new())
+                    }
+                    MaintainedCountDisclosure::DeclaredNotServed { table, columns } => {
+                        (false, true, table, columns, Vec::new())
+                    }
+                    MaintainedCountDisclosure::NotDeclared {
+                        table,
+                        columns,
+                        already_declared,
+                    } => (false, false, table, columns, already_declared.clone()),
+                };
+                CanonicalMaintainedCountDisclosure {
+                    used,
+                    declared,
+                    table: table.clone(),
+                    columns: canonical_count_columns(columns),
+                    already_declared: already_declared
+                        .iter()
+                        .map(|list| canonical_count_columns(list))
+                        .collect(),
+                }
+            }),
         }
     }
 }
@@ -319,9 +490,15 @@ fn encoding_error_from_transport(
 }
 
 pub fn encode_query_result(result: &QueryResult) -> Result<Vec<u8>, ReadEncodingError> {
-    let canonical = CanonicalQueryResult::from(result);
-    validate_query_result(&canonical)?;
-    encode(&canonical)
+    // Encoded from the borrowed view, which writes the same bytes as the owned
+    // canonical form: building the owned form first would copy every row of
+    // the answer only to hand the copy to the encoder.
+    for row in &result.rows {
+        if row.len() != result.columns.len() {
+            return Err(ReadEncodingError::InvalidPayload);
+        }
+    }
+    encode(&CanonicalQueryResultView::from(result))
 }
 
 /// Decode with no caller ceiling in hand. The shipped default stands in as
@@ -368,20 +545,77 @@ pub fn encode_metadata_body(
     Ok(bytes.finish())
 }
 
+/// How many bytes [`encode_metadata_body`] produces for `body`, measured
+/// without building them, so a limit can refuse the encoding before it is
+/// allocated.
+pub(crate) fn encoded_metadata_body_len(
+    body: &crate::direct_file_reader::DirectMetadataBody,
+) -> usize {
+    let mut counter = CanonicalWriter::counting();
+    crate::read_image::write_metadata_body(&mut counter, body);
+    counter.len()
+}
+
+/// [`encode_metadata_body`] into a buffer allocated once at `len`, the size
+/// [`encoded_metadata_body_len`] measured and the caller admitted.
+pub(crate) fn encode_metadata_body_measured(
+    body: &crate::direct_file_reader::DirectMetadataBody,
+    len: usize,
+) -> Vec<u8> {
+    let mut bytes = CanonicalWriter {
+        bytes: Vec::with_capacity(len),
+        len: 0,
+        counting: false,
+    };
+    crate::read_image::write_metadata_body(&mut bytes, body);
+    #[cfg(feature = "test-seams")]
+    crate::read_image::answer_encoded_for_test();
+    bytes.finish()
+}
+
 /// A deterministic, self-delimiting byte writer for canonical documents.
 #[derive(Default)]
 pub struct CanonicalWriter {
     bytes: Vec<u8>,
+    len: usize,
+    /// Measure only: count what would be written and keep none of it.
+    counting: bool,
 }
 
 impl CanonicalWriter {
+    /// A writer that measures a document's encoded length without keeping
+    /// its bytes.
+    pub fn counting() -> Self {
+        Self {
+            bytes: Vec::new(),
+            len: 0,
+            counting: true,
+        }
+    }
+
+    /// The bytes written, or counted, so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        self.len = self.len.saturating_add(bytes.len());
+        if !self.counting {
+            self.bytes.extend_from_slice(bytes);
+        }
+    }
+
     pub fn tag(&mut self, tag: u8) -> &mut Self {
-        self.bytes.push(tag);
+        self.put(&[tag]);
         self
     }
 
     pub fn count(&mut self, value: u64) -> &mut Self {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.put(&value.to_le_bytes());
         self
     }
 
@@ -391,7 +625,7 @@ impl CanonicalWriter {
 
     pub fn text(&mut self, text: &str) -> &mut Self {
         self.count(text.len() as u64);
-        self.bytes.extend_from_slice(text.as_bytes());
+        self.put(text.as_bytes());
         self
     }
 
@@ -407,7 +641,7 @@ impl CanonicalWriter {
 
     pub fn raw(&mut self, bytes: &[u8]) -> &mut Self {
         self.count(bytes.len() as u64);
-        self.bytes.extend_from_slice(bytes);
+        self.put(bytes);
         self
     }
 
@@ -595,7 +829,16 @@ fn validate_query_result(result: &CanonicalQueryResult) -> Result<(), ReadEncodi
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
-    encode_to_vec(value, standard()).map_err(|_| ReadEncodingError::InvalidPayload)
+    // Measured first and written once into a buffer of exactly that length.
+    // Growing the output by doubling would reserve up to twice a large answer
+    // and briefly hold the old and new buffers together while it copies.
+    let mut measured = bincode::enc::write::SizeWriter::default();
+    bincode::serde::encode_into_writer(value, &mut measured, standard())
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    let mut encoded = Vec::with_capacity(measured.bytes_written);
+    bincode::serde::encode_into_std_write(value, &mut encoded, standard())
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    Ok(encoded)
 }
 
 /// The decoder's own limit counts wire reads, and counts each integer field at

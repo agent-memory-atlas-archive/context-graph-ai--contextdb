@@ -36,26 +36,22 @@ fn author_local_bootstrap_schema(db: &Database) {
 
 /// Round-trip one locally-authored `DdlChange` through the same durable
 /// config codec the hub itself persists received/authoritative DDL through.
-/// `DdlChange`'s hand-written `Deserialize` cannot tell a bincode
-/// struct-variant record apart from a legacy three-field one, so it treats
-/// every codec round trip as legacy and drops the structured
-/// `foreign_keys`/`composite_foreign_keys`/`composite_unique` fields to
-/// empty. This is exactly the reduced shape a hub serves back to an edge
-/// pulling its full authoritative schema history, so it is the realistic
-/// input to build a `ReceivedDdlContext` from.
-fn hub_reduced_shape(change: &DdlChange) -> DdlChange {
+/// The codec is exact, so this is the authored declaration, foreign keys and
+/// composite keys included: the shape a hub serves back to an edge pulling
+/// its full authoritative schema history.
+fn hub_served_shape(change: &DdlChange) -> DdlChange {
     let encoded = RedbPersistence::encode_config_value(change).unwrap();
     RedbPersistence::decode_config_value(&encoded).unwrap()
 }
 
 /// Build the full-authoritative-history `ReceivedDdlContext` a hub would
-/// serve for the given already-hub-reduced DDL vector, authenticated from a
+/// serve for the given hub-served DDL vector, authenticated from a
 /// source node identity distinct from anything this edge authored locally.
 fn full_history_from_hub(
-    reduced_ddl: Vec<DdlChange>,
+    served_ddl: Vec<DdlChange>,
 ) -> (ChangeSet, crate::protocol::ReceivedDdlContext) {
     let source_lsn = Lsn(1);
-    let entries = reduced_ddl
+    let entries = served_ddl
         .iter()
         .enumerate()
         .map(|(ordinal, change)| {
@@ -74,13 +70,14 @@ fn full_history_from_hub(
                     table_generation,
                 )
                 .unwrap(),
+                author: None,
             }
         })
         .collect();
     (
         ChangeSet {
-            ddl_lsn: vec![source_lsn; reduced_ddl.len()],
-            ddl: reduced_ddl,
+            ddl_lsn: vec![source_lsn; served_ddl.len()],
+            ddl: served_ddl,
             ..ChangeSet::default()
         },
         crate::protocol::ReceivedDdlContext {
@@ -99,6 +96,7 @@ fn hub_receipt(received: &crate::protocol::ReceivedDdlContext) -> SyncApplyRecei
         incarnation: received.source_incarnation,
         source_lsn: Lsn(1),
         dependency_complete: true,
+        hub_contact_ms: None,
     }
 }
 
@@ -151,8 +149,8 @@ fn locally_bootstrapped_schema_reaches_zero_outbound_after_identical_full_histor
         "the bootstrap group is exactly the four authored statements"
     );
 
-    let reduced_ddl: Vec<DdlChange> = local_ddl.iter().map(hub_reduced_shape).collect();
-    let (changes, received) = full_history_from_hub(reduced_ddl);
+    let served_ddl: Vec<DdlChange> = local_ddl.iter().map(hub_served_shape).collect();
+    let (changes, received) = full_history_from_hub(served_ddl);
     apply_full_history(&db, &changes, &received).unwrap();
 
     assert_eq!(
@@ -184,8 +182,8 @@ fn divergent_local_schema_stays_pending_after_identical_full_history_pull() {
     )
     .unwrap();
 
-    let reduced_ddl: Vec<DdlChange> = bootstrap_ddl.iter().map(hub_reduced_shape).collect();
-    let (changes, received) = full_history_from_hub(reduced_ddl);
+    let served_ddl: Vec<DdlChange> = bootstrap_ddl.iter().map(hub_served_shape).collect();
+    let (changes, received) = full_history_from_hub(served_ddl);
     apply_full_history(&db, &changes, &received).unwrap();
 
     let assert_only_orphan_pending = |db: &Database, when: &str| {
@@ -249,8 +247,8 @@ fn mixed_local_schema_commit_stays_fully_pending() {
         .find(|ddl| matches!(ddl, DdlChange::CreateTable { name, .. } if name == "bootstrap_mixed_shared"))
         .cloned()
         .expect("the shared table must be among the committed DDL");
-    let reduced_ddl = vec![hub_reduced_shape(&shared_ddl)];
-    let (changes, received) = full_history_from_hub(reduced_ddl);
+    let served_ddl = vec![hub_served_shape(&shared_ddl)];
+    let (changes, received) = full_history_from_hub(served_ddl);
     apply_full_history(&db, &changes, &received).unwrap();
 
     let assert_whole_commit_pending = |db: &Database, when: &str| {
@@ -265,4 +263,91 @@ fn mixed_local_schema_commit_stays_fully_pending() {
     assert_whole_commit_pending(&db, "immediately after apply");
     let db = reopen(db, &path);
     assert_whole_commit_pending(&db, "after reopen");
+}
+
+#[test]
+fn a_hub_serves_the_foreign_keys_and_composite_keys_its_author_wrote() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().join("bootstrap-echo-exact-shape.redb");
+    let db = Database::open(&path).unwrap();
+    author_local_bootstrap_schema(&db);
+    let notes = |ddl: &[DdlChange]| {
+        ddl.iter()
+            .find_map(|change| match change {
+                DdlChange::CreateTable {
+                    name,
+                    foreign_keys,
+                    composite_unique,
+                    ..
+                } if name == "bootstrap_notes" => {
+                    Some((foreign_keys.clone(), composite_unique.clone()))
+                }
+                _ => None,
+            })
+            .expect("the authored CREATE TABLE is in schema history")
+    };
+    let authored = notes(&db.changes_since(Lsn(0)).ddl);
+    assert_eq!(authored.0.len(), 1, "the author wrote one foreign key");
+    assert_eq!(authored.0[0].child_column, "owner_id");
+    assert_eq!(
+        authored.1,
+        vec![vec!["tenant".to_string(), "slug".to_string()]]
+    );
+    let served: Vec<DdlChange> = db
+        .changes_since(Lsn(0))
+        .ddl
+        .iter()
+        .map(hub_served_shape)
+        .collect();
+    assert_eq!(
+        notes(&served),
+        authored,
+        "the served history is the authored one"
+    );
+    let db = reopen(db, &path);
+    assert_eq!(
+        notes(&db.changes_since(Lsn(0)).ddl),
+        authored,
+        "history read back from the store is the authored one"
+    );
+}
+
+#[test]
+fn schema_history_after_reopen_is_the_authored_record_not_current_metadata() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().join("bootstrap-echo-authored-history.redb");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE history_owners (id INTEGER PRIMARY KEY)",
+        &empty_params(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE history_notes (id INTEGER PRIMARY KEY)",
+        &empty_params(),
+    )
+    .unwrap();
+    db.execute(
+        "ALTER TABLE history_notes ADD COLUMN owner_id INTEGER REFERENCES history_owners(id)",
+        &empty_params(),
+    )
+    .unwrap();
+    let created_keys = |db: &Database| {
+        db.changes_since(Lsn(0))
+            .ddl
+            .iter()
+            .find_map(|change| match change {
+                DdlChange::CreateTable {
+                    name, foreign_keys, ..
+                } if name == "history_notes" => Some(foreign_keys.clone()),
+                _ => None,
+            })
+            .expect("the CREATE TABLE is in schema history")
+    };
+    assert!(created_keys(&db).is_empty(), "the CREATE declared no key");
+    let db = reopen(db, &path);
+    assert!(
+        created_keys(&db).is_empty(),
+        "a key added later by ALTER is never grafted onto the CREATE after reopen"
+    );
 }

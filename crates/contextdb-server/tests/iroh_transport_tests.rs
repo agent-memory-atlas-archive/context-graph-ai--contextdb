@@ -2362,23 +2362,19 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
         before_reconciliation.accepted_fragment_sequences,
         "reconciliation does not accept a second full upload"
     );
+    // A hub contact row no longer holds a page open (95382cc3 "pull: exclude hub contacts from
+    // page limit enforcement"), so the oversized page reports `has_more = false` and the client
+    // stops after the one over-frame reply: there is no separate empty terminal follow-up pull.
     let reconciliation_replies = &after_reconciliation.authenticated_pull_reply_bytes_after_reset;
-    let (terminal_reply, oversized_attempts) = reconciliation_replies
-        .split_last()
-        .expect("reconciliation reaches an ordinary terminal pull");
     assert!(
-        (1..=MAX_OVERSIZED_RECONCILIATION_ATTEMPTS).contains(&oversized_attempts.len()),
+        (1..=MAX_OVERSIZED_RECONCILIATION_ATTEMPTS).contains(&reconciliation_replies.len()),
         "the oversized reconciliation stays within the production five-attempt bound"
     );
     assert!(
-        oversized_attempts
+        reconciliation_replies
             .iter()
             .all(|bytes| *bytes > FRAME_CEILING),
-        "every pre-terminal reconciliation pull carries the unsplittable over-frame source-LSN group"
-    );
-    assert!(
-        *terminal_reply < FRAME_CEILING,
-        "the final pull is an ordinary empty terminal follow-up, not a split data page"
+        "every reconciliation pull carries the unsplittable over-frame source-LSN group"
     );
     assert_completed_oversized_response_lifecycle(&after_reconciliation, &edge_node_id);
     assert_eq!(
@@ -2913,6 +2909,13 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         "contextdb-engine/examples/custody_scale.rs",
         "contextdb-engine/tests/custody/server_resource_policy_contract_tests.rs",
         "contextdb-engine/tests/sync/sync_source_mirror_tests.rs",
+        // These sync suites bind a real localhost endpoint (an authenticated
+        // resumable schema-migration transfer, a policy-refusal replay, and
+        // the module declaration gating them behind the transport feature)
+        // to exercise the real authenticated transport contract directly.
+        "contextdb-engine/tests/sync/a_received_schema_transaction_never_publishes_a_prefix.rs",
+        "contextdb-engine/tests/sync/schema_migration_chunked_transport.rs",
+        "contextdb-engine/tests/sync/policy_refusal_outcome_and_replay.rs",
         // The test-estate ratchet audit names test FILES (including this one)
         // in its per-file sleep counts — filenames, not transport use.
         "contextdb-core/tests/test_estate_audit.rs",

@@ -19,7 +19,7 @@ fn pushed(r: &QueryResult) -> Vec<&str> {
 
 const FEWER: &str = "fewer predicate columns matched than chosen index";
 const FIRST: &str = "first column not in WHERE";
-const TIED: &str = "tied with chosen index; lost by creation order";
+const MORE_COLUMNS: &str = "more indexed columns than chosen index";
 
 fn reason<'a>(r: &'a QueryResult, name: &str) -> Option<&'a str> {
     r.trace
@@ -53,8 +53,8 @@ fn seed_edge(
 /// EXPLAIN tells a consumer why each competing index lost. On a DAG edges table with a composite
 /// UNIQUE constraint, the hop composite beats both automatic indexes and a hand-made index
 /// (fewer predicate columns) and the primary key (first column not in WHERE), and pushes every
-/// predicate so only the matching rows are read. When two composites tie, the one created later
-/// says it lost by creation order.
+/// predicate so only the matching rows are read. When two composites push the same prefix, the
+/// shorter declared key wins before creation order and the longer key says why it lost.
 #[test]
 fn acceptance_explain_says_why_each_competing_composite_index_lost() {
     let db = Database::open_memory();
@@ -176,13 +176,13 @@ fn acceptance_explain_says_why_each_competing_composite_index_lost() {
         "SELECT id FROM edges WHERE source_id IN ($s) AND context_id > $c ORDER BY id ASC";
     let tie_params = params(vec![("s", Value::Uuid(source)), ("c", Value::Uuid(cutoff))]);
     let r = tie.execute(tie_sql, &tie_params).unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_long"));
+    assert_eq!(r.trace.index_used.as_deref(), Some("idx_short"));
     assert_eq!(pushed(&r), vec!["source_id"]);
-    assert_eq!(reason(&r, "idx_short"), Some(TIED));
+    assert_eq!(reason(&r, "idx_long"), Some(MORE_COLUMNS));
 
     let explain = render_explain(&tie, tie_sql, &tie_params).unwrap();
-    assert!(explain.contains("idx_short: tied with chosen index; lost by creation order"));
-    assert!(explain.contains("idx_long"));
+    assert!(explain.contains("idx_long: more indexed columns than chosen index"));
+    assert!(explain.contains("idx_short"));
 }
 
 #[test]

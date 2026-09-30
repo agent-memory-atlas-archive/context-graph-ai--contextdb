@@ -22,8 +22,8 @@ of truth.
   conflict policy (`SYNC CONFLICT KEEP FIRST | KEEP LATEST`) over the Iroh transport — nodes
   reach each other by cryptographic identity, no broker installed by default. See
   [Architecture — Sync](architecture.md).
-  This release emits and accepts sync **protocol 7**. The supported skew window is the current
-  protocol plus the two previous **released** protocols.
+  This release emits and accepts only sync **protocol 7**. Envelopes using any other protocol
+  version are refused.
   <!-- enforced by: protocol_version_bump_tests::first_release_accepts_only_protocol_seven, protocol_version_bump_tests::every_noncurrent_envelope_is_rejected_by_encoding_and_decoding -->
 - **A durable work ledger and a media/blob plane**, both pure library surfaces today (no CLI
   flag): jobs/claims/leases for distributing work across machines, and content-addressed blob

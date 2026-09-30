@@ -231,8 +231,10 @@ a single row that cannot fit a page even alone refuses with `owner_limit_exceede
 closes the cursor automatically. Draining or closing past the end is never an error: a later
 `.cursor fetch` returns one empty success page (`rows: [], has_more: false`) and a later
 `.cursor close` succeeds as a no-op — so a fetch-until-empty loop always exits clean.
-`cursor_not_found` fires for a cursor that never existed, was explicitly closed, or belongs to
-another session. A mis-sized `.cursor fetch <n>` is the one refusal that does NOT end the read:
+`cursor_not_found` fires on either route when a cursor never existed, was explicitly closed, or
+belongs to another session. On the live-owner route only, if owner shutdown drains a cursor or its
+prepared page before delivery, the request instead receives `owner_not_serving`. A mis-sized
+`.cursor fetch <n>` is the one refusal that does NOT end the read:
 it is checked before any row is read, so nothing is consumed and the cursor keeps its place on
 both the direct-file and live-owner routes. Everything else that stops a cursor ends it and
 releases its snapshot and memory — exhaustion, `.cursor close`, `cursor_expired`, losing the
@@ -256,6 +258,16 @@ continuation state; they never use the SQL cursor: <!-- enforced by: read_cli_jo
 .tables [--continue <continuation>]
 .events status [--continue <continuation>]
 ```
+
+Each sink item reports `uncertain` separately from `delivered` and
+`permanent_failures`. It counts external attempts whose outcome could not be
+confirmed, including an attempt interrupted by a crash. A pending action may
+still be retried with the same action identity; this count does not assert that
+the recipient saw or did not see it. After an unclean exit, the file route may
+require a writable reopen to repair the store before any read-only file
+session can open. The owner route then reports the pending uncertainty before
+a sink callback is registered or delivery resumes. After a clean close, the
+file route reports the same history without a writer.
 
 `continuation` is a string exactly when `has_more` is true and `null` when it is false; a
 continuation is accepted only by the command that issued it (anything else refuses with
@@ -323,17 +335,14 @@ the only thing that variable can change.
 
 ---
 
-## Store Maintenance (`migrate` / `reset` / `diagnose` / `snapshot` / `inspect` / `purge`)
+## Store Maintenance (`reset` / `diagnose` / `snapshot` / `inspect` / `purge`)
 
-*This section describes today's shipped maintenance tools, carried forward — it is not part of
-the read-surface contract freeze; each tool's contract is re-decided when it is rebuilt over the
-read kernel.*
+*This section describes the maintenance subcommands and their operator contracts.*
 
 Operational subcommands are part of the one typed command tree and appear in ordinary `--help`.
 <!-- enforced by: read_cli_journeys_invocation::operational_commands_are_visible_in_ordinary_help_and_repair_is_gone -->
 
 ```
-contextdb migrate <PATH>
 contextdb reset <PATH> --force
 contextdb diagnose <PATH>
 contextdb snapshot export <PATH> <NEW_ARTIFACT> [--json]
@@ -345,20 +354,11 @@ contextdb purge <PATH> --table <TABLE> --force
 
 | Command | What it does |
 |---------|--------------|
-| `migrate <PATH>` | Bring a legacy-format store forward in place, backing up the original first. |
 | `reset <PATH> --force` | Recreate a wedged or corrupt store from scratch. Destructive. |
 | `diagnose <PATH>` | Report a store's format and schema layout read-only, never modifying it. |
 | `snapshot export <PATH> <NEW_ARTIFACT>` | Publish a transactionally consistent, purge-fenced backup artifact. |
 | `inspect <SUBCOMMAND> <SNAPSHOT_OR_DATABASE_PATH>` | Read durable key and media state from a snapshot artifact or database file. |
 | `purge <PATH> --table <TABLE> --force` | Force-gated whole-table authoritative erasure. |
-
-### `migrate` — bring a legacy-format root forward in place
-
-Writes a `<PATH>.bak` backup of the untouched original FIRST, reads every
-row/edge/vector/DDL statement out of the legacy root, writes it into a fresh current-format
-root, then performs the atomic swap. Refuses (leaving the path untouched) on a root that is
-already current-format; running it twice is a safe no-op. If migration fails partway, the
-original path is left as it was and the `.bak` backup remains.
 
 ### `reset --force` — recreate a wedged or corrupt root from scratch
 
@@ -369,9 +369,9 @@ from a backup or a healthy sync peer FIRST.
 ### `diagnose` — read-only diagnosis, never modifies
 
 Reads the store's format marker and top-level schema layout through a read-only handle and
-reports its diagnosis — current-format-and-readable, legacy-format, or corrupt/truncated —
-without ever opening the store read-write or writing to the path. A legacy-format root is not
-corrupt: its report points at `migrate`, never `reset`, and vice versa.
+reports whether the store is readable, was written by an earlier build, or is
+corrupt or truncated, without writing to the path. A store written by an earlier
+build is not read. Move it aside and create the store again.
 
 ### `snapshot export` — publish a purge-fenced backup
 
@@ -754,12 +754,36 @@ The channel lives in the per-user runtime directory (`$XDG_RUNTIME_DIR/contextdb
 `/run/user/<uid>` as the systemd fallback; `--owner-read-runtime-dir` overrides — required for
 containers and packaged services). That one directory serves BOTH sides: give the same
 `--owner-read-runtime-dir` (or `CONTEXTDB_OWNER_READ_RUNTIME_DIR`) to a reading session and it
-looks for the channel exactly where the writer put it. <!-- enforced by: read_cli_journeys_runtime_root::a_reader_given_the_writer_s_runtime_root_reaches_the_owner --> Owner-channel startup failure never fails the database open:
+looks for the channel exactly where the writer put it.
+<!-- enforced by: read_cli_journeys_runtime_root::a_reader_given_the_writer_s_runtime_root_reaches_the_owner -->
+Owner-channel startup failure never fails the database open:
 the writer keeps running and reports `not_serving` with one startup warning. Two distinct names
 for the two sides of that situation: `not_serving` is the serving STATE on the owner's own
 status surface; `owner_not_serving` is the refusal KIND an inspecting session receives when it
 tries to reach that owner — scripts branch on each in its own place.
 <!-- enforced by: read_cli_journeys_live_owner::owner_status_reports_the_serving_owner_as_control_data -->
+
+Reader breadcrumbs, retained-snapshot registrations, and erasure fences use the platform per-user
+directory when it is available; in a container without one, they use the supplied directory.
+A participant also inventories the supplied directory when configured, so a reader and writer
+using different channel directories still coordinate over the same physical database through the
+platform directory when it is available. Purge publication reaches every known candidate
+directory. An empty candidate directory alone never
+proves that there are no readers. If a candidate directory cannot be authenticated, reclamation
+or purge refuses with a typed reader-coordination error naming that directory; channel startup
+failure alone leaves the database open and reports `not_serving`.
+In a container without a platform runtime directory, the reader and writer may supply different
+channel directories. A direct reader keeps a byte-free advisory presence lock on the database
+file after its initial load lock releases. If the writer sees that lock but cannot find the
+reader's registration in any runtime directory it knows, ordinary opens and commits remain
+available with a conservative retention floor. Explicit storage reclamation and authoritative
+purge refuse with `ReaderCoordinationUnavailable`, naming the missing registration; they resume
+after the unknown reader exits. This preserves the channel-directory option without requiring a
+shared directory. The container must expose the same physical database file and support Linux
+open-file-description advisory locks for this journey. On other Unix systems without a common
+platform runtime root, ordinary writes retain a conservative floor and reclamation or purge
+refuses because reader inventory completeness cannot be proved.
+<!-- enforced by: reader_breadcrumbs_live_in_the_default_runtime_location::a_reader_given_an_override_publishes_in_the_default_runtime_location, authoritative_purge_reader_publication::supplied_reader_and_default_writer_share_erasure_publication, authoritative_purge_reader_publication::default_reader_and_supplied_writer_share_erasure_publication, authoritative_purge_reader_publication::an_unreadable_candidate_refuses_purge_without_blocking_database_open, authoritative_purge_reader_publication::an_unreadable_candidate_refuses_writer_reclamation_until_it_is_restored, authoritative_purge_reader_publication::different_roots_without_platform_root_refuse_unsafe_reclamation_and_purge, reader_continuity_contract::a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store -->
 
 ---
 
@@ -836,13 +860,19 @@ Every binary reports one of four codes:
 | `0` | Success. Every statement the run attempted succeeded. | A clean run, and any interactive session — it showed you each error as it happened, so the code reports the session rather than the statements inside it, exactly as `psql` and `sqlite3` do. |
 | `1` | Error. The invocation was valid; something in the run failed. | Every runtime refusal on this surface, any SQL or engine error, a failed meta-command, a definitive sync failure, a store that could not be opened or closed. |
 | `2` | Usage error. The invocation itself was wrong and nothing was attempted. | An unknown flag or missing argument, an unparseable flag value such as `--memory-limit 12Q`, an invalid limit relationship, or an incomplete combination such as `--tenant-id` with no `--sync-endpoint`. |
-| `3` | A `.sync push` was interrupted after sending and its outcome is unconfirmed — the hub never said whether it landed, so re-pushing is the safe move. | An interrupted push, including the automatic final push on exit. |
+| `3` | A `.sync push` was interrupted after sending and its outcome is unconfirmed — the hub never said whether it landed, so re-pushing is the safe move. | An interrupted push, including one that carries schema changes and the automatic final push on exit. <!-- enforced by: crates/contextdb-cli/src/repl.rs::interrupted_push_unconfirmed_maps_to_distinct_exit_code --> |
 
 Precedence: a definitive error (`1`) dominates an unconfirmed push (`3`), which dominates
 success (`0`). A usage error (`2`) is terminal before anything runs, so it never competes. A
 non-interactive session exits `1` when any statement was refused and `0` only when everything
 succeeded; an unconfirmed push still reports `3` even from an interactive session, because
 nobody can act on it once the process is gone.
+
+A script continues after a refused statement, including a memory or disk refusal. Independent
+statements still run. `SHOW MEMORY_LIMIT` / `SET MEMORY_LIMIT` and `SHOW DISK_LIMIT` /
+`SET DISK_LIMIT` remain available to inspect and raise an exhausted limit, but successful recovery
+does not erase the earlier error: that scripted run still exits `1`.
+<!-- enforced by: read_cli_journeys_script_continuation::a_memory_refusal_is_followed_by_independent_work_and_recovery, read_cli_journeys_script_continuation::a_disk_refusal_is_followed_by_independent_work_and_recovery, read_cli_journeys_script_continuation::a_refusal_through_the_translated_sync_inspection_route_still_continues -->
 
 ### Error Classification
 
@@ -859,7 +889,7 @@ teaching its recovery: <!-- enforced by: read_cli_journeys_machine_surface::ever
 | `held_by_writer` | io | A writer owns the store; a read session (drop `--write`) reaches its channel. The refusal names the store in `store_path` and, when the holder has published a record about itself, the holding process in `process_id`. |
 | `held_by_readers` | io | Readers hold the file during hydration; the refusal lists them or says to retry in a moment. |
 | `owner_not_running` | io | Rust `request_owner` was called on a direct-file route. |
-| `owner_not_serving` | io | A writer holds the store but has no usable inspection channel — including a writer that has claimed the store and not published its serving decision inside the caller's declared deadlines. |
+| `owner_not_serving` | io | A writer holds the store but has no usable inspection channel — including a writer that has claimed the store and not published its serving decision inside the caller's declared deadlines, or a draining owner that released the requested cursor/page before delivery. |
 | `owner_user_mismatch` | io | The owner belongs to a different operating-system user. |
 | `owner_mismatch` | io | The responder does not own this database/run. |
 | `owner_at_capacity` | io | Every reader slot is occupied; retry, close a session, or raise `--owner-read-concurrency`. |
@@ -873,7 +903,7 @@ teaching its recovery: <!-- enforced by: read_cli_journeys_machine_surface::ever
 | `cursor_transaction_active` | sql | `.cursor open` during an active write transaction. |
 | `cursor_invalid_statement` | usage | `.cursor open` received something other than one SELECT or SHOW VECTOR_PARTITIONS statement. |
 | `cursor_expired` | io | Idle or lifetime crossed (`detail` names which); reopen with `.cursor open`. |
-| `cursor_not_found` | io | The cursor never existed, was explicitly closed, or is another connection's (a drained cursor answers an empty success page instead). |
+| `cursor_not_found` | io | On either route, the cursor never existed, was explicitly closed, or is another session's (an exhausted cursor answers an empty success page instead). On the live-owner route only, a cursor/page drained during owner shutdown is `owner_not_serving`. |
 | `direct_read_requires_writer` | io | Safe decode found state needing a corrective writable open; close holders, rerun with `--write`. |
 | `operation_already_completed` | io | The local-channel operation had already produced its outcome before this poll reached it — an internal race guard, not a condition a caller triggers by any documented action. |
 | `owner_route_unsupported` | io | The requested inspection kind is not implemented over the live owner's channel (today: image-state metadata); the refusal names the kind and says a direct file session answers it once no writer holds the store. |

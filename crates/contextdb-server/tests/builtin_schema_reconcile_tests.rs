@@ -1,51 +1,12 @@
-//! The built-in tables that carry their own HISTORY / SYNC / RETAIN
-//! declaration in-DDL (`work_capabilities`, `peer_directory`,
-//! `work_node_contacts`, `work_inputs`) must gain that declaration on a
-//! root that predates it, not just on a freshly created root.
+//! Built-in table installers reconcile missing HISTORY, SYNC and RETAIN
+//! declarations on existing tables through ordinary ALTER TABLE.
 //!
-//! Each installer (`install_work_ledger_schema`, `install_peer_directory_
-//! schema`, `install_node_contacts_schema`) is idempotent-by-absence: it
-//! only ever `CREATE TABLE`s a table that does not exist yet, so an already-
-//! present table is never recreated with the newer DDL. The reconcile half
-//! (an `ALTER TABLE` run when the table exists but its `TableMeta` doesn't
-//! yet carry the declaration) is what closes that gap, and until this test
-//! it had no coverage proving it end to end on a real reopened root.
-//! `work_inputs`' `RETAIN 7 DAYS` reconcile is the same gap on a different
-//! axis: a root created before that declaration landed would otherwise keep
-//! every input copy forever.
-//!
-//! HONEST CONSTRUCTION NOTE: there is no old-shape binary fixture for this —
-//! all four declarations landed in the same work as the tables themselves,
-//! so no released build ever shipped them undeclared. The pre-declaration
-//! root below is built directly through the store's own DDL surface: the
-//! identical column list each installer's own `CREATE TABLE` constant
-//! carries, with the trailing `HISTORY` / `SYNC CONFLICT` / `SYNC OFF` /
-//! `RETAIN` clause stripped off. That is exactly the on-disk shape an older
-//! installer revision (one that had not yet learned to declare the table)
-//! would have produced — not a synthetic stand-in for it.
-//!
-//! NOW-TRUE INVARIANT: a gap on one of these four tables' declared policy
-//! can ONLY mean this — a root that predates the declaration, never "an
-//! operator (or a peer) just opted out." `refuse_engine_owned_policy_
-//! mutation` (`contextdb-engine/src/executor.rs`) refuses every LOCAL
-//! `ALTER TABLE` that would move one of these tables away from its declared
-//! shape, before any part of it is written; its arriving-sync-DDL mirror,
-//! `refuse_engine_owned_policy_sync_ddl` (`database.rs`), refuses the same
-//! mutation atomically for a whole sync batch, whether it arrives spelled as
-//! an `AlterTable` or as a `CreateTable` adopting an already-existing table;
-//! and the sync-apply merge (`engine_owned_merged_policy`) makes sure a
-//! silent axis on an arriving DDL PRESERVES the table's current declared
-//! value rather than clearing it, so an in-progress multi-step reconcile (or
-//! a dropped clause from an unguarded/older binary) never reads as an
-//! implicit opt-out either. Before these doors existed,
-//! `default_ttl_seconds.is_none()` / a missing `history_policy` /
-//! `conflict_policy` was ambiguous between "this legacy root" and "an
-//! operator (or a peer) just opted out" — and the reconcile arms below could
-//! not tell the two apart, so they silently re-declared the engine's policy
-//! over an operator's own explicit choice. See
-//! `crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs` for
-//! that door's own coverage; this file stays scoped to proving the
-//! reconcile heals a genuine legacy root end to end.
+//! The fixture uses each installer's canonical columns with policy clauses
+//! omitted. Installers create absent tables and reconcile present ones without
+//! recreating them. Policy guards refuse local or received attempts to clear an
+//! installed engine-owned policy, while received declarations that omit an axis
+//! preserve its current value. See engine_owned_ledger_policy_tests.rs for those
+//! guards; this file checks reconciliation after reopening the fixture.
 
 use contextdb_core::{ConflictPolicy, HistoryPolicy, SyncDirection, Value};
 use contextdb_engine::Database;
@@ -139,7 +100,7 @@ fn pre_declaration_root_gains_all_three_builtin_declarations_on_reopen() {
         db.close().expect("close pre-declaration root");
     }
 
-    // Reopen -- the same path a real upgraded root takes -- and run each
+    // Reopen the fixture and run each
     // installer exactly as its owning consumer does at startup. Every
     // installer sees its table already present and must reconcile it via
     // ALTER TABLE rather than skip it outright.
@@ -197,7 +158,7 @@ fn pre_declaration_root_gains_all_three_builtin_declarations_on_reopen() {
     assert_eq!(
         inputs.default_ttl_seconds,
         Some(7 * 24 * 60 * 60),
-        "work_inputs must gain RETAIN 7 DAYS on reconcile, an upgraded root must self-bound \
+        "work_inputs must gain RETAIN 7 DAYS on reconcile, the reconciled table must self-bound \
          its input copies exactly like a freshly created root does"
     );
 

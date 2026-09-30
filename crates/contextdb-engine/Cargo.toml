@@ -15,7 +15,7 @@ categories.workspace = true
 
 [features]
 in-process-test-seams = []
-test-seams = ["in-process-test-seams", "redb/test-seams", "contextdb-vector/test-seams"]
+test-seams = ["in-process-test-seams", "redb/test-seams", "contextdb-vector/test-seams", "contextdb-core/test-seams", "contextdb-tx/test-seams"]
 # Build-only validation facility used by the installed release smoke. It keeps
 # the real Iroh path and exposes only two fixed crash checkpoints; it does not
 # enable the broader test seam.
@@ -60,7 +60,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_bytes = "0.11"
 tracing.workspace = true
-redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb" }
+redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb", features = ["contextdb-internal"] }
 bincode = { workspace = true }
 smallvec = "1"
 time.workspace = true
@@ -108,6 +108,7 @@ toml = "0.8"
 [[test]]
 name = "integration"
 path = "../../tests/integration.rs"
+required-features = ["test-seams"]
 
 [[test]]
 name = "acceptance"
@@ -195,6 +196,21 @@ name = "indexed_row_memory_charge_measurement"
 path = "tests/indexed_row_memory_charge_measurement.rs"
 
 [[test]]
+name = "declared_memory_limit_bounds_a_writer"
+path = "tests/declared_memory_limit_bounds_a_writer.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "staged_predecode_row"
+path = "tests/staged_predecode_row.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "received_schema_metadata_peak"
+path = "tests/received_schema_metadata_peak.rs"
+required-features = ["test-seams"]
+
+[[test]]
 name = "memory_limit_admission_holds_for_vectors"
 path = "tests/memory_limit_admission_holds_for_vectors.rs"
 
@@ -209,6 +225,11 @@ path = "tests/text_memory_charge_measurement.rs"
 [[test]]
 name = "direct_file_image_memory_lifetime"
 path = "tests/direct_file_image_memory_lifetime.rs"
+required-features = ["test-seams"]
+
+[[test]]
+name = "history_request_memory"
+path = "tests/history_request_memory.rs"
 required-features = ["test-seams"]
 
 
@@ -347,6 +368,7 @@ path = "../../benches/trigger_throughput.rs"
 name = "version_cleanup_scaling"
 harness = false
 path = "../../benches/version_cleanup_scaling.rs"
+required-features = ["test-seams"]
 
 # Documentation recipe uses the ordinary authenticated transport.
 [[example]]

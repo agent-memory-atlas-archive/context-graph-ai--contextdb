@@ -36,9 +36,22 @@ fn p() -> HashMap<String, Value> {
     HashMap::new()
 }
 
-/// The counter `MEMORY_LIMIT` is enforced against.
+/// The counter `MEMORY_LIMIT` is enforced against, net of the durable
+/// writer's own retention.
+///
+/// This file's contracts are all of the form "the accountant lands exactly
+/// where it stood before any of this data existed" -- which is true of what a
+/// ROW costs and is not true of the store as a whole: the in-memory change
+/// log keeps the record of those rows having been written and expired, the
+/// commit index keeps one entry per commit, and Redb's page cache is charged
+/// for the life of the open. All three are memory the store is genuinely
+/// holding, and a declared limit now sees them; a proof about a row's own
+/// lifecycle has to read past them or it is measuring the log.
 fn charged(db: &Database) -> usize {
-    db.accountant().usage().used
+    db.accountant()
+        .usage()
+        .used
+        .saturating_sub(db.__durable_writer_charged_bytes_for_test())
 }
 
 /// Row payload derived from a seed, so no assertion can be satisfied by a

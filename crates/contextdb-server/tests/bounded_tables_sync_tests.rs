@@ -11,10 +11,14 @@
 //! moves through `Wallclock::test_clock_guard`; pruning is driven synchronously
 //! on the test thread.
 
-use contextdb_core::{TenantId, Value, Wallclock};
+use contextdb_core::{Error, TenantId, Value, Wallclock};
 use contextdb_engine::Database;
+use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
 use contextdb_engine::work_ledger::{BlobHash, MovementPolicy, install_work_ledger_schema};
 use contextdb_server::blob_resolver::BlobStore;
+use contextdb_server::protocol::{
+    DependencyCompletePullResponse, MessageType, PullResponse, decode,
+};
 use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
 use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::transport::{
@@ -24,6 +28,7 @@ use contextdb_server::{
     FabricIdentity, InProcessBroker, SyncClient, SyncServer, TransferDirection, TransferPlane,
     TransferReceipt,
 };
+use contextdb_tx::WriteSet;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -747,6 +752,100 @@ async fn c5_hub_ages_retained_rows_on_its_own_clock() {
 // Transfer receipts
 // ---------------------------------------------------------------------------
 
+struct RejectPulledCommit;
+
+impl DatabasePlugin for RejectPulledCommit {
+    fn pre_commit(&self, _ws: &WriteSet, source: CommitSource) -> contextdb_core::Result<()> {
+        if source == CommitSource::SyncPull {
+            return Err(Error::Other("injected pull commit failure".to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn c9_failed_pull_still_records_the_rows_and_payload_received_from_the_hub() {
+    let (_clock, _guard) = MockClock::install(T0);
+    let broker = InProcessBroker::new();
+    let hub = start_hub(&broker);
+    insert_notes(&hub.db, 1..2);
+
+    let temp = tempfile::TempDir::new().expect("edge tempdir");
+    let edge = Arc::new(
+        Database::open_with_plugin(temp.path().join("edge.db"), Arc::new(RejectPulledCommit))
+            .expect("open rejecting edge"),
+    );
+    edge.execute(RETAINED_DDL, &p())
+        .expect("edge retained table");
+    edge.execute(CONTROL_DDL, &p()).expect("edge control table");
+    let client = edge_client(&edge, &broker, "edge-rejected-pull");
+
+    let error = within(client.pull_default())
+        .await
+        .expect_err("receiver must reject the pulled commit");
+    assert!(
+        error.to_string().contains("injected pull commit failure"),
+        "the pull must expose the receiver's failed commit: {error}"
+    );
+    assert_eq!(row_count(&edge, "notes"), 0, "the row must not install");
+
+    let wire_rows: Vec<_> = broker
+        .recorded_exchanges()
+        .into_iter()
+        .filter(|exchange| exchange.subject == pull_subject(TENANT))
+        .flat_map(|exchange| {
+            let envelope = decode(&exchange.response_bytes).expect("decode pull reply");
+            let (ordinary, units) = match envelope.message_type {
+                MessageType::PullResponse => (
+                    rmp_serde::from_slice::<PullResponse>(&envelope.payload)
+                        .expect("decode ordinary pull reply"),
+                    Vec::new(),
+                ),
+                MessageType::DependencyCompletePullResponse => {
+                    let page: DependencyCompletePullResponse =
+                        rmp_serde::from_slice(&envelope.payload)
+                            .expect("decode dependency-complete pull reply");
+                    (page.ordinary, page.units)
+                }
+                other => panic!("pull returned {other:?}"),
+            };
+            std::iter::once(ordinary.changeset)
+                .chain(units)
+                .flat_map(|changes| changes.rows)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(wire_rows.len(), 1, "one note crossed the wire");
+    assert_eq!(wire_rows[0].table, "notes");
+    let wire_payload_bytes = rmp_serde::to_vec(&wire_rows[0].values)
+        .expect("serialize wire row values")
+        .len() as u64;
+    assert!(wire_payload_bytes > 0, "the row has a payload");
+
+    let hub_sent = receipt_for_role(
+        &hub.server.transfer_receipts(),
+        "edge-rejected-pull",
+        TransferPlane::Sync,
+        TransferDirection::Sent,
+    )
+    .counters
+    .clone();
+    assert_eq!(hub_sent.items, 1, "the hub sent the decoded row");
+    assert_eq!(hub_sent.payload_bytes, wire_payload_bytes);
+    let edge_received = receipt_for_role(
+        &client.transfer_receipts(),
+        HUB_NODE,
+        TransferPlane::Sync,
+        TransferDirection::Received,
+    )
+    .counters
+    .clone();
+    assert_eq!(edge_received.items, hub_sent.items);
+    assert_eq!(edge_received.payload_bytes, hub_sent.payload_bytes);
+
+    hub.stop().await;
+}
+
 #[tokio::test]
 async fn c9_sync_receipts_count_items_and_bytes_per_peer_and_direction() {
     let (_clock, _guard) = MockClock::install(T0);
@@ -858,6 +957,121 @@ async fn c9_client_receipts_record_both_directions_against_the_hub_node_id() {
             .iter()
             .all(|r| r.peer_node_id == fixture_node_id(HUB_NODE)),
         "the client talks to exactly one hub, so every receipt names it: {receipts:?}"
+    );
+
+    hub.stop().await;
+}
+
+/// A received receipt counts the rows in the hub's reply, including a row the
+/// edge's declared direction prevents it from installing.
+#[tokio::test]
+async fn c9_pull_receipt_counts_rows_excluded_by_the_edges_push_only_direction() {
+    let (_clock, _guard) = MockClock::install(T0);
+    let broker = InProcessBroker::new();
+    let hub = start_hub(&broker);
+    hub.db
+        .execute(
+            "CREATE TABLE uploads (id INTEGER PRIMARY KEY, body TEXT)",
+            &p(),
+        )
+        .expect("hub upload table");
+    insert_notes(&hub.db, 1..2);
+    let upload = HashMap::from([
+        ("id".to_string(), Value::Int64(1)),
+        (
+            "body".to_string(),
+            Value::Text("upload-on-the-wire".to_string()),
+        ),
+    ]);
+    hub.db
+        .execute(
+            "INSERT INTO uploads (id, body) VALUES ($id, $body)",
+            &upload,
+        )
+        .expect("hub upload row");
+
+    let edge = open_edge(None);
+    edge.execute(
+        "CREATE TABLE uploads (id INTEGER PRIMARY KEY, body TEXT) SYNC PUSH ONLY",
+        &p(),
+    )
+    .expect("edge push-only table");
+    let client = edge_client(&edge, &broker, "edge-wire-receipt");
+    within(client.pull_default()).await.expect("edge pull");
+
+    let mut wire_rows = Vec::new();
+    for exchange in broker
+        .recorded_exchanges()
+        .into_iter()
+        .filter(|exchange| exchange.subject == pull_subject(TENANT))
+    {
+        let envelope = decode(&exchange.response_bytes).expect("decode pull reply");
+        let (ordinary, units) = match envelope.message_type {
+            MessageType::PullResponse => (
+                rmp_serde::from_slice::<PullResponse>(&envelope.payload)
+                    .expect("decode ordinary pull reply"),
+                Vec::new(),
+            ),
+            MessageType::DependencyCompletePullResponse => {
+                let page: DependencyCompletePullResponse = rmp_serde::from_slice(&envelope.payload)
+                    .expect("decode dependency-complete pull reply");
+                (page.ordinary, page.units)
+            }
+            other => panic!("pull returned {other:?}"),
+        };
+        for row in std::iter::once(&ordinary.changeset)
+            .chain(units.iter())
+            .flat_map(|changes| changes.rows.iter())
+        {
+            wire_rows.push((
+                row.table.clone(),
+                rmp_serde::to_vec(&row.values)
+                    .expect("serialize row payload")
+                    .len() as u64,
+            ));
+        }
+    }
+    let mut wire_tables: Vec<_> = wire_rows.iter().map(|(table, _)| table.as_str()).collect();
+    wire_tables.sort_unstable();
+    assert_eq!(
+        wire_tables,
+        ["notes", "uploads"],
+        "both rows crossed the wire"
+    );
+    let wire_payload_bytes: u64 = wire_rows.iter().map(|(_, bytes)| bytes).sum();
+
+    assert_eq!(row_count(&edge, "notes"), 1, "the eligible row installs");
+    assert_eq!(
+        row_count(&edge, "uploads"),
+        0,
+        "the edge's push-only direction excludes the upload row"
+    );
+    let hub_receipts = hub.server.transfer_receipts();
+    let hub_sent = receipt_for_role(
+        &hub_receipts,
+        "edge-wire-receipt",
+        TransferPlane::Sync,
+        TransferDirection::Sent,
+    );
+    let edge_receipts = client.transfer_receipts();
+    let edge_received = receipt_for_role(
+        &edge_receipts,
+        HUB_NODE,
+        TransferPlane::Sync,
+        TransferDirection::Received,
+    );
+    assert_eq!(hub_sent.counters.items, 2, "the hub sent both rows");
+    assert_eq!(
+        hub_sent.counters.payload_bytes, wire_payload_bytes,
+        "hub sent bytes count the two wire row payloads"
+    );
+    assert_eq!(
+        edge_received.counters.items, hub_sent.counters.items,
+        "received items count every row sent over the wire"
+    );
+    assert_eq!(
+        edge_received.counters.payload_bytes, hub_sent.counters.payload_bytes,
+        "received payload bytes include the direction-excluded row"
     );
 
     hub.stop().await;
@@ -1344,6 +1558,7 @@ struct LoseAckAfterApply {
     push_subject: String,
     status_subject: String,
     confirmable: bool,
+    push_applied: AtomicBool,
     fail_reconciliation_pull: bool,
     after_push_apply: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -1395,6 +1610,7 @@ impl ClientTransport for LoseAckAfterApply {
             let inner = self.inner.clone();
             let subject = subject.to_string();
             let after_push_apply = self.after_push_apply.clone();
+            let push_applied = &self.push_applied;
             return Box::pin(async move {
                 // The hub applies and commits ...
                 let _ = inner
@@ -1403,13 +1619,17 @@ impl ClientTransport for LoseAckAfterApply {
                 if let Some(after_push_apply) = after_push_apply {
                     after_push_apply();
                 }
+                push_applied.store(true, Ordering::SeqCst);
                 // ... and then the acknowledgement is lost coming back.
                 Err(TransportError::Unreachable(
                     "ack lost after the hub committed the batch".to_string(),
                 ))
             });
         }
-        if !self.confirmable && subject == self.status_subject {
+        if !self.confirmable
+            && self.push_applied.load(Ordering::SeqCst)
+            && subject == self.status_subject
+        {
             return Box::pin(async {
                 Err(TransportError::Unreachable(
                     "hub status unreachable".to_string(),
@@ -1443,6 +1663,7 @@ fn lost_ack_client(
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable,
+            push_applied: AtomicBool::new(false),
             fail_reconciliation_pull: false,
             after_push_apply: None,
         }),
@@ -1466,6 +1687,7 @@ fn lost_ack_client_with_newer_hub_edit(
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable: true,
+            push_applied: AtomicBool::new(false),
             fail_reconciliation_pull,
             after_push_apply: Some(Arc::new(move || {
                 hub_db
@@ -1491,6 +1713,7 @@ fn lost_ack_client_with_failed_reconciliation_pull(
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable: true,
+            push_applied: AtomicBool::new(false),
             fail_reconciliation_pull: true,
             after_push_apply: None,
         }),
@@ -1838,6 +2061,7 @@ async fn lost_refusal_reply_keeps_original_diagnostics_after_a_newer_hub_edit() 
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable: true,
+            push_applied: AtomicBool::new(false),
             fail_reconciliation_pull: false,
             after_push_apply: Some(Arc::new(move || {
                 if !edited.swap(true, Ordering::SeqCst) {
@@ -1946,6 +2170,7 @@ async fn accepted_delete_replay_retires_only_its_adjudicated_work_across_reopen(
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable: true,
+            push_applied: AtomicBool::new(false),
             fail_reconciliation_pull: false,
             after_push_apply: Some(Arc::new(move || {
                 if !inserted.swap(true, Ordering::SeqCst) {

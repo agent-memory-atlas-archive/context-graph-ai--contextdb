@@ -372,8 +372,16 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
     let store = auto_vector_store(12_000);
     let query = "SELECT id FROM vector_budget_docs WHERE kind = 'eligible' \
                  ORDER BY embedding <=> '[1,0,0]' LIMIT 3";
+    // docs/cli.md declares active time as an independent per-read limit.
+    // This journey varies work and result limits over a large AUTO fallback,
+    // so give every invocation the same explicit active-time allowance.
+    let run_with_active_budget = |args: &[&str], script: &str| {
+        let mut args = args.to_vec();
+        args.extend(["--read-active-ms", "300000"]);
+        run(&args, script)
+    };
 
-    let writer = run(
+    let writer = run_with_active_budget(
         &[
             store.path_str(),
             "--write",
@@ -390,7 +398,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
         writer.describe()
     );
 
-    let reader = run(
+    let reader = run_with_active_budget(
         &[store.path_str(), "--json", "--read-work", "5000000"],
         &format!("{query};\n"),
     );
@@ -405,7 +413,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
     assert_eq!(rows_of(&writer_result), rows_of(&reader_result));
     assert_eq!(rows_of(&writer_result).len(), 3);
 
-    let writer_low_work = run(
+    let writer_low_work = run_with_active_budget(
         &[
             store.path_str(),
             "--write",
@@ -415,7 +423,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
         ],
         &format!("{query};\n"),
     );
-    let direct_low_work = run(
+    let direct_low_work = run_with_active_budget(
         &[store.path_str(), "--json", "--read-work", "50000"],
         &format!("{query};\n"),
     );
@@ -463,7 +471,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
         }
     }
 
-    let writer_result_refusal = run(
+    let writer_result_refusal = run_with_active_budget(
         &[
             store.path_str(),
             "--write",
@@ -477,7 +485,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
         ],
         &format!("{query};\n"),
     );
-    let direct_result_refusal = run(
+    let direct_result_refusal = run_with_active_budget(
         &[
             store.path_str(),
             "--json",
@@ -506,7 +514,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
     }
 
     let cursor_script = format!(".cursor open {query}\n.cursor fetch\n");
-    let writer_cursor = run(
+    let writer_cursor = run_with_active_budget(
         &[
             store.path_str(),
             "--write",
@@ -520,7 +528,7 @@ fn vector_work_and_result_refusals_match_between_writer_and_direct_file_sessions
         ],
         &cursor_script,
     );
-    let direct_cursor = run(
+    let direct_cursor = run_with_active_budget(
         &[
             store.path_str(),
             "--json",

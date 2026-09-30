@@ -363,6 +363,60 @@ and the row is still there. This is ratified engine behavior, not a bug to work 
 is arbitrated by the declared policy exactly like an upsert, so the fix is declaring the right
 policy up front (step 1), never retrying the push.
 
+## 8. Change a synced table deliberately
+
+Prerequisite: complete the hub/enrollment recipe above and use a writable edge session.
+
+1. Author the change with ordinary `ALTER TABLE`. Use explicit `DROP COLUMN` or `RENAME COLUMN`
+   when that is your intent; an omitted column in received partial ALTER metadata is preserved.
+2. Push from the author and pull on the receiving edge as in recipes 2–4. Drop and rename markers
+   travel with the authored DDL; receivers do not guess a rename from matching column types.
+3. Query the receiver using the new name. A rename preserves the values and vector index; a drop
+   removes that column's data. The change survives reopening the store.
+4. If a received `CREATE TABLE` has different columns from the existing table, inspect the
+   reported schema mismatch. It does not silently replace the receiver's existing table.
+<!-- enforced by: sql_surface_other::sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column, sql_surface_other::sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename, sql_surface_other::sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_operation, sql_surface_other::sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors_operation, sql_surface_other::sync_vector_rename_persists_row_image_across_reopen, tests/acceptance/schema_lifecycle.rs::f23_schema_mismatch_between_edge_and_server_is_detected, tests/integration/ddl_sync_tests.rs::ds10_schema_divergence_detected -->
+
+An authenticated push carries an authored `ALTER TABLE ... SET MAINTAIN COUNT` declaration to
+the hub. A peer without that schema capability holds back the affected table and reports the
+missing capability while other tables keep syncing; the table catches up once the peer supports
+it. The hub's writable handle then answers a matching exact `COUNT(*)`.
+<!-- enforced by: authenticated_sync_contract_tests::a_maintained_count_declaration_crosses_sync_or_holds_back_its_table -->
+
+This local scratch example shows the authoring syntax before you use it on your writable edge:
+
+```bash
+contextdb :memory: --json <<'SQL'
+CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);
+INSERT INTO notes VALUES (1, 'kept');
+ALTER TABLE notes RENAME COLUMN body TO content;
+SELECT content FROM notes;
+ALTER TABLE notes DROP COLUMN content;
+SELECT id FROM notes;
+SQL
+```
+
+Stdout:
+
+```json
+{"rows_affected":0}
+{"rows_affected":1}
+{"rows_affected":0}
+{"result":{"columns":["content"],"rows":[{"content":"kept"}]}}
+{"rows_affected":0}
+{"result":{"columns":["id"],"rows":[{"id":1}]}}
+```
+<!-- enforced by: tests/integration/alter_table_tests.rs::at06_rename_column_new_name_returns_data, tests/integration/alter_table_tests.rs::at07_rename_column_old_name_gone, sql_surface_other::sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_operation -->
+
+A synced row includes large committed columns even when the file-backed sender stores their
+bodies only on disk. You do not need to select those columns first to warm the sender's memory.
+<!-- enforced by: delivery_manifest_contract::a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_staging_path_and_is_never_served_to_a_pulling_peer -->
+
+Schema history is replayed per source transaction in author order, including intervening rows
+between a create and a later drop. An accepted migration can be retried after a lost reply
+without appending its DDL again.
+<!-- enforced by: tests/acceptance/trigger.rs::t3_sync_trigger_table_create_drop_history_replays_chronologically, schema_migration_chunked_transport::oversized_authenticated_schema_stays_invisible_until_one_commit_and_retry -->
+
 ## Per-table control
 
 Two independent axes, both per table.

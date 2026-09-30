@@ -137,9 +137,10 @@ impl TransactionalMemory {
         requested_region_size: Option<u64>,
         cache_size: usize,
         read_only: bool,
+        external_read: bool,
     ) -> Result<Self, DatabaseError> {
         assert!(page_size.is_power_of_two() && page_size >= DB_HEADER_SIZE);
-
+        assert!(!external_read || read_only);
         let region_size = requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE);
         let region_size = min(
             region_size,
@@ -226,12 +227,17 @@ impl TransactionalMemory {
         }
         let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
         let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
-
+        // Page size is fixed at creation for both native and external reads.
         assert_eq!(header.page_size() as usize, page_size);
-        assert!(storage.raw_file_len()? >= header.layout().len());
+        if !external_read {
+            assert!(storage.raw_file_len()? >= header.layout().len());
+        }
         let needs_recovery =
             header.recovery_required || header.layout().len() != storage.raw_file_len()?;
-        if needs_recovery {
+        // An externally pinned user root does not consult allocator/system
+        // state or select a root from this header. Its caller retains every
+        // reachable page, even while a different writer owns the file.
+        if needs_recovery && !external_read {
             if read_only {
                 return Err(DatabaseError::RepairAborted);
             }
@@ -252,9 +258,14 @@ impl TransactionalMemory {
                 .copy_from_slice(&header.to_bytes(true));
             storage.flush()?;
         }
-
+        // All remaining address calculations use this captured geometry.
         let layout = header.layout();
-        assert_eq!(layout.len(), storage.raw_file_len()?);
+        // Registered roots use fixed region/page geometry. A writer may grow
+        // the file after this header read, so its current length is not a
+        // consistency condition for the external reader's retained pages.
+        if !external_read {
+            assert_eq!(layout.len(), storage.raw_file_len()?);
+        }
         let region_size = layout.full_region_layout().len();
         let region_header_size = layout.full_region_layout().data_section().start;
         let state = InMemoryState::new(header);
@@ -776,6 +787,24 @@ impl TransactionalMemory {
         })
     }
 
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn get_page_window(
+        &self,
+        page: PageNumber,
+        range: std::ops::Range<usize>,
+        hint: PageHint,
+    ) -> Result<super::cached_file::PageMemory> {
+        let address = page.address_range(
+            self.page_size.into(),
+            self.region_size,
+            self.region_header_with_padding_size,
+            self.page_size,
+        );
+        let extent_len = usize::try_from(address.end - address.start).unwrap();
+        self.storage
+            .read_window(address.start, extent_len, range, hint)
+    }
+
     // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
     pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
         #[cfg(debug_assertions)]
@@ -1107,6 +1136,13 @@ impl TransactionalMemory {
 
         let result = self.storage.resize(new_layout.len());
         if result.is_err() {
+            if matches!(
+                &result,
+                Err(StorageError::Io(error))
+                    if error.kind() == std::io::ErrorKind::QuotaExceeded
+            ) {
+                return result;
+            }
             // TODO: it would be nice to have a more cohesive approach to setting this.
             // we do it in commit() & rollback() on failure, but there are probably other places that need it
             self.needs_recovery.store(true, Ordering::Release);
@@ -1156,6 +1192,36 @@ impl TransactionalMemory {
 
     pub(crate) fn get_page_size(&self) -> usize {
         self.page_size.try_into().unwrap()
+    }
+
+    /// Make the committed root readable by a read-only opener while this
+    /// backend remains alive for existing readers. The caller has already
+    /// stopped every writer and finished allocator-state housekeeping.
+    pub(crate) fn publish_read_only_handoff(&self) -> Result {
+        if self.needs_recovery.load(Ordering::Acquire) || thread::panicking() {
+            return Err(StorageError::Corrupted(
+                "cannot publish a read-only handoff before recovery completes".to_owned(),
+            ));
+        }
+        let mut state = self.state.lock()?;
+        self.storage.flush()?;
+        state.header.recovery_required = false;
+        self.write_header(&state.header)?;
+        self.storage.flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn read_only_handoff_is_clean(&self) -> bool {
+        !self.needs_recovery.load(Ordering::Acquire)
+            && self
+                .state
+                .lock()
+                .is_ok_and(|state| !state.header.recovery_required)
+    }
+
+    pub(crate) fn close_after_read_only_handoff(&self) -> Result {
+        debug_assert!(self.read_only_handoff_is_clean());
+        self.storage.close()
     }
 
     pub(crate) fn close(&self) -> Result {

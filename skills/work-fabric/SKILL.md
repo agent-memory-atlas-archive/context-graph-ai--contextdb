@@ -30,7 +30,7 @@ for the exact lines), or, inside a checkout of this repo, depend on the crates i
    — the job's input is a `blob_ref`, not inline data; go wire the blob plane instead of retrying
    `materialize_inputs`.
 7. **If a claim never proves out (stays `Won { synced: false }`)**, the hub was unreachable when
-   you claimed — that is provisional, not arbitrated; do not treat it as a confirmed win.
+   you claimed — that is provisional, not arbitrated; do not treat it as a confirmed win. <!-- enforced by: crates/contextdb-server/tests/work_ledger_tests.rs::offline_node_drains_its_own_job_and_reconciles_on_reconnect -->
 
 ## Two modules named `work_ledger` — pick the right one
 
@@ -55,7 +55,7 @@ The lifecycle events:
 - `submit_job` — the work exists
 - `insert_claim` — someone took it under a lease
 - `record_result` — completed, **exactly once**: a second call when a result row already exists is a
-  no-op `Ok`, so duplicate work is caught rather than double-recorded
+  no-op `Ok`, so duplicate work is caught rather than double-recorded <!-- enforced by: tests/integration/work_ledger_tests.rs::wl_e07_result_is_exactly_once_and_duplicate_writes_are_noops -->
 - `record_failure` — the failure row is what **legalizes the next attempt**
 - `cancel_job` — withdrawn
 
@@ -86,7 +86,7 @@ a store with the ledger schema installed.
 
 `JobSpec` is builder-only. Required identity is the job id, its work class, its mode and the
 submitting node; everything else defaults (no requirement tags, no inputs, priority `0`, no
-deadline, `max_attempts` 2).
+deadline, `max_attempts` 2). <!-- enforced by: crates/contextdb-engine/src/work_ledger.rs::jobspec_builder_defaults_are_sensible -->
 
 ```rust
 use contextdb_engine::work_ledger::{JobSpec, submit_job};
@@ -136,32 +136,37 @@ anything large enough that you'd rather move it once, node-to-node, hash-verifie
 
 **Inline (`ledger_input`) inputs are NOT kept until the job is terminal.** `work_inputs` declares
 `RETAIN 7 DAYS`, so a job's ledger-carried input copies age out on that window regardless of
-whether the job was ever claimed. `materialize_inputs` distinguishes a job that never declared
-ledger input (returns `Ok` with an empty result) from one whose input aged out (returns
-`Err(Error::WorkInputExpired { job_id })`) — a worker must handle the typed refusal rather than
+whether the job was ever claimed. <!-- enforced by: tests/integration/work_input_retention_tests.rs::a_never_claimed_jobs_input_copies_age_out_under_the_declared_window --> `materialize_inputs` distinguishes a job that never declared
+ledger input (returns `Ok` with an empty result) <!-- enforced by: tests/integration/work_input_retention_tests.rs::a_job_with_no_ledger_inputs_at_all_is_not_reported_as_expired --> from one whose input aged out (returns
+`Err(Error::WorkInputExpired { job_id })`) <!-- enforced by: tests/integration/work_input_retention_tests.rs::reading_an_expired_jobs_input_returns_a_typed_refusal_not_empty_bytes --> — a worker must handle the typed refusal rather than
 executing on silently-empty input. Submit and claim promptly if the job's inputs are inline.
 
 **The engine reserves NINE table names for this module and its siblings: `work_jobs`,
 `work_claims`, `work_results`, `work_failures`, `work_cancellations`, `work_inputs`,
 `work_capabilities`, `peer_directory`, `work_node_contacts`.** A `CREATE TABLE` of any of these
 nine names refuses unless your columns structurally match the owning installer's own declaration —
-you can't shadow a reserved name with an incompatible shape.
+you can't shadow a reserved name with an incompatible shape. <!-- enforced by: crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::create_table_work_capabilities_with_wrong_columns_refuses_locally, crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::create_table_of_each_other_work_ledger_reserved_name_with_wrong_columns_refuses_locally, crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::shape_refusal_does_not_claim_installer_exclusivity -->
 
 **What IS guarded on all nine today: the `SYNC CONFLICT` axis only.** A `SYNC CONFLICT` clause
 that mismatches the engine's own arbitration for that table refuses — on `CREATE`, on `ALTER`, and
 on the identical mutation arriving from a peer over sync (an explicit differing value refuses the
 whole sync batch; silence, or writing back the table's own current policy, is accepted — that is
 what a pre-declaration root looks like before its first reconcile, and what an honest restate looks
-like). `SHOW SYNC_CONFLICT_POLICY` renders the eight of these nine tables that actually carry a
-policy — `peer_directory` plus every work-ledger table except `work_node_contacts`, which declares
-none and so shows no row at all.
+like).
+For the five hub-refereed tables (`work_jobs`, `work_claims`, `work_results`, `work_failures`,
+`work_cancellations`), a mismatching conflict clause refuses on local `CREATE` <!-- enforced by: crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::local_create_of_each_hub_refereed_table_with_wrong_explicit_conflict_refuses -->,
+local `ALTER` <!-- enforced by: crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::hub_refereed_sync_conflict_refusal_names_only_the_conflict_axis -->,
+and received `CREATE` or `ALTER`. <!-- enforced by: crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::arriving_create_table_adopt_wrong_explicit_conflict_on_a_hub_refereed_table_refuses, crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::arriving_alter_table_wrong_explicit_conflict_on_a_hub_refereed_table_refuses -->
+`SHOW SYNC_CONFLICT_POLICY` renders the eight of these nine tables that actually carry a
+policy <!-- enforced by: crates/contextdb-engine/tests/engine/show_sync_conflict_policy_tests.rs::show_marks_every_engine_governed_work_ledger_table_engine_owned_with_its_true_arbitration, crates/contextdb-engine/tests/engine/show_sync_conflict_policy_tests.rs::show_marks_peer_directory_engine_owned_with_its_true_arbitration --> — `peer_directory` plus every work-ledger table except `work_node_contacts`, which declares
+none and so shows no row at all. <!-- enforced by: crates/contextdb-engine/tests/engine/show_sync_conflict_policy_tests.rs::work_node_contacts_never_appears_in_show_since_it_declares_no_conflict_policy -->
 
 **`work_inputs`, `work_capabilities`, `peer_directory`, and `work_node_contacts` are fully
 guarded** — every axis (`RETAIN`, `HISTORY`, sync-direction, `SYNC CONFLICT`) refuses a mismatching
 `ALTER TABLE`, locally and on arrival from a peer; restating the table's own already-declared value
 verbatim is accepted as a no-op, not a mismatch. `work_inputs`' own `RETAIN 7 DAYS` window is a
 real example of this: `ALTER TABLE work_inputs DROP RETAIN` and `ALTER TABLE work_inputs SET
-RETAIN 30 DAYS` both refuse today, naming `work_inputs` as engine-owned in the error. If your
+RETAIN 30 DAYS` both refuse today, naming `work_inputs` as engine-owned in the error. <!-- enforced by: crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::drop_retain_on_work_inputs_refuses_with_engine_owned_message, crates/contextdb-engine/tests/engine/engine_owned_ledger_policy_tests.rs::set_retain_to_a_different_window_on_work_inputs_also_refuses --> If your
 workload needs a different input-copy lifetime than 7 days, the sanctioned way is
 `run_input_retention`'s `grace_ms` argument, which you call on your own schedule — not an `ALTER
 TABLE` on `work_inputs`, which will refuse.
@@ -179,7 +184,7 @@ currently stops you.**
 
 `contextdb_server::work_ledger::claim_job` **claims by push**: it inserts a local claim row, pushes
 it, and the hub's conflict reply on the claim key *is* the arbitration verdict. Two workers racing
-for the same job resolve at the hub, not by a local guess.
+for the same job resolve at the hub, not by a local guess. <!-- enforced by: crates/contextdb-server/tests/installed_work_ledger_claim_race_tests.rs::two_installed_nodes_racing_one_claim_agree_on_the_holder, crates/contextdb-server/tests/work_ledger_tests.rs::two_workers_race_exactly_one_wins_and_one_result_exists -->
 
 ```rust
 use contextdb_server::work_ledger::claim_job;
@@ -189,10 +194,10 @@ let outcome = claim_job(&sync_client, "job-1", 1, "node-b", lease_deadline_ms, n
 
 **If the hub is unreachable the claim is held locally as `Won { synced: false }` rather than
 blocking.** That is deliberate — an offline node keeps working — but it means the claim is not yet
-arbitrated, and you should treat it as provisional.
+arbitrated, and you should treat it as provisional. <!-- enforced by: crates/contextdb-server/tests/work_ledger_tests.rs::offline_node_drains_its_own_job_and_reconciles_on_reconnect -->
 
 To run work rather than hand-drive it, implement `WorkExecutor` and use `poll_and_execute_once` or
-`run_worker_loop` with a `WorkerConfig`. The executor trait is the seam where your real work
+`run_worker_loop` with a `WorkerConfig`. <!-- enforced by: crates/contextdb-server/tests/work_ledger_tests.rs::worker_loop_polls_until_shutdown_and_executes_arriving_work --> The executor trait is the seam where your real work
 happens; everything around it is ledger bookkeeping.
 
 ## Move the bytes — the blob plane
@@ -218,10 +223,10 @@ blob_store.serve_on(&iroh_server);
 ```
 
 `ingest_file(&Path)` is the streaming sibling of `ingest_bytes`. Because the returned `BlobHash` is
-the hash of the bytes, ingesting the same content twice is a no-op.
+the hash of the bytes, <!-- enforced by: crates/contextdb-server/tests/media_transfer_tests.rs::ingest_round_trip_matches_blake3_identity --> ingesting the same content twice is a no-op.
 
 On the consumer side, fetching is async, node-to-node and **hash-verified — only bytes that hash to
-the requested `BlobHash` ever reach your sink**:
+the requested `BlobHash` ever reach your sink**: <!-- enforced by: crates/contextdb-server/tests/media_transfer_tests.rs::tampered_bytes_are_caught_by_hash_verify -->
 
 ```rust
 let mut sink = Vec::new();
@@ -241,10 +246,10 @@ mid-stream drop), so retrying it is reasonable where retrying those two is not.
 ## The entitlement rule — the actual security boundary
 
 **A consumer may fetch a blob only while it holds a *live* claim** — lease still ahead, that attempt
-not failed — **on a job whose inputs reference that blob's hash.**
+not failed — **on a job whose inputs reference that blob's hash.** <!-- enforced by: crates/contextdb-server/tests/media_transfer_tests.rs::holder_refuses_a_fetcher_whose_lease_has_expired_at_resolve, crates/contextdb-engine/tests/engine/blob_ref_ledger.rs::node_holds_claim_for_blob_tracks_live_claim_on_the_hashs_job -->
 
 This is checked **holder-side at serve time, before any payload bytes move**. The check is the gate,
-not an after-the-fact audit, and it is never trusted from the requester.
+not an after-the-fact audit, and it is never trusted from the requester. <!-- enforced by: crates/contextdb-server/tests/media_transfer_tests.rs::holder_refuses_unentitled_fetcher_by_authenticated_node_id -->
 
 There is also a local, identity-blind pre-check the consumer can run before dialing. **That is a
 round-trip optimization and nothing more — never treat it as the entitlement boundary.**
@@ -297,14 +302,14 @@ let bytes_written = blob_store
 ```
 
 **The ledger reserves `blob_ref` but does not resolve it.** `materialize_inputs` refuses a
-`blob_ref` input with `Error::InputRequiresBlobResolver` and points you at the blob resolver. The
+`blob_ref` input with `Error::InputRequiresBlobResolver` <!-- enforced by: crates/contextdb-engine/tests/engine/blob_ref_ledger.rs::materialize_inputs_surfaces_a_blob_ref_never_silent_empty --> and points you at the blob resolver. The
 ledger tracks that a job depends on a blob; the media plane moves the bytes.
 
 ## Reclaiming space
 
 `reclaim_unreferenced(now_ms, grace_ms)` frees a blob once every job referencing it is terminal past
-the grace window, or once no job references it at all. A later resolve against a reclaimed blob
-returns `BlobNotFound` — **even from an otherwise-entitled caller.** Budget your grace window
+the grace window, <!-- enforced by: crates/contextdb-server/tests/media_transfer_tests.rs::reclaim_deletes_an_unreferenced_blob_then_resolve_is_blob_not_found --> or once no job references it at all. A later resolve against a reclaimed blob
+returns `BlobNotFound` <!-- enforced by: crates/contextdb-server/tests/media_transfer_tests.rs::reclaim_deletes_an_unreferenced_blob_then_resolve_is_blob_not_found --> — **even from an otherwise-entitled caller.** Budget your grace window
 against your slowest worker, not your fastest.
 
 ## Transport

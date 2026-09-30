@@ -578,8 +578,7 @@ fn single_cli_error_line<'a>(stderr: &'a str, context: &str) -> &'a str {
     error_lines[0]
 }
 
-/// I pointed contextdb-cli at a 0.3.4 fixture file; the CLI printed a single Error: line that contained "sync" and
-/// "reimport" and exited non-zero, so an operator can act on the message without reading source.
+/// A store fixture written by an earlier build produces one actionable Error line and a nonzero exit.
 #[test]
 fn f116_cli_renders_legacy_vector_store_error_with_actionable_guidance() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -598,17 +597,12 @@ fn f116_cli_renders_legacy_vector_store_error_with_actionable_guidance() {
     let stderr = output_string(&output.stderr);
     let error_line = single_cli_error_line(&stderr, "legacy detection");
     assert!(
-        error_line.contains("legacy vector store")
-            || error_line.contains("LegacyVectorStoreDetected"),
-        "stderr must name the error; got: {stderr}"
+        error_line.contains("written by an earlier build") && error_line.contains("not read"),
+        "stderr must explain the refusal; got: {stderr}"
     );
     assert!(
-        error_line.contains("sync"),
-        "stderr must point at sync-from-peer recovery; got: {stderr}"
-    );
-    assert!(
-        error_line.contains("recreate") && error_line.contains("reimport"),
-        "stderr must point at recreate-and-reimport recovery; got: {stderr}"
+        error_line.contains("Move it aside and create the store again"),
+        "stderr must state the store creation remedy; got: {stderr}"
     );
 }
 
@@ -684,13 +678,23 @@ fn f118_cli_renders_unknown_vector_index_error() {
 fn f117b_cli_renders_memory_budget_exceeded_with_index_tag() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("budget.db");
-    // SET MEMORY_LIMIT before insert. The exact CLI / SQL surface for setting MEMORY_LIMIT is
-    // `SET MEMORY_LIMIT '4K'` per query-surface-spec; if that surface differs at Step 3, adjust.
+    // The setup budget must clear CREATE TABLE's own fixed charge before the intended statement
+    // (the INSERT) gets a chance to trip the refusal under test. The engine counts
+    // index postings and row side maps against the memory limit, and a table's primary-key index
+    // allocates a fixed 64 KiB exact-probe filter that is charged to MEMORY_LIMIT at CREATE TABLE
+    // time (measured here: 66088 bytes) — independent of the vector column's own dimension. A
+    // budget too small to cover that charge makes CREATE TABLE
+    // itself the refused statement, so the table never exists and the follow-on INSERT then fails
+    // with its own, unrelated `table not found: audio_clips` — two stderr lines instead of the one
+    // this test means to observe. `72K` (73728 bytes) leaves headroom (measured: ~4593 bytes
+    // available) after CREATE TABLE succeeds, and the INSERT's own vector body (measured: 8192
+    // bytes for this VECTOR(2048) literal) is what exceeds that remaining budget and trips the
+    // single refusal under test.
     let vector_literal = std::iter::repeat_n("1.0", 2048)
         .collect::<Vec<_>>()
         .join(",");
     let script = format!(
-        "SET MEMORY_LIMIT '4K';\n\
+        "SET MEMORY_LIMIT '72K';\n\
          CREATE TABLE audio_clips (id UUID PRIMARY KEY, vector_audio VECTOR(2048));\n\
          INSERT INTO audio_clips (id, vector_audio) VALUES \
          ('11111111-1111-1111-1111-111111111111', [{vector_literal}]);\n\
@@ -702,6 +706,8 @@ fn f117b_cli_renders_memory_budget_exceeded_with_index_tag() {
         "CLI must exit non-zero for vector memory budget exhaustion"
     );
     let stderr = output_string(&output.stderr);
+    // Exactly one refusal: the setup's CREATE TABLE succeeded under the 72K budget, so this is
+    // the INSERT's own refusal, not a `table not found` echo of a failed setup statement.
     let error_line = single_cli_error_line(&stderr, "memory budget exhaustion");
     assert!(
         error_line.to_lowercase().contains("memory"),
@@ -712,6 +718,12 @@ fn f117b_cli_renders_memory_budget_exceeded_with_index_tag() {
             && error_line.contains("audio_clips")
             && error_line.contains("vector_audio"),
         "Error line must render `@audio_clips.vector_audio` operation tag for budget attribution; got: {error_line}"
+    );
+    // Column attribution the accounting now reports: the memory subsystem/operation tag names
+    // the write path that consumed the budget, not just the bare table/column pair.
+    assert!(
+        error_line.contains("insert") || error_line.contains("vector_insert"),
+        "Error line must name the write operation that exhausted the budget; got: {error_line}"
     );
 }
 

@@ -15,9 +15,10 @@ together.
 Owns (`src/manager.rs`) `TransactionManager`: `begin`, `snapshot`,
 `with_write_set` / `with_write_set_detached`, `commit` / `commit_with_lsn` /
 `commit_with_reserved_lsn_callback`, `rollback`, LSN allocation, the commit
-index, and `CommitFailure`. Owns (`src/write_set.rs`) `WriteSet`,
+index, active-write-set inspection and drain, bounded commit-lock acquisition,
+and `CommitFailure`. Owns (`src/write_set.rs`) `WriteSet`,
 `WriteSetApplicator`, `RelationalDeletePredicate`, and
-`row_matches_delete_predicates`.
+`row_matches_delete_predicates`, including recorded admission bytes for staged rows.
 
 Must not own: what a write set means in storage (the applicator in the engine
 and store crates applies it), SQL, durability, or conflict policy. Never add a
@@ -47,13 +48,16 @@ second transaction manager beside this one.
 | A failed DDL LSN allocation does not advance `current_lsn` | `tests/tx_safety_tests.rs::tx_06_failed_ddl_lsn_allocation_does_not_advance_current_lsn` |
 | Prepare runs after the transaction is frozen; prepare, apply, and return see canonical final rows | `tests/tx_safety_tests.rs::tx_07_prepare_runs_after_transaction_is_frozen`, `::tx_08_prepare_apply_and_return_see_canonical_final_rows` |
 | After-apply publication precedes commit visibility | `tests/tx_safety_tests.rs::tx_09_after_apply_publication_precedes_commit_visibility` |
+| Staged rows settle their recorded admission across an index-set change | `crates/contextdb-engine/tests/declared_memory_limit_bounds_a_writer.rs::a_transaction_open_across_an_index_set_change_settles_the_rows_it_staged` |
+| Writable recovery truncates only uncommitted commit-index entries | `crates/contextdb-engine/tests/engine_seams/recover_uncommitted_commit_index_tail.rs::writable_recovery_truncates_only_commit_index_entries_past_the_committed_lsn` |
+| Bounded reads copy one complete published snapshot and LSN while a writer applies; cancellation and an advanced request clock wake a parked reader | `crates/contextdb-engine/tests/engine_seams/snapshot_visible_posting_membership_contract.rs::new_membership_root_cannot_expose_half_applied_row_vector_commit`, `src/manager.rs::commit_wait_tests::cancellation_wakes_a_commit_wait_before_the_writer_releases`, `src/manager.rs::commit_wait_tests::manual_deadline_advance_wakes_commit_wait_without_writer_release` |
 
 ## Where a change lives
 
 | Change | Where it lands |
 |---|---|
-| Commit, rollback, snapshot, LSN, or `TxId` assignment | `src/manager.rs` |
-| Write-set fields, emptiness, canonicalization | `src/write_set.rs` |
+| Commit, rollback, snapshot, LSN, `TxId`, active write sets or commit-lock access | `src/manager.rs` |
+| Write-set fields, emptiness, canonicalization or staged-row admission records | `src/write_set.rs` |
 | How a write set is applied to rows, edges, or vectors | The store crate that implements `WriteSetApplicator`, sequenced by the engine |
 | A new identifier newtype | Core crate `types.rs` — not here |
 

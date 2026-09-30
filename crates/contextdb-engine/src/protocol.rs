@@ -1,3 +1,4 @@
+#![allow(clippy::needless_update)] // Existing compatibility and test seam shape.
 use crate::error::SyncError;
 use contextdb_core::{
     CompositeForeignKey, Incarnation, Lsn, RowId, SingleColumnForeignKey, Value, VectorIndexRef,
@@ -69,6 +70,23 @@ pub struct PushRequest {
     pub incarnation: Incarnation,
 }
 
+/// A whole signed schema unit refused by the receiving hub's declared policy.
+/// This is an outcome, never an acceptance receipt or an applied watermark.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedSchemaUnitOutcome {
+    pub tenant_id: contextdb_core::TenantId,
+    pub pushing_node_id: String,
+    pub pushing_incarnation: Incarnation,
+    pub author_node_id: String,
+    pub author_incarnation: Incarnation,
+    pub source_ddl_lsn: Lsn,
+    pub unit_digest: [u8; 32],
+    pub hub_node_id: String,
+    pub hub_incarnation: Incarnation,
+    pub table: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct PushResponse {
     pub result: Option<WireApplyResult>,
@@ -80,19 +98,24 @@ pub struct PushResponse {
     pub outcomes: Vec<WireDeliveryOutcome>,
     #[serde(default)]
     pub hub_incarnation: Option<Incarnation>,
+    #[serde(default)]
+    pub refused_schema_units: Vec<RefusedSchemaUnitOutcome>,
 }
 
 // Populate ordinary response lanes without shifting optional slots.
 impl Serialize for PushResponse {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let has_outcomes = !self.outcomes.is_empty() || self.hub_incarnation.is_some();
+        let has_refusals = !self.refused_schema_units.is_empty();
+        let has_hub = self.hub_incarnation.is_some() || has_refusals;
+        let has_outcomes = !self.outcomes.is_empty() || has_hub;
         let has_application_error = self.application_error.is_some() || has_outcomes;
         let mut value = serializer.serialize_struct(
             "PushResponse",
             2 + usize::from(has_application_error)
                 + usize::from(has_outcomes)
-                + usize::from(self.hub_incarnation.is_some()),
+                + usize::from(has_hub)
+                + usize::from(has_refusals),
         )?;
         value.serialize_field("result", &self.result)?;
         value.serialize_field("error", &self.error)?;
@@ -102,8 +125,11 @@ impl Serialize for PushResponse {
         if has_outcomes {
             value.serialize_field("outcomes", &self.outcomes)?;
         }
-        if self.hub_incarnation.is_some() {
+        if has_hub {
             value.serialize_field("hub_incarnation", &self.hub_incarnation)?;
+        }
+        if has_refusals {
+            value.serialize_field("refused_schema_units", &self.refused_schema_units)?;
         }
         value.end()
     }
@@ -267,6 +293,65 @@ pub struct WireDdlProvenance {
     pub table_generation: Option<u64>,
     #[serde(with = "serde_bytes")]
     pub digest: Vec<u8>,
+    /// The schema author's own signed identity for this record. Authored DDL
+    /// carries it across every hop unchanged. A declaration received through
+    /// the unattested apply door has no author block and sets `unattested`.
+    #[serde(default)]
+    pub author: Option<WireDdlAuthor>,
+    /// The sender received this declaration through the unattested apply
+    /// door. It must preserve that trust class rather than claiming authorship.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattested: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The author's identity for one schema record: who wrote it, in which life
+/// of their database, and the source LSN, ordinal, table generation and
+/// canonical digest the author attested when it first sent the record. A
+/// forwarding peer carries this unchanged, so every later holder names the
+/// author, never the peer that happened to deliver it.
+///
+/// `unit_statements` is how many statements the author's source transaction
+/// (its node, incarnation and source LSN) holds. With the signed ordinal it
+/// fixes the author's complete unit and its order, so a peer that forwards
+/// the unit cannot drop, reorder or split its statements without every later
+/// receiver seeing it.
+///
+/// `attestation` is the author's own ed25519 signature over exactly those
+/// fields plus the statement itself, so a later holder checks authorship
+/// against the author's public key rather than trusting whichever peer
+/// delivered the record. It is the same signature shape the custody lane's
+/// schema dependency carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireDdlAuthor {
+    pub node_id: String,
+    pub incarnation: Incarnation,
+    pub source_ddl_lsn: Lsn,
+    pub ordinal: u32,
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub table_generation: Option<u64>,
+    #[serde(with = "serde_bytes")]
+    pub digest: Vec<u8>,
+    #[serde(default, with = "serde_bytes")]
+    pub attestation: Vec<u8>,
+    #[serde(default)]
+    pub unit_statements: u32,
+}
+
+/// Digest of the complete ordered signed author blocks. Each block already
+/// binds its statement bytes, generation, ordinal and authored unit length.
+pub(crate) fn authored_schema_unit_digest(
+    authors: &[&WireDdlAuthor],
+) -> Result<[u8; 32], SyncError> {
+    check_authored_units_whole_and_in_order(authors.iter().copied())?;
+    let bytes =
+        rmp_serde::to_vec(authors).map_err(|error| SyncError::Protocol(error.to_string()))?;
+    Ok(*blake3::hash(&bytes).as_bytes())
 }
 
 /// Private wire-to-apply handoff. The engine's public schema API never
@@ -286,6 +371,31 @@ pub(crate) struct ReceivedDdlEntry {
     pub table: Option<String>,
     pub table_generation: Option<u64>,
     pub digest: Vec<u8>,
+    /// The original author's identity when the sender forwarded this record;
+    /// `None` when the authenticated sender is itself the author.
+    pub author: Option<WireDdlAuthor>,
+}
+
+impl ReceivedDdlContext {
+    /// The author of `entry`: the signed identity the sender carried, whether
+    /// the sender wrote the schema or forwarded it.
+    pub(crate) fn author_of(&self, entry: &ReceivedDdlEntry) -> WireDdlAuthor {
+        // Every wire lane carries a signed author, checked before the unit
+        // reaches an install path. An in-crate context assembled without one
+        // names its authenticated sender and shows no signature, so anything
+        // it forwards is refused rather than believed.
+        entry.author.clone().unwrap_or_else(|| WireDdlAuthor {
+            attestation: Vec::new(),
+            unit_statements: 0,
+            node_id: self.source_node_id.clone(),
+            incarnation: self.source_incarnation,
+            source_ddl_lsn: entry.source_ddl_lsn,
+            ordinal: entry.ordinal,
+            table: entry.table.clone(),
+            table_generation: entry.table_generation,
+            digest: entry.digest.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -760,8 +870,223 @@ pub fn validate_wire_ddl_provenance(changeset: &WireChangeSet) -> Result<(), Syn
                 "DDL provenance at index {index} has a digest mismatch"
             )));
         }
+        // A declaration relayed from the unattested apply door stays marked
+        // unattested. An authenticated receiver refuses it below, with its
+        // table name, before constructing any received schema context.
+        if provenance.unattested {
+            if provenance.author.is_some() {
+                return Err(SyncError::Protocol(format!(
+                    "DDL provenance at index {index} is both unattested and signed"
+                )));
+            }
+            continue;
+        }
+        // Authored schema carries its author's own signature. This shape
+        // check precedes signature verification where the tenant is known.
+        let author = provenance.author.as_ref().ok_or_else(|| {
+            SyncError::Protocol(format!(
+                "DDL provenance at index {index} names no signed author"
+            ))
+        })?;
+        if author.node_id.is_empty()
+            || author.digest.len() != blake3::OUT_LEN
+            || author.table != provenance.table
+            || author.attestation.is_empty()
+        {
+            return Err(SyncError::Protocol(format!(
+                "DDL provenance at index {index} carries a malformed author identity"
+            )));
+        }
+        // The delivered generation is the one installed. A forwarding peer
+        // owns its own delivery position, never the schema instance the
+        // author wrote against.
+        if author.table_generation != provenance.table_generation {
+            return Err(SyncError::Protocol(format!(
+                "DDL provenance at index {index} delivers a table generation its author did not \
+                 sign"
+            )));
+        }
+    }
+    check_authored_units_whole_and_in_order(
+        changeset
+            .ddl_provenance
+            .iter()
+            .filter_map(|provenance| provenance.author.as_ref()),
+    )
+}
+
+/// Every author's source transaction in one delivery -- and in what a
+/// receiver stages from it -- arrives whole, once, and in the author's own
+/// statement order: its signed ordinals run 0, 1, ... up to the statement
+/// count the author signed, contiguously in the vector. A forwarding peer
+/// that reorders, drops or splits a signed unit is refused here before
+/// anything is staged, and so is a receiver that would stage part of one: its
+/// declared table policy refuses a whole transaction or none of it. Separate
+/// source transactions keep the order the delivering peer holds them in:
+/// per-table holdback legitimately lets a later unrelated unit through first.
+pub(crate) fn check_authored_units_whole_and_in_order<'a>(
+    authors: impl IntoIterator<Item = &'a WireDdlAuthor>,
+) -> Result<(), SyncError> {
+    // (author node, incarnation, source LSN, signed statement count, lowest
+    // ordinal the next statement may carry)
+    let mut open: Option<(&'a str, Incarnation, Lsn, u32, u32)> = None;
+    let mut delivered = HashSet::<(&'a str, Incarnation, Lsn)>::new();
+    let incomplete = |lsn: Lsn| {
+        SyncError::Protocol(format!(
+            "authenticated schema delivers only part of its author's source transaction at LSN {}",
+            lsn.0
+        ))
+    };
+    let out_of_order = |lsn: Lsn| {
+        SyncError::Protocol(format!(
+            "authenticated schema does not deliver its author's statements at LSN {} in the \
+             author's signed order",
+            lsn.0
+        ))
+    };
+    let in_place = |ordinal: u32, next: u32, count: u32| ordinal < count && ordinal == next;
+    for author in authors {
+        let unit = (
+            author.node_id.as_str(),
+            author.incarnation,
+            author.source_ddl_lsn,
+        );
+        match open.as_mut() {
+            Some((node, incarnation, lsn, count, next)) if (*node, *incarnation, *lsn) == unit => {
+                if author.unit_statements != *count || !in_place(author.ordinal, *next, *count) {
+                    return Err(out_of_order(*lsn));
+                }
+                *next = author.ordinal + 1;
+            }
+            _ => {
+                if let Some((_, _, lsn, count, next)) = open.take()
+                    && next != count
+                {
+                    return Err(incomplete(lsn));
+                }
+                if !delivered.insert(unit) {
+                    return Err(SyncError::Protocol(format!(
+                        "authenticated schema splits its author's source transaction at LSN {}",
+                        author.source_ddl_lsn.0
+                    )));
+                }
+                if !in_place(author.ordinal, 0, author.unit_statements) {
+                    return Err(out_of_order(author.source_ddl_lsn));
+                }
+                open = Some((
+                    unit.0,
+                    unit.1,
+                    unit.2,
+                    author.unit_statements,
+                    author.ordinal + 1,
+                ));
+            }
+        }
+    }
+    if let Some((_, _, lsn, count, next)) = open
+        && next != count
+    {
+        return Err(incomplete(lsn));
     }
     Ok(())
+}
+
+/// Check one schema record against the author it names: the author's own
+/// signature over the statement it sent, its position, and the schema
+/// generation it wrote against. A peer that forwards schema carries this block
+/// unchanged, so this holds at every hop, however many peers the record
+/// crossed and whatever session it last arrived on.
+pub(crate) fn verify_ddl_author_attestation(
+    tenant_id: &contextdb_core::TenantId,
+    ddl: &WireDdlChange,
+    author: &WireDdlAuthor,
+) -> Result<(), SyncError> {
+    if author.attestation.is_empty() {
+        return Err(SyncError::Protocol(
+            "authenticated schema provenance carries no author signature".to_string(),
+        ));
+    }
+    let attested = canonical_ddl_provenance_digest(
+        ddl,
+        author.source_ddl_lsn,
+        author.ordinal,
+        author.table.as_deref(),
+        author.table_generation,
+    )?;
+    if attested != author.digest {
+        return Err(SyncError::Protocol(
+            "authenticated schema provenance does not digest the statement its author attested"
+                .to_string(),
+        ));
+    }
+    let ddl_bytes = rmp_serde::to_vec(ddl)
+        .map_err(|err| SyncError::Protocol(format!("cannot encode authored DDL: {err}")))?;
+    let bytes = crate::custody::records::ddl_author_attestation_bytes(
+        tenant_id,
+        &author.node_id,
+        author.incarnation,
+        author.source_ddl_lsn,
+        author.ordinal,
+        author.unit_statements,
+        author.table.as_deref(),
+        author.table_generation,
+        &ddl_bytes,
+        &author.digest,
+    )
+    .map_err(|err| SyncError::Protocol(err.to_string()))?;
+    crate::identity::FabricIdentity::verify_lineage_by_node_id(
+        &author.node_id,
+        &bytes,
+        &author.attestation,
+    )
+    .map_err(|_| {
+        SyncError::Protocol(
+            "authenticated schema provenance does not verify for the author it names".to_string(),
+        )
+    })
+}
+
+/// The author block for one schema record, signed as `identity` the way an
+/// author's own send signs it. A fixture that stands in for a peer restating
+/// schema that peer authored uses this; no other way of making a block that
+/// verifies exists, which is the point.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn signed_ddl_author_for_test(
+    tenant_id: &contextdb_core::TenantId,
+    identity: &crate::identity::FabricIdentity,
+    incarnation: Incarnation,
+    ddl: &WireDdlChange,
+    provenance: &WireDdlProvenance,
+    unit_statements: u32,
+) -> Result<WireDdlAuthor, SyncError> {
+    let node_id = identity.node_id();
+    let ddl_bytes = rmp_serde::to_vec(ddl)
+        .map_err(|err| SyncError::Protocol(format!("cannot encode authored DDL: {err}")))?;
+    let bytes = crate::custody::records::ddl_author_attestation_bytes(
+        tenant_id,
+        &node_id,
+        incarnation,
+        provenance.source_ddl_lsn,
+        provenance.ordinal,
+        unit_statements,
+        provenance.table.as_deref(),
+        provenance.table_generation,
+        &ddl_bytes,
+        &provenance.digest,
+    )
+    .map_err(|err| SyncError::Protocol(err.to_string()))?;
+    Ok(WireDdlAuthor {
+        node_id,
+        incarnation,
+        source_ddl_lsn: provenance.source_ddl_lsn,
+        ordinal: provenance.ordinal,
+        table: provenance.table.clone(),
+        table_generation: provenance.table_generation,
+        digest: provenance.digest.clone(),
+        attestation: identity.sign_for_test(&bytes),
+        unit_statements,
+    })
 }
 
 /// Preserve validated schema identity across the wire-to-engine conversion.
@@ -782,6 +1107,22 @@ pub(crate) fn received_ddl_context(
             "DDL provenance requires an authenticated source node".to_string(),
         ));
     }
+    // The author's signature is checked before the unit can reach any install
+    // path, on every hop. A delivering peer's authenticated session says only
+    // who handed the record over, never who wrote it.
+    for (ddl, provenance) in changeset.ddl.iter().zip(changeset.ddl_provenance.iter()) {
+        if provenance.unattested {
+            return Err(SyncError::UnattestedReceivedSchema {
+                table: provenance.table.clone().unwrap_or_else(|| {
+                    wire_ddl_affected_table(ddl).unwrap_or("schema").to_string()
+                }),
+            });
+        }
+        let author = provenance.author.as_ref().ok_or_else(|| {
+            SyncError::Protocol("authenticated schema names no signed author".to_string())
+        })?;
+        verify_ddl_author_attestation(tenant_id, ddl, author)?;
+    }
     Ok(Some(ReceivedDdlContext {
         tenant_id: tenant_id.clone(),
         source_node_id: source_node_id.to_string(),
@@ -795,9 +1136,22 @@ pub(crate) fn received_ddl_context(
                 table: entry.table.clone(),
                 table_generation: entry.table_generation,
                 digest: entry.digest.clone(),
+                author: entry.author.clone(),
             })
             .collect(),
     }))
+}
+
+pub(crate) fn received_ddl_error(error: SyncError) -> contextdb_core::Error {
+    match error {
+        SyncError::UnattestedReceivedSchema { table } => {
+            contextdb_core::Error::ReceivedSchemaAuthorshipUnavailable {
+                table,
+                reason: "the declaration arrived without its author's signature".to_string(),
+            }
+        }
+        error => contextdb_core::Error::SyncError(error.to_string()),
+    }
 }
 
 impl From<RowChange> for WireRowChange {
@@ -1188,17 +1542,52 @@ impl From<WireConflict> for Conflict {
 /// carries the asking edge's per-life incarnation so the hub reads back the
 /// record for THIS life of the edge — a rebuilt edge (fresh incarnation) is
 /// answered `Lsn(0)`, never the prior life's stale-high watermark.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncStatusRequest {
     pub incarnation: Incarnation,
+    /// Exact candidate digests; bounded to 128 per authenticated request.
+    pub refused_schema_unit_digests: Vec<[u8; 32]>,
 }
 
-/// Reply on the per-tenant sync-status subject. This struct is NEW wire
-/// surface — old peers never see it (old servers are not subscribed; old
-/// clients never send the request). Both fields are `#[serde(default)]`
-/// Options from day one: absent = unknown = no regression detection = client
-/// behaves exactly as today.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+impl Serialize for SyncStatusRequest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut value = serializer.serialize_struct("SyncStatusRequest", 3)?;
+        value.serialize_field("incarnation", &self.incarnation)?;
+        // The custody status probe owns this tuple slot when it has a signed checkpoint.
+        value.serialize_field("checkpoint", &None::<()>)?;
+        value.serialize_field(
+            "refused_schema_unit_digests",
+            &self.refused_schema_unit_digests,
+        )?;
+        value.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SyncStatusRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Probe {
+            incarnation: Incarnation,
+            #[serde(default, rename = "checkpoint")]
+            _checkpoint: Option<serde::de::IgnoredAny>,
+            refused_schema_unit_digests: Vec<[u8; 32]>,
+        }
+        let Probe {
+            incarnation,
+            _checkpoint: _,
+            refused_schema_unit_digests,
+        } = Probe::deserialize(deserializer)?;
+        Ok(Self {
+            incarnation,
+            refused_schema_unit_digests,
+        })
+    }
+}
+
+/// Reply on the per-tenant sync-status subject. The exact digest acknowledgment
+/// binds refusal facts to the authenticated candidate request.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct SyncStatusResponse {
     /// The server's persisted per-tenant record of the highest edge-LSN it has
     /// applied (contract item 3 — rides `export_snapshot` artifacts).
@@ -1210,7 +1599,45 @@ pub struct SyncStatusResponse {
     // Ordinary status reports the current custody authority.
     #[serde(default)]
     pub hub_incarnation: Option<Incarnation>,
+    #[serde(default)]
+    pub refused_schema_units: Vec<RefusedSchemaUnitOutcome>,
+    /// Authenticated acknowledgment of exactly the requested candidate batch.
+    #[serde(default)]
+    pub refused_schema_unit_digests_ack: Option<Vec<[u8; 32]>>,
 }
+impl Serialize for SyncStatusResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let has_ack = self.refused_schema_unit_digests_ack.is_some();
+        let has_refusals = !self.refused_schema_units.is_empty() || has_ack;
+        let mut value = serializer.serialize_struct(
+            "SyncStatusResponse",
+            3 + usize::from(has_refusals) + usize::from(has_ack),
+        )?;
+        value.serialize_field("applied_push_watermark", &self.applied_push_watermark)?;
+        value.serialize_field("server_current_lsn", &self.server_current_lsn)?;
+        value.serialize_field("hub_incarnation", &self.hub_incarnation)?;
+        if has_refusals {
+            value.serialize_field("refused_schema_units", &self.refused_schema_units)?;
+        }
+        if has_ack {
+            value.serialize_field(
+                "refused_schema_unit_digests_ack",
+                &self.refused_schema_unit_digests_ack,
+            )?;
+        }
+        value.end()
+    }
+}
+
+/// One atomically persisted candidate pass. This is not an audit-history cursor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RefusedSchemaLookupCheckpoint {
+    pub candidate_fingerprint: [u8; 32],
+    pub hub_incarnation: Incarnation,
+    pub next_index: usize,
+}
+
 // Manifests live directly in the ordinary changeset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1486,4 +1913,120 @@ pub fn wire_row_lineages(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod refused_schema_wire_tests {
+    use super::*;
+
+    #[test]
+    fn empty_refusal_status_keeps_its_previous_wire_shape() {
+        #[derive(Serialize)]
+        struct PreviousResponse {
+            applied_push_watermark: Option<Lsn>,
+            server_current_lsn: Option<Lsn>,
+            hub_incarnation: Option<Incarnation>,
+        }
+        let response = SyncStatusResponse {
+            applied_push_watermark: Some(Lsn(4)),
+            server_current_lsn: Some(Lsn(9)),
+            hub_incarnation: Some(Incarnation(7)),
+            ..Default::default()
+        };
+        let bytes = rmp_serde::to_vec(&response).unwrap();
+        assert_eq!(
+            bytes,
+            rmp_serde::to_vec(&PreviousResponse {
+                applied_push_watermark: response.applied_push_watermark,
+                server_current_lsn: response.server_current_lsn,
+                hub_incarnation: response.hub_incarnation
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<SyncStatusResponse>(&bytes).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn exact_refusal_queries_share_the_custody_tuple_and_require_an_explicit_ack() {
+        let digests = vec![[7; 32], [19; 32]];
+        let request = SyncStatusRequest {
+            incarnation: Incarnation(7),
+            refused_schema_unit_digests: digests.clone(),
+            ..Default::default()
+        };
+        let bytes = rmp_serde::to_vec(&request).unwrap();
+        let probe: crate::custody::incarnation::StatusProbe =
+            rmp_serde::from_slice(&bytes).unwrap();
+        assert!(probe.checkpoint.is_none());
+        assert_eq!(probe.refused_schema_unit_digests, digests);
+        assert_eq!(
+            rmp_serde::from_slice::<SyncStatusRequest>(&rmp_serde::to_vec(&probe).unwrap())
+                .unwrap(),
+            request
+        );
+        let response = SyncStatusResponse {
+            hub_incarnation: Some(Incarnation(9)),
+            refused_schema_unit_digests_ack: Some(digests),
+            ..Default::default()
+        };
+        assert_eq!(
+            rmp_serde::from_slice::<SyncStatusResponse>(&rmp_serde::to_vec(&response).unwrap())
+                .unwrap(),
+            response
+        );
+        let old = SyncStatusResponse {
+            refused_schema_unit_digests_ack: None,
+            ..response
+        };
+        let decoded: SyncStatusResponse =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&old).unwrap()).unwrap();
+        assert!(decoded.refused_schema_unit_digests_ack.is_none());
+    }
+
+    #[test]
+    fn ordinary_status_probe_carries_an_empty_exact_lookup() {
+        #[derive(Serialize, Deserialize)]
+        struct ExactRequest {
+            incarnation: Incarnation,
+            checkpoint: Option<()>,
+            refused_schema_unit_digests: Vec<[u8; 32]>,
+        }
+        let current = SyncStatusRequest {
+            incarnation: Incarnation(7),
+            refused_schema_unit_digests: Vec::new(),
+        };
+        let bytes = rmp_serde::to_vec(&current).unwrap();
+        assert_eq!(
+            bytes,
+            rmp_serde::to_vec(&ExactRequest {
+                incarnation: Incarnation(7),
+                checkpoint: None,
+                refused_schema_unit_digests: Vec::new(),
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<SyncStatusRequest>(&bytes).unwrap(),
+            current
+        );
+        let exact = SyncStatusRequest {
+            refused_schema_unit_digests: vec![[7; 32]],
+            ..current
+        };
+        let server_probe: crate::custody::incarnation::StatusProbe =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&exact).unwrap()).unwrap();
+        assert!(server_probe.checkpoint.is_none());
+        assert_eq!(
+            server_probe.refused_schema_unit_digests,
+            exact.refused_schema_unit_digests
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<SyncStatusRequest>(&rmp_serde::to_vec(&server_probe).unwrap())
+                .unwrap(),
+            exact
+        );
+    }
 }

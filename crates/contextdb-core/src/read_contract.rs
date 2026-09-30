@@ -673,10 +673,13 @@ pub enum ReadFailureKind {
     /// Administrative custody inspection is unavailable through a constrained
     /// application-row handle because the answer is a whole metadata block.
     ConstrainedHandleInspectionRefused,
+    /// A completed read cannot cross the authoritative erasure publication
+    /// boundary for the snapshot it used.
+    AuthoritativeErasure,
 }
 
 impl ReadFailureKind {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::WriteRequiresFlag,
         Self::HeldByWriter,
         Self::HeldByReaders,
@@ -702,6 +705,7 @@ impl ReadFailureKind {
         Self::OwnerRouteUnsupported,
         Self::DeclaredPrincipalRefused,
         Self::ConstrainedHandleInspectionRefused,
+        Self::AuthoritativeErasure,
     ];
 
     pub const fn class(self) -> ReadFailureClass {
@@ -729,6 +733,7 @@ impl ReadFailureKind {
             | Self::DirectReadRequiresWriter
             | Self::DeclaredPrincipalRefused
             | Self::ConstrainedHandleInspectionRefused
+            | Self::AuthoritativeErasure
             | Self::StoreNotFound => ReadFailureClass::Io,
         }
     }
@@ -1039,6 +1044,9 @@ impl ReadFailureKind {
             }
             Self::ConstrainedHandleInspectionRefused => {
                 "this constrained handle cannot inspect the whole custody metadata block"
+            }
+            Self::AuthoritativeErasure => {
+                "authoritative erasure invalidated this completed read before publication"
             }
         }
     }

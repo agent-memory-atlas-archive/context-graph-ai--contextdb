@@ -28,7 +28,7 @@ use std::mem::size_of;
 use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::{panic, thread};
+use std::{io, panic, thread};
 
 const MAX_PAGES_PER_COMPACTION: usize = 1_000_000;
 
@@ -858,6 +858,7 @@ pub struct WriteTransaction {
     two_phase_commit: bool,
     shrink_policy: ShrinkPolicy,
     quick_repair: bool,
+    deferred_free_budget: (usize, usize),
     // All transaction-local savepoint lifecycle state. See
     // `SavepointTransactionState` for the commit/abort contract.
     savepoint_state: Mutex<SavepointTransactionState>,
@@ -876,8 +877,16 @@ impl WriteTransaction {
         let system_page = mem.get_system_root();
 
         let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
+        #[cfg(feature = "test-seams")]
+        let tables = {
+            let mut tables = tables;
+            tables.table_tree.table_write_observer =
+                transaction_tracker.table_write_observer.clone();
+            tables
+        };
         let system_tables = SystemNamespace::new(system_page, guard.clone(), mem.clone());
 
+        let deferred_free_budget = transaction_tracker.deferred_free_budget;
         Ok(Self {
             transaction_tracker,
             mem: mem.clone(),
@@ -890,9 +899,41 @@ impl WriteTransaction {
             durability: InternalDurability::Immediate,
             two_phase_commit: false,
             quick_repair: false,
+            deferred_free_budget,
             shrink_policy: ShrinkPolicy::Default,
             savepoint_state: Mutex::new(SavepointTransactionState::default()),
         })
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn record_table_write_for_test(
+        &self,
+        table: &str,
+        operation: crate::TableWriteOperationForTest,
+        key: &[u8],
+        value_bytes: usize,
+    ) {
+        crate::table_write_observer::record(
+            &self.transaction_tracker.table_write_observer,
+            table,
+            operation,
+            key,
+            value_bytes,
+        );
+    }
+
+    /// Override this commit's inherited deferred reclamation limits. The first
+    /// argument counts allocated extents, which may span multiple physical pages;
+    /// the second counts free-list entries, including empty lists.
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn set_deferred_free_budget(&mut self, extents: usize, entries: usize) {
+        self.deferred_free_budget = (extents, entries);
+    }
+
+    // Explicit whole-file compaction retains its upstream full-drain semantics.
+    pub(crate) fn reclaim_all_deferred_pages(&mut self) {
+        self.deferred_free_budget = (usize::MAX, usize::MAX);
     }
 
     pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
@@ -1378,6 +1419,28 @@ impl WriteTransaction {
         self.tables.lock().unwrap().open_table(self, definition)
     }
 
+    /// Return the finalized root header of a user table after its open handles
+    /// have been dropped. A caller can bind this physical root in another table
+    /// before the same transaction commits. An empty or absent table has no root.
+    #[doc(hidden)]
+    pub fn table_root_fingerprint<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Option<[u8; 32]>, TableError> {
+        let mut tables = self.tables.lock().unwrap();
+        tables.table_tree.flush_table_root_updates()?;
+        let table = tables
+            .table_tree
+            .get_table::<K, V>(definition.name(), TableType::Normal)?;
+        Ok(match table {
+            Some(InternalTableDefinition::Normal { table_root, .. }) => {
+                table_root.map(BtreeHeader::to_le_bytes)
+            }
+            Some(InternalTableDefinition::Multimap { .. }) => unreachable!(),
+            None => None,
+        })
+    }
+
     /// Open the given table
     ///
     /// The table will be created if it does not exist
@@ -1438,7 +1501,23 @@ impl WriteTransaction {
         let name = definition.name().to_string();
         // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
         drop(definition);
-        self.tables.lock().unwrap().delete_table(self, &name)
+        #[cfg(not(feature = "test-seams"))]
+        {
+            self.tables.lock().unwrap().delete_table(self, &name)
+        }
+        #[cfg(feature = "test-seams")]
+        {
+            let result = self.tables.lock().unwrap().delete_table(self, &name);
+            if matches!(result, Ok(true)) {
+                self.record_table_write_for_test(
+                    &name,
+                    crate::TableWriteOperationForTest::DeleteTable,
+                    &[],
+                    0,
+                );
+            }
+            result
+        }
     }
 
     /// Delete the given table
@@ -1495,11 +1574,36 @@ impl WriteTransaction {
             self.two_phase_commit = true;
         }
 
+        #[cfg(feature = "test-seams")]
+        let mut span_started = std::time::Instant::now();
         let (user_root, allocated_pages, data_freed) =
             self.tables.lock().unwrap().table_tree.flush_and_close()?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span_count();
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::FlushAndClose,
+                span_started.elapsed().as_nanos() as u64,
+            );
+            span_started = std::time::Instant::now();
+        }
 
+        let allocated_pages: Vec<_> = allocated_pages.into_iter().collect();
+        // Everything from here to the end of the commit is the commit's own
+        // system-table bookkeeping, and the pages it copies belong to the next
+        // commit's freed list rather than to the one just taken.
+        #[cfg(feature = "test-seams")]
+        let restore_tag = {
+            crate::commit_work::observe_commit(data_freed.len(), allocated_pages.len());
+            crate::commit_work::set_tag(crate::commit_work::TAG_COMMIT_BOOKKEEPING)
+        };
         self.store_data_freed_pages(data_freed)?;
-        self.store_allocated_pages(allocated_pages.into_iter().collect())?;
+        self.store_allocated_pages(allocated_pages)?;
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_commit_span(
+            crate::commit_work::CommitSpan::StorePageLists,
+            span_started.elapsed().as_nanos() as u64,
+        );
 
         #[cfg(feature = "logging")]
         debug!(
@@ -1510,6 +1614,9 @@ impl WriteTransaction {
             InternalDurability::None => self.non_durable_commit(user_root)?,
             InternalDurability::Immediate => self.durable_commit(user_root)?,
         }
+
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::set_tag(restore_tag);
 
         self.savepoint_state
             .lock()
@@ -1653,11 +1760,21 @@ impl WriteTransaction {
     }
 
     pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
+        #[cfg(feature = "test-seams")]
+        let mut span_started = std::time::Instant::now();
         let free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
             .map_or(self.transaction_id, |x| x.next());
         self.process_freed_pages(free_until_transaction)?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::ProcessFreedPages,
+                span_started.elapsed().as_nanos() as u64,
+            );
+            span_started = std::time::Instant::now();
+        }
 
         let mut system_tables = self.system_tables.lock().unwrap();
         let system_freed_pages = system_tables.system_freed_pages();
@@ -1706,6 +1823,14 @@ impl WriteTransaction {
         }
 
         let system_root = system_tree.finalize_dirty_checksums()?;
+        #[cfg(feature = "test-seams")]
+        {
+            crate::commit_work::observe_commit_span(
+                crate::commit_work::CommitSpan::SystemTree,
+                span_started.elapsed().as_nanos() as u64,
+            );
+            span_started = std::time::Instant::now();
+        }
 
         self.mem.commit(
             user_root,
@@ -1714,6 +1839,11 @@ impl WriteTransaction {
             self.two_phase_commit,
             self.shrink_policy,
         )?;
+        #[cfg(feature = "test-seams")]
+        crate::commit_work::observe_commit_span(
+            crate::commit_work::CommitSpan::StorageCommit,
+            span_started.elapsed().as_nanos() as u64,
+        );
 
         // Mark any pending non-durable commits as fully committed.
         self.transaction_tracker.clear_pending_non_durable_commits();
@@ -1854,10 +1984,23 @@ impl WriteTransaction {
     /// Old committed pages enter ordinary reader-fenced deferred reclamation.
     #[doc(hidden)]
     pub fn compact_step(
+        self,
+        cursor: &mut CompactionCursor,
+        maximum: usize,
+        admit: impl FnMut(usize) -> std::io::Result<()>,
+    ) -> Result<CompactionProgress, crate::CompactionError> {
+        self.compact_step_with_hook(cursor, maximum, admit, |_| Ok(()))
+    }
+
+    /// Publish a relocation batch after the caller has bound any table-root
+    /// fingerprints changed by page movement in this same transaction.
+    #[doc(hidden)]
+    pub fn compact_step_with_hook(
         mut self,
         cursor: &mut CompactionCursor,
         maximum: usize,
         mut admit: impl FnMut(usize) -> std::io::Result<()>,
+        on_batch: impl FnOnce(&Self) -> Result<(), StorageError>,
     ) -> Result<CompactionProgress, crate::CompactionError> {
         assert!(maximum > 0);
         if self.transaction_tracker.any_savepoint_exists() {
@@ -1869,6 +2012,7 @@ impl WriteTransaction {
         let mut next = cursor.clone();
         next.active = true;
         let progress = self.compact_page_batch(&mut next, maximum, &mut admit)?;
+        on_batch(&self)?;
         self.commit_compaction_frees()
             .map_err(|e| e.into_storage_error())?;
         *cursor = next;
@@ -1956,43 +2100,190 @@ impl WriteTransaction {
     // NOTE: must be called before store_system_freed_pages() during commit, since this can create
     // more pages freed by the current transaction
     fn process_freed_pages(&mut self, free_until: TransactionId) -> Result {
-        // We assume below that PageNumber is length 8
-        assert_eq!(PageNumber::serialized_size(), 8);
-
-        // Handle the data freed tree
-        let mut system_tables = self.system_tables.lock().unwrap();
-        {
-            let mut data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
-            let key = TransactionIdWithPagination {
-                transaction_id: free_until.raw_id(),
-                pagination_id: 0,
+        let (pages, entries) = self.deferred_free_budget;
+        // Give each tree half the shared cap. The odd unit follows the oldest
+        // durable pending key, so a one-unit budget cannot starve either tree
+        // across reopen or arbitrarily many aborted transactions. Newly created
+        // bookkeeping entries sort after the work already waiting.
+        let extra_for_data = if pages % 2 != 0 || entries % 2 != 0 {
+            let mut tables = self.system_tables.lock().unwrap();
+            let mut oldest = |definition: SystemTableDefinition<
+                TransactionIdWithPagination,
+                PageList,
+            >|
+             -> Result<Option<(u64, u64)>> {
+                let table = tables.open_system_table(self, definition)?;
+                Ok(table.tree.first()?.map(|(key, _)| {
+                    let key = key.value();
+                    (key.transaction_id, key.pagination_id)
+                }))
             };
-            for entry in data_freed.extract_from_if(..key, |_, _| true)? {
-                let (_, page_list) = entry?;
-                for i in 0..page_list.value().len() {
-                    self.mem
-                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore);
-                }
+            let data = oldest(DATA_FREED_TABLE)?;
+            let system = oldest(SYSTEM_FREED_TABLE)?;
+            match (data, system) {
+                (Some(data), Some(system)) => data <= system,
+                (Some(_), None) => true,
+                _ => false,
             }
-        }
-
-        // Handle the system freed tree
+        } else {
+            false
+        };
+        let data_pages = pages / 2 + usize::from(extra_for_data) * (pages % 2);
+        let data_entries = entries / 2 + usize::from(extra_for_data) * (entries % 2);
+        let (data_pages_left, data_entries_left) = self.process_freed_pages_bounded(
+            free_until,
+            DATA_FREED_TABLE,
+            data_pages,
+            data_entries,
+        )?;
+        let (system_pages_left, system_entries_left) = self.process_freed_pages_bounded(
+            free_until,
+            SYSTEM_FREED_TABLE,
+            pages - data_pages,
+            entries - data_entries,
+        )?;
+        // The first pass gives both trees their fair share. If one has no
+        // eligible work, lend its unused capacity to the other without ever
+        // exceeding either caller-owned total budget.
+        let pages_left = data_pages_left + system_pages_left;
+        let entries_left = data_entries_left + system_entries_left;
+        if pages_left == 0 || entries_left == 0 || (pages_left == pages && entries_left == entries)
         {
-            let mut system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
-            let key = TransactionIdWithPagination {
-                transaction_id: free_until.raw_id(),
-                pagination_id: 0,
-            };
-            for entry in system_freed.extract_from_if(..key, |_, _| true)? {
-                let (_, page_list) = entry?;
-                for i in 0..page_list.value().len() {
-                    self.mem
-                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore);
-                }
-            }
+            return Ok(());
         }
-
+        let (pages_left, entries_left) = self.process_freed_pages_bounded(
+            free_until,
+            DATA_FREED_TABLE,
+            pages_left,
+            entries_left,
+        )?;
+        if pages_left > 0 && entries_left > 0 {
+            self.process_freed_pages_bounded(
+                free_until,
+                SYSTEM_FREED_TABLE,
+                pages_left,
+                entries_left,
+            )?;
+        }
         Ok(())
+    }
+
+    fn process_freed_pages_bounded(
+        &self,
+        free_until: TransactionId,
+        definition: SystemTableDefinition<TransactionIdWithPagination, PageList>,
+        mut pages_remaining: usize,
+        mut entries_remaining: usize,
+    ) -> Result<(usize, usize)> {
+        let mut system_tables = self.system_tables.lock().unwrap();
+        let mut freed = system_tables.open_system_table(self, definition)?;
+        while pages_remaining > 0 && entries_remaining > 0 {
+            let next = freed.tree.first()?.map(|(key, _)| key.value());
+            let Some(key) = next else { break };
+            if key.transaction_id >= free_until.raw_id() {
+                break;
+            }
+            // Only one B-tree value is resident. Mutate its count in place in
+            // the transaction's copy-on-write leaf; the retained prefix is a
+            // durable continuation across committed writes and restarts.
+            // Ordinary abort happens before this commit-only reclamation phase.
+            let mut entry = freed.tree.get_mut(&key)?.expect("first entry exists");
+            entries_remaining -= 1;
+            #[cfg(feature = "test-seams")]
+            crate::commit_work::observe_reclaimed_entry();
+            // Each PageList item is one allocation extent. Its page order may
+            // cover several physical pages, but it consumes one budget unit.
+            while pages_remaining > 0 {
+                let Some(page) = entry.value_mut().pop_back() else {
+                    break;
+                };
+                self.mem.free(page, &mut PageTrackerPolicy::Ignore);
+                pages_remaining -= 1;
+                #[cfg(feature = "test-seams")]
+                crate::commit_work::observe_reclaimed_page();
+            }
+            let empty = entry.value().len() == 0;
+            drop(entry);
+            if empty {
+                freed.remove(&key)?;
+            }
+        }
+        Ok((pages_remaining, entries_remaining))
+    }
+
+    /// Inspect the exact root-page intersection with the deferred-free table
+    /// on demand. The transaction floor may also defer unrelated pages; this
+    /// diagnostic deliberately does not inventory them on writer admission.
+    #[doc(hidden)]
+    pub fn external_snapshot_retention_stats(&self) -> Result<ExternalSnapshotRetentionStats> {
+        let snapshots = self
+            .transaction_tracker
+            .external_snapshot_page_sets(&self.mem)?;
+        let protected = snapshots
+            .iter()
+            .flat_map(|(_, pages)| pages.iter().copied())
+            .collect::<HashSet<_>>();
+        let mut retained = HashSet::new();
+        let mut system_tables = self.system_tables.lock().unwrap();
+        let data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
+        for entry in data_freed.range::<TransactionIdWithPagination>(..)? {
+            let (_, pages) = entry?;
+            for index in 0..pages.value().len() {
+                let page = pages.value().get(index);
+                if protected.contains(&page) {
+                    retained.insert(page);
+                }
+            }
+        }
+        let page_size = u32::try_from(self.mem.get_page_size())
+            .expect("redb page size is represented by a 32-bit header field");
+        let reachable_bytes = protected
+            .iter()
+            .map(|page| page.page_size_bytes(page_size))
+            .sum();
+        let referenced_pages = snapshots.iter().map(|(_, pages)| pages.len() as u64).sum();
+        let referenced_bytes = snapshots
+            .iter()
+            .flat_map(|(_, pages)| pages.iter())
+            .map(|page| page.page_size_bytes(page_size))
+            .sum();
+        let retained_bytes = retained
+            .iter()
+            .map(|page| page.page_size_bytes(page_size))
+            .sum();
+        Ok(ExternalSnapshotRetentionStats {
+            snapshots: snapshots.len() as u64,
+            reachable_pages: protected.len() as u64,
+            referenced_pages,
+            retained_pages: retained.len() as u64,
+            reachable_bytes,
+            referenced_bytes,
+            retained_bytes,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn external_snapshot_retained_pages_for_test(&self) -> Result<Vec<[u8; 8]>> {
+        let protected = self
+            .transaction_tracker
+            .external_snapshot_page_sets(&self.mem)?
+            .into_iter()
+            .flat_map(|(_, pages)| pages)
+            .collect::<HashSet<_>>();
+        let mut retained = BTreeSet::new();
+        let mut system_tables = self.system_tables.lock().unwrap();
+        let data_freed = system_tables.open_system_table(self, DATA_FREED_TABLE)?;
+        for entry in data_freed.range::<TransactionIdWithPagination>(..)? {
+            let (_, pages) = entry?;
+            for index in 0..pages.value().len() {
+                let page = pages.value().get(index);
+                if protected.contains(&page) {
+                    retained.insert(page);
+                }
+            }
+        }
+        Ok(retained.into_iter().map(PageNumber::to_le_bytes).collect())
     }
 
     fn process_freed_pages_nondurable_helper(
@@ -2249,6 +2540,52 @@ pub struct ReadTransaction {
     tree: TableTree,
 }
 
+/// Stable identity of the user-tree root captured by one read transaction.
+///
+/// This is storage identity, not an application content digest. Consumers
+/// retaining external snapshot pages use it to name the exact copy-on-write
+/// root whose reachability must be preserved.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageSnapshotIdentity {
+    pub transaction_id: u64,
+    pub user_root: Option<StorageUserRootIdentity>,
+}
+
+/// The physical root header of the user table tree.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageUserRootIdentity {
+    pub page: [u8; 8],
+    pub checksum: u128,
+    pub length: u64,
+}
+
+/// Supplies the complete authenticated external snapshot set before a writer
+/// may allocate or reclaim pages. An error refuses the write without changing
+/// storage; an empty set authorizes release of all external holds.
+#[doc(hidden)]
+pub type ExternalSnapshotProvider =
+    Arc<dyn Fn() -> io::Result<Vec<StorageSnapshotIdentity>> + Send + Sync>;
+
+/// On-demand root-page diagnostic for authenticated external snapshots.
+///
+/// `reachable_bytes` is the union reachable from all roots. `referenced_bytes`
+/// counts shared pages once per root. `retained_bytes` is the union of those
+/// root pages that current state no longer reaches. The transaction floor can
+/// defer additional unrelated pages until the final snapshot releases.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExternalSnapshotRetentionStats {
+    pub snapshots: u64,
+    pub reachable_pages: u64,
+    pub referenced_pages: u64,
+    pub retained_pages: u64,
+    pub reachable_bytes: u64,
+    pub referenced_bytes: u64,
+    pub retained_bytes: u64,
+}
+
 /// Application pages follow MVCC; allocator/system pages do not. Capture
 /// only the system's numeric totals under the short writer boundary, then
 /// traverse application data through an ordinary independent read snapshot.
@@ -2293,6 +2630,45 @@ impl ReadTransaction {
         })
     }
 
+    pub(crate) fn new_external(
+        mem: Arc<TransactionalMemory>,
+        snapshot: StorageSnapshotIdentity,
+    ) -> Result<Self, TransactionError> {
+        let root = match snapshot.user_root {
+            Some(root) => Some(BtreeHeader::new(
+                PageNumber::validated_from_le_bytes(root.page).ok_or_else(|| {
+                    StorageError::Corrupted(
+                        "external snapshot root has an invalid allocation order".to_owned(),
+                    )
+                })?,
+                root.checksum,
+                root.length,
+            )),
+            None => None,
+        };
+        let guard = Arc::new(crate::db::TransactionGuard::external(TransactionId::new(
+            snapshot.transaction_id,
+        )));
+        Ok(Self {
+            mem: mem.clone(),
+            tree: TableTree::new(root, PageHint::Verified, guard, mem)
+                .map_err(TransactionError::Storage)?,
+        })
+    }
+
+    /// Name the exact committed user-tree root this transaction reads.
+    #[doc(hidden)]
+    pub fn storage_snapshot_identity(&self) -> StorageSnapshotIdentity {
+        StorageSnapshotIdentity {
+            transaction_id: self.tree.transaction_guard().id().raw_id(),
+            user_root: self.tree.root().map(|root| StorageUserRootIdentity {
+                page: root.root.to_le_bytes(),
+                checksum: root.checksum,
+                length: root.length,
+            }),
+        }
+    }
+
     /// Open the given table
     pub fn open_table<K: Key + 'static, V: Value + 'static>(
         &self,
@@ -2307,12 +2683,54 @@ impl ReadTransaction {
             InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                 definition.name().to_string(),
                 table_root,
-                PageHint::Clean,
+                self.tree.hint(),
                 self.tree.transaction_guard().clone(),
                 self.mem.clone(),
             )?),
             InternalTableDefinition::Multimap { .. } => unreachable!(),
         }
+    }
+
+    /// Open a byte table for reject-only bounded inspection. Selected records
+    /// still use ordinary complete-page admission and checksum verification.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_byte_table_bounded(
+        &self,
+        definition: TableDefinition<&'static [u8], &'static [u8]>,
+    ) -> Result<ReadOnlyTable<&'static [u8], &'static [u8]>, TableError> {
+        let header = self
+            .tree
+            .get_table::<&[u8], &[u8]>(definition.name(), TableType::Normal)?
+            .ok_or_else(|| TableError::TableDoesNotExist(definition.name().to_string()))?;
+        match header {
+            InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new_bounded(
+                definition.name().to_string(),
+                table_root,
+                self.tree.hint(),
+                self.tree.transaction_guard().clone(),
+                self.mem.clone(),
+            )),
+            InternalTableDefinition::Multimap { .. } => unreachable!(),
+        }
+    }
+
+    /// Return the committed root header without reading the table's payload pages.
+    #[doc(hidden)]
+    pub fn table_root_fingerprint<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Option<[u8; 32]>, TableError> {
+        let table = self
+            .tree
+            .get_table::<K, V>(definition.name(), TableType::Normal)?;
+        Ok(match table {
+            Some(InternalTableDefinition::Normal { table_root, .. }) => {
+                table_root.map(BtreeHeader::to_le_bytes)
+            }
+            Some(InternalTableDefinition::Multimap { .. }) => unreachable!(),
+            None => None,
+        })
     }
 
     /// Open the given table without a type
@@ -2333,7 +2751,7 @@ impl ReadTransaction {
                 ..
             } => Ok(ReadOnlyUntypedTable::new(
                 table_root,
-                PageHint::Clean,
+                self.tree.hint(),
                 fixed_key_size,
                 fixed_value_size,
                 self.mem.clone(),
@@ -2361,7 +2779,7 @@ impl ReadTransaction {
             } => Ok(ReadOnlyMultimapTable::new(
                 table_root,
                 table_length,
-                PageHint::Clean,
+                self.tree.hint(),
                 self.tree.transaction_guard().clone(),
                 self.mem.clone(),
             )?),
@@ -2389,7 +2807,7 @@ impl ReadTransaction {
             } => Ok(ReadOnlyUntypedMultimapTable::new(
                 table_root,
                 table_length,
-                PageHint::Clean,
+                self.tree.hint(),
                 fixed_key_size,
                 fixed_value_size,
                 self.mem.clone(),
@@ -2435,7 +2853,15 @@ impl Debug for ReadTransaction {
 
 #[cfg(test)]
 mod test {
-    use crate::{Database, TableDefinition};
+    use crate::backends::FileBackend;
+    use crate::tree_store::{Page, PageHint, PageNumber};
+    use crate::{
+        Database, ExternalSnapshotProvider, ExternalSnapshotRetentionStats, ReadableDatabase,
+        TableDefinition,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::fs::OpenOptions;
+    use std::sync::{Arc, Mutex};
 
     const X: TableDefinition<&str, &str> = TableDefinition::new("x");
 
@@ -2455,6 +2881,238 @@ mod test {
         let db2 = Database::create(tmpfile.path()).unwrap();
         let write_txn = db2.begin_write().unwrap();
         assert!(write_txn.transaction_id > first_txn_id);
+    }
+
+    #[test]
+    fn external_roots_retain_only_reachable_allocation_versions_and_release_them_for_reuse() {
+        const VALUES: TableDefinition<u64, &[u8]> = TableDefinition::new("external_values");
+        const CHURN: TableDefinition<u64, &[u8]> = TableDefinition::new("post_snapshot_churn");
+        const REUSE: TableDefinition<u64, &[u8]> = TableDefinition::new("released_page_reuse");
+
+        let file = crate::create_tempfile();
+        let db = Database::create(file.path()).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(VALUES).unwrap();
+            for key in 0..256 {
+                table
+                    .insert(key, vec![(key % 251) as u8; 8192].as_slice())
+                    .unwrap();
+            }
+        }
+        write.commit().unwrap();
+        drop(db);
+
+        let read_db = crate::ReadOnlyDatabase::open(file.path()).unwrap();
+        let read = read_db.begin_read().unwrap();
+        let snapshot = read.storage_snapshot_identity();
+        assert_eq!(
+            read.open_table(VALUES)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .value(),
+            &[0; 8192]
+        );
+        drop(read);
+        drop(read_db);
+
+        let registered = Arc::new(Mutex::new(vec![snapshot]));
+        let provider_state = registered.clone();
+        let provider: ExternalSnapshotProvider =
+            Arc::new(move || Ok(provider_state.lock().unwrap().clone()));
+        let backend = FileBackend::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.path())
+                .unwrap(),
+        )
+        .unwrap();
+        let db = Database::builder()
+            .open_with_backend_and_external_snapshots(backend, provider)
+            .unwrap();
+        let mem = db.get_memory();
+
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(VALUES)
+            .unwrap()
+            .insert(0, &[99; 8192][..])
+            .unwrap();
+        write.commit().unwrap();
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(CHURN)
+            .unwrap()
+            .insert(0, &[17; 8192][..])
+            .unwrap();
+        write.commit().unwrap();
+        for _ in 0..3 {
+            db.begin_write().unwrap().commit().unwrap();
+        }
+
+        let retained_ids = db.external_snapshot_retained_pages_for_test().unwrap();
+        let baseline = db.external_snapshot_retention_stats().unwrap();
+        assert_eq!(baseline.snapshots, 1);
+        assert!(baseline.reachable_pages > 0);
+        assert!(baseline.retained_pages > 0);
+        assert_eq!(baseline.retained_pages, retained_ids.len() as u64);
+        assert!(baseline.referenced_pages >= baseline.reachable_pages);
+        assert_eq!(baseline.retained_bytes % 4096, 0);
+        let retained_pages = retained_ids
+            .iter()
+            .copied()
+            .map(PageNumber::from_le_bytes)
+            .collect::<HashSet<_>>();
+        let retained_bytes = retained_pages
+            .iter()
+            .map(|page| {
+                assert!(mem.is_allocated(*page));
+                (
+                    *page,
+                    mem.get_page(*page, PageHint::None)
+                        .unwrap()
+                        .memory()
+                        .to_vec(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let old = db.begin_external_read(snapshot).unwrap();
+        assert_eq!(
+            old.open_table(VALUES)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .value(),
+            &[0; 8192],
+            "the retained physical root must still expose the pre-writer value"
+        );
+        drop(old);
+
+        for generation in 1..=24u8 {
+            let write = db.begin_write().unwrap();
+            write
+                .open_table(CHURN)
+                .unwrap()
+                .insert(0, vec![generation; 8192].as_slice())
+                .unwrap();
+            write.commit().unwrap();
+            let now = db.external_snapshot_retained_pages_for_test().unwrap();
+            assert_eq!(
+                now, retained_ids,
+                "versions born after the registered root must not accumulate behind it"
+            );
+        }
+
+        registered.lock().unwrap().clear();
+        for _ in 0..3 {
+            db.begin_write().unwrap().commit().unwrap();
+        }
+        assert_eq!(
+            db.external_snapshot_retention_stats().unwrap(),
+            ExternalSnapshotRetentionStats::default()
+        );
+        let reclaimed = retained_pages
+            .iter()
+            .filter(|page| !mem.is_allocated(**page))
+            .count();
+        assert!(
+            reclaimed > 0,
+            "released external pages must enter the free inventory"
+        );
+
+        let mut reused = HashSet::new();
+        for batch in 0..64u64 {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(REUSE).unwrap();
+                for item in 0..64u64 {
+                    let key = batch * 64 + item;
+                    table
+                        .insert(key, vec![(key % 239) as u8; 8192].as_slice())
+                        .unwrap();
+                }
+            }
+            write.commit().unwrap();
+            reused.extend(retained_pages.iter().copied().filter(|page| {
+                mem.is_allocated(*page)
+                    && mem.get_page(*page, PageHint::None).unwrap().memory() != retained_bytes[page]
+            }));
+            if !reused.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !reused.is_empty(),
+            "ordinary allocation must actually reuse a released retained extent"
+        );
+    }
+
+    #[test]
+    fn external_root_validation_and_prewriter_registration_order_fail_closed() {
+        let file = crate::create_tempfile();
+        let db = Database::create(file.path()).unwrap();
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(X)
+            .unwrap()
+            .insert("root", "validated")
+            .unwrap();
+        write.commit().unwrap();
+        drop(db);
+
+        let read_db = crate::ReadOnlyDatabase::open(file.path()).unwrap();
+        let read = read_db.begin_read().unwrap();
+        let snapshot = read.storage_snapshot_identity();
+        drop(read);
+        drop(read_db);
+
+        let mut forged = snapshot;
+        forged.user_root.as_mut().unwrap().checksum ^= 1;
+        let backend = FileBackend::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.path())
+                .unwrap(),
+        )
+        .unwrap();
+        let error = Database::builder()
+            .open_with_backend_and_external_snapshots(backend, Arc::new(move || Ok(vec![forged])))
+            .expect_err("a forged physical root must be refused before writer housekeeping");
+        assert!(error.to_string().contains("invalid user-tree root"));
+
+        let registered = Arc::new(Mutex::new(Vec::new()));
+        let provider_state = registered.clone();
+        let backend = FileBackend::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.path())
+                .unwrap(),
+        )
+        .unwrap();
+        let db = Database::builder()
+            .open_with_backend_and_external_snapshots(
+                backend,
+                Arc::new(move || Ok(provider_state.lock().unwrap().clone())),
+            )
+            .unwrap();
+        registered.lock().unwrap().push(snapshot);
+        let Err(error) = db.begin_write() else {
+            panic!("an unpinned root cannot register after writer admission completed");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("new external snapshots require a live read pin after writer admission")
+        );
+        registered.lock().unwrap().clear();
+        db.begin_write().unwrap().abort().unwrap();
     }
 }
 
@@ -2623,6 +3281,441 @@ mod online_relocation_tests {
                 .unwrap()
                 .value(),
             &[73u8; 8192]
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_reclamation_tests {
+    use super::*;
+    use crate::{Database, ReadableDatabase};
+
+    const SELECTED: TableDefinition<u64, u64> = TableDefinition::new("selected");
+    const CHURN: TableDefinition<u64, &[u8]> = TableDefinition::new("churn");
+
+    // Count both free-list entries and allocated extents (PageList items), not
+    // physical pages. Empty entries and later cleanup work matter to the drain.
+    fn pending(db: &Database, cutoff: Option<u64>) -> [(usize, usize); 2] {
+        let write = db.begin_write().unwrap();
+        let mut counts = [(0, 0); 2];
+        {
+            let mut tables = write.system_tables.lock().unwrap();
+            for (index, definition) in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE]
+                .into_iter()
+                .enumerate()
+            {
+                let table = tables.open_system_table(&write, definition).unwrap();
+                for entry in table.range::<TransactionIdWithPagination>(..).unwrap() {
+                    let (key, pages) = entry.unwrap();
+                    if cutoff.is_none_or(|cutoff| key.value().transaction_id <= cutoff) {
+                        counts[index].0 += 1;
+                        counts[index].1 += pages.value().len();
+                    }
+                }
+            }
+        }
+        write.abort().unwrap();
+        counts
+    }
+
+    fn pending_before(db: &Database, cutoff: u64) -> usize {
+        pending(db, Some(cutoff))
+            .iter()
+            .map(|(_, pages)| pages)
+            .sum()
+    }
+
+    #[test]
+    fn idle_writer_drains_eligible_deferred_pages_with_bounded_commits() {
+        let file = crate::create_tempfile();
+        let mut builder = Database::builder();
+        builder.set_cache_size(0).set_deferred_free_budget(64, 64);
+        let db = builder.create(file.path()).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(CHURN).unwrap();
+            for key in 0..128 {
+                table.insert(key, &[0; 8192][..]).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        let read = db.begin_read().unwrap();
+        for generation in 1..=4u8 {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(CHURN).unwrap();
+                for key in 0..128 {
+                    table.insert(key, &[generation; 8192][..]).unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        assert!(
+            pending(&db, None)
+                .iter()
+                .map(|(_, pages)| pages)
+                .sum::<usize>()
+                > 64
+        );
+        drop(read);
+        db.drain_deferred_frees().unwrap();
+        assert_eq!(pending(&db, None), [(0, 0); 2]);
+        assert_eq!(
+            db.begin_read()
+                .unwrap()
+                .open_table(CHURN)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .value(),
+            &[4; 8192]
+        );
+    }
+
+    #[test]
+    fn released_snapshot_cleanup_is_bounded_durable_and_eventually_drains() {
+        let file = crate::create_tempfile();
+        let mut builder = Database::builder();
+        builder.set_cache_size(0).set_deferred_free_budget(64, 64);
+        let db = builder.create(file.path()).unwrap();
+        let write = db.begin_write().unwrap();
+        write.open_table(SELECTED).unwrap().insert(1, 7).unwrap();
+        {
+            let mut table = write.open_table(CHURN).unwrap();
+            for key in 0..160 {
+                table.insert(key, &[0; 8192][..]).unwrap();
+            }
+        }
+        write.commit().unwrap();
+        let read = db.begin_read().unwrap();
+        for generation in 1..=8u8 {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(CHURN).unwrap();
+                for key in 0..160 {
+                    table.insert(key, &[generation; 8192][..]).unwrap();
+                }
+            }
+            write.commit().unwrap();
+        }
+        assert_eq!(
+            read.open_table(SELECTED)
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .unwrap()
+                .value(),
+            7
+        );
+        let cutoff = db
+            .get_memory()
+            .get_last_committed_transaction_id()
+            .unwrap()
+            .raw_id();
+        let backlog = pending_before(&db, cutoff);
+        assert!(
+            backlog > 1024,
+            "held read must defer substantial unrelated churn"
+        );
+        assert_eq!(
+            pending(&db, Some(cutoff))[1],
+            (0, 0),
+            "this fixture leaves only the data free tree eligible, so its unused system share can be lent"
+        );
+        drop(read);
+
+        let write = db.begin_write().unwrap();
+        write.open_table(SELECTED).unwrap().insert(2, 9).unwrap();
+        write.commit().unwrap();
+        let remaining = pending_before(&db, cutoff);
+        assert!(remaining < backlog);
+        assert!(
+            backlog - remaining > 32,
+            "the data tree must borrow the idle system tree's share"
+        );
+        assert!(
+            backlog - remaining <= 64,
+            "one small append cannot reclaim more than 64 allocated extents"
+        );
+
+        // Ordinary abort never runs the commit-only reclamation stage. Prove
+        // both a user write and a COW edit of the durable continuation roll
+        // back, without invoking commit-stage allocator frees before abort.
+        let before_abort = pending(&db, None);
+        let allocated_before_abort = db.get_memory().count_allocated_pages().unwrap();
+        let write = db.begin_write().unwrap();
+        write.open_table(SELECTED).unwrap().insert(3, 11).unwrap();
+        let mut edited = 0;
+        {
+            let mut tables = write.system_tables.lock().unwrap();
+            for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
+                let mut table = tables.open_system_table(&write, definition).unwrap();
+                if let Some(key) = table.tree.first().unwrap().map(|(key, _)| key.value()) {
+                    let mut entry = table.tree.get_mut(&key).unwrap().unwrap();
+                    if entry.value_mut().pop_back().is_some() {
+                        edited += 1;
+                    }
+                }
+            }
+        }
+        assert!(edited > 0, "exercise a partially trimmed continuation");
+        write.abort().unwrap();
+        assert_eq!(pending(&db, None), before_abort);
+        assert_eq!(
+            db.get_memory().count_allocated_pages().unwrap(),
+            allocated_before_abort
+        );
+        assert!(
+            db.begin_read()
+                .unwrap()
+                .open_table(SELECTED)
+                .unwrap()
+                .get(3)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db);
+        let db = builder.open(file.path()).unwrap();
+        let after_reopen = pending_before(&db, cutoff);
+        assert!(
+            after_reopen > 0,
+            "bounded close/open housekeeping must preserve remaining work"
+        );
+        assert!(after_reopen <= remaining);
+        for _ in 0..backlog {
+            if pending(&db, None) == [(0, 0); 2] {
+                break;
+            }
+            db.begin_write().unwrap().commit().unwrap();
+        }
+        assert_eq!(
+            pending(&db, None),
+            [(0, 0); 2],
+            "later commits drain both entire free trees, including new housekeeping work"
+        );
+        let read = db.begin_read().unwrap();
+        assert_eq!(
+            read.open_table(SELECTED)
+                .unwrap()
+                .get(2)
+                .unwrap()
+                .unwrap()
+                .value(),
+            9
+        );
+        assert_eq!(
+            read.open_table(CHURN)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .value(),
+            &[8; 8192]
+        );
+    }
+
+    #[test]
+    fn empty_deferred_lists_consume_the_entry_budget() {
+        let file = crate::create_tempfile();
+        let db = Database::create(file.path()).unwrap();
+        let mut write = db.begin_write().unwrap();
+        write.set_deferred_free_budget(0, 0);
+        {
+            let mut tables = write.system_tables.lock().unwrap();
+            for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
+                let mut table = tables.open_system_table(&write, definition).unwrap();
+                for pagination_id in 0..20 {
+                    let key = TransactionIdWithPagination {
+                        transaction_id: 0,
+                        pagination_id,
+                    };
+                    table
+                        .insert_reserve(&key, PageList::required_bytes(1))
+                        .unwrap()
+                        .as_mut()
+                        .clear();
+                }
+            }
+        }
+        write.commit().unwrap();
+        let mut write = db.begin_write().unwrap();
+        write.set_deferred_free_budget(64, 5);
+        write.commit().unwrap();
+        let write = db.begin_write().unwrap();
+        let mut remaining = 0;
+        {
+            let mut tables = write.system_tables.lock().unwrap();
+            for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
+                let table = tables.open_system_table(&write, definition).unwrap();
+                let end = TransactionIdWithPagination {
+                    transaction_id: 1,
+                    pagination_id: 0,
+                };
+                for entry in table.range(..end).unwrap() {
+                    assert_eq!(entry.unwrap().1.value().len(), 0);
+                    remaining += 1;
+                }
+            }
+        }
+        write.abort().unwrap();
+        assert_eq!(remaining, 35, "empty lists must not bypass the entry cap");
+    }
+
+    #[test]
+    fn one_unit_budget_progresses_in_both_trees() {
+        let file = crate::create_tempfile();
+        let mut builder = Database::builder();
+        builder.set_deferred_free_budget(1, 1);
+        let db = builder.create(file.path()).unwrap();
+        let write = db.begin_write().unwrap();
+        write.open_table(SELECTED).unwrap().insert(1, 0).unwrap();
+        write.commit().unwrap();
+        let read = db.begin_read().unwrap();
+        for generation in 1..10u64 {
+            let write = db.begin_write().unwrap();
+            write
+                .open_table(SELECTED)
+                .unwrap()
+                .insert(1, generation)
+                .unwrap();
+            write.commit().unwrap();
+        }
+        let cutoff = db
+            .get_memory()
+            .get_last_committed_transaction_id()
+            .unwrap()
+            .raw_id();
+        drop(read);
+        let mut previous = pending_before(&db, cutoff);
+        assert!(previous > 1);
+        for _ in 0..previous * 4 + 100 {
+            db.begin_write().unwrap().commit().unwrap();
+            let current = pending_before(&db, cutoff);
+            assert!(previous - current <= 1);
+            previous = current;
+            if current == 0 {
+                break;
+            }
+        }
+        assert_eq!(previous, 0);
+    }
+
+    #[test]
+    fn one_unit_budget_progresses_in_both_trees_across_repeated_reopen() {
+        let file = crate::create_tempfile();
+        let mut builder = Database::builder();
+        builder.set_deferred_free_budget(1, 1);
+        let mut db = builder.create(file.path()).unwrap();
+        let write = db.begin_write().unwrap();
+        write.open_table(SELECTED).unwrap().insert(1, 0).unwrap();
+        write.commit().unwrap();
+        let read = db.begin_read().unwrap();
+        for generation in 1..=12u64 {
+            let mut write = db.begin_write().unwrap();
+            write.set_quick_repair(true);
+            write
+                .open_table(SELECTED)
+                .unwrap()
+                .insert(1, generation)
+                .unwrap();
+            write.commit().unwrap();
+        }
+        let cutoff = db
+            .get_memory()
+            .get_last_committed_transaction_id()
+            .unwrap()
+            .raw_id();
+        let initial = pending(&db, Some(cutoff));
+        assert!(
+            initial
+                .iter()
+                .all(|(entries, pages)| *entries > 0 && *pages > 0),
+            "{initial:?}"
+        );
+        drop(read);
+        let bound = initial
+            .iter()
+            .map(|(entries, pages)| entries + pages)
+            .sum::<usize>()
+            * 4
+            + 100;
+        for _ in 0..bound {
+            // Each reopen is a new tracker. The aborted inspection also makes
+            // transaction-ID parity unsuitable as a fairness mechanism.
+            drop(db);
+            db = builder.open(file.path()).unwrap();
+            if pending(&db, Some(cutoff)) == [(0, 0); 2] {
+                break;
+            }
+        }
+        assert_eq!(pending(&db, Some(cutoff)), [(0, 0); 2]);
+        assert_eq!(
+            db.begin_read()
+                .unwrap()
+                .open_table(SELECTED)
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .unwrap()
+                .value(),
+            12
+        );
+    }
+
+    #[test]
+    fn explicit_compaction_drains_backlog_with_a_finite_builder_budget() {
+        let file = crate::create_tempfile();
+        let mut builder = Database::builder();
+        builder.set_deferred_free_budget(1, 1);
+        let mut db = builder.create(file.path()).unwrap();
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(CHURN)
+            .unwrap()
+            .insert(0, &[0; 8192][..])
+            .unwrap();
+        write.commit().unwrap();
+        let read = db.begin_read().unwrap();
+        for generation in 1..=16u8 {
+            let mut write = db.begin_write().unwrap();
+            write.set_quick_repair(true);
+            write
+                .open_table(CHURN)
+                .unwrap()
+                .insert(0, &[generation; 8192][..])
+                .unwrap();
+            write.commit().unwrap();
+        }
+        assert!(pending(&db, None).iter().all(|(_, pages)| *pages > 2));
+        drop(read);
+        db.compact().unwrap();
+        assert_eq!(pending(&db, None), [(0, 0); 2]);
+        assert_eq!(db.begin_write().unwrap().deferred_free_budget, (1, 1));
+        assert_eq!(
+            db.begin_read()
+                .unwrap()
+                .open_table(CHURN)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .value(),
+            &[16; 8192]
+        );
+        drop(db);
+        let db = builder.open(file.path()).unwrap();
+        assert_eq!(
+            db.begin_read()
+                .unwrap()
+                .open_table(CHURN)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .value(),
+            &[16; 8192]
         );
     }
 }

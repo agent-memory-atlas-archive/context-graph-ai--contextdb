@@ -9,12 +9,17 @@ pub mod test_seam;
 
 pub use cosine::cosine_similarity;
 pub use hnsw::{HnswGraphStats, HnswIndex};
-pub use mem::{MemVectorExecutor, VectorSearchDebugTrace};
+pub use mem::{
+    MemVectorExecutor, VectorPartitionSearchRoute, VectorPartitionSearchTrace,
+    VectorSearchDebugTrace,
+};
 #[doc(hidden)]
 pub use memory_budget::MemoryBudget;
 #[doc(hidden)]
 pub use memory_budget::VectorWorkspaceReservation;
 pub use quantized::{stored_vector_resident_bytes, stored_vector_value};
+#[doc(hidden)]
+pub use store::VectorPartitionSourceMaintenanceMetadata;
 pub use store::{
     PartitionedVectorDelete, PartitionedVectorEntry, PartitionedVectorMove,
     PreparedPartitionedVectorBatch, PreparedVectorPublication, VectorIndexInfo, VectorIndexLayout,

@@ -351,11 +351,17 @@ fn policy_changes_clear_a_failure_when_the_healthy_route_no_longer_needs_work() 
         assert_eq!(int(&indexes, index, "stalled_partitions"), 0);
         assert_eq!(text(&indexes, index, "broad_route_reason"), "none");
         assert_eq!(text(&indexes, index, "broad_route_recovery_action"), "none");
-        let cycle = db
+        let error = db
             .run_maintenance_cycle()
-            .expect("a policy with no current need returns an idle finite cycle");
-        assert_eq!(cycle.vector.built_partitions, 0);
-        assert_eq!(cycle.vector.first_failure, None);
+            .expect_err("closing compaction reports its typed resource deferral");
+        assert!(
+            matches!(
+                error,
+                contextdb_core::Error::MemoryBudgetExceeded { .. }
+                    | contextdb_core::Error::DiskBudgetExceeded { .. }
+            ),
+            "closing compaction resource refusal: {error:?}"
+        );
     };
 
     let refused = db

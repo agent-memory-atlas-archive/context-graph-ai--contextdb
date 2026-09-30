@@ -41,7 +41,7 @@ to register `:memory:` session callbacks).
 | Invariant | Guard |
 |---|---|
 | Multi-byte UTF-8 anywhere in the input never panics `parse()` | `tests/utf8_multibyte_boundary_tests.rs::parse_never_panics_across_a_generated_utf8_width_and_offset_matrix` and its sixteen siblings |
-| Every statement is explicitly Read or Write (the match has no catch-all) | `tests/statement_effect_contract.rs::statement_effect_marks_only_the_ten_inspection_variants_as_reads` |
+| Every statement is explicitly Read or Write (the match has no catch-all) | `tests/statement_effect_contract.rs::statement_effect_marks_only_the_inspection_variants_as_reads` |
 | Vector clauses parse on `CREATE TABLE` and `ADD COLUMN` with defaults preserved | `tests/vector_partition_syntax_contract.rs::create_table_accepts_defaulted_and_explicit_partition_declarations`, `::vector_policy_spellings_preserve_values_and_defaults_on_create_add_and_alter` |
 | Reordered, repeated, empty or unknown vector clauses are refused | `tests/vector_partition_syntax_contract.rs::vector_declarations_and_queries_reject_reordered_or_repeated_clauses` |
 | `MAX_PARTITIONS` without a key is left to semantic validation | `tests/vector_partition_syntax_contract.rs::max_partitions_without_a_partition_key_reaches_semantic_validation` |
@@ -71,6 +71,7 @@ the generated matrix in `utf8_multibyte_boundary_tests.rs`; never delete a case 
 | New vector clause | Its slot in the ordered clause list in `grammar.pest`, field on the AST column/alter shape, rejection cases in `vector_partition_syntax_contract.rs`; semantic checks go to the engine. |
 | New refused SQL feature | A pre-check in `parse()` returning a typed `Error`, boundary-safe. |
 | New scalar function | Nothing here — function calls parse generically; see the root guide. |
+| Read/write statement classification or expression shape | `classification.rs` and `ast.rs`; `parser.rs` builds the AST from `grammar.pest`. |
 
 ## Fast test
 

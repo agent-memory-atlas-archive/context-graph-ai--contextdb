@@ -21,6 +21,21 @@ use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 
+pub(super) fn page_checksum<T: Page>(
+    page: &T,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+) -> Result<Checksum> {
+    match page.memory().first().copied() {
+        Some(LEAF) => leaf_checksum(page, fixed_key_size, fixed_value_size),
+        Some(BRANCH) => branch_checksum(page, fixed_key_size),
+        _ => Err(crate::StorageError::Corrupted(format!(
+            "page {:?} has an invalid btree node type",
+            page.get_page_number()
+        ))),
+    }
+}
+
 pub(crate) struct BtreeStats {
     pub(crate) tree_height: u32,
     pub(crate) leaf_pages: u64,
@@ -423,6 +438,8 @@ impl UntypedBtreeMut {
         let mut ignore = PageTrackerPolicy::Ignore;
         if !self.mem.free_if_uncommitted(page_number, &mut ignore) {
             freed_pages.push(page_number);
+            #[cfg(feature = "test-seams")]
+            crate::commit_work::note_freed_page();
         }
 
         Ok(Some((new_page.get_page_number(), DEFERRED)))
@@ -430,7 +447,7 @@ impl UntypedBtreeMut {
 }
 
 pub(crate) struct BtreeMut<'a, K: Key + 'static, V: Value + 'static> {
-    mem: Arc<TransactionalMemory>,
+    pub(super) mem: Arc<TransactionalMemory>,
     transaction_guard: Arc<TransactionGuard>,
     root: Option<BtreeHeader>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
@@ -630,6 +647,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
                 new_page.memory_mut().copy_from_slice(old_page.memory());
                 drop(old_page);
                 freed_pages.push(root.root);
+                #[cfg(feature = "test-seams")]
+                crate::commit_work::note_freed_page();
 
                 root.root = new_page.get_page_number();
                 root.checksum = DEFERRED;
@@ -690,6 +709,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
                         .copy_from_slice(old_child_page.memory());
                     drop(old_child_page);
                     freed_pages.push(child_page);
+                    #[cfg(feature = "test-seams")]
+                    crate::commit_work::note_freed_page();
 
                     let mut mutator = BranchMutator::new(page.memory_mut());
                     mutator.write_child_page(child_index, new_page.get_page_number(), DEFERRED);
@@ -780,6 +801,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
         for page in freed {
             if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                 freed_pages.push(page);
+                #[cfg(feature = "test-seams")]
+                crate::commit_work::note_freed_page();
             }
         }
 
@@ -870,6 +893,22 @@ impl RawBtree {
         }
     }
 
+    /// Authenticate only the saved root page during external admission.
+    /// Its descendants remain protected by the transaction floor and are
+    /// checked when the retained reader actually visits them.
+    pub(crate) fn verify_root_checksum(&self) -> Result<bool> {
+        let Some(header) = self.root else {
+            return Ok(true);
+        };
+        let page = self.mem.get_page(header.root, self.hint)?;
+        let computed = match page.memory().first().copied() {
+            Some(LEAF) => leaf_checksum(&page, self.fixed_key_size, self.fixed_value_size),
+            Some(BRANCH) => branch_checksum(&page, self.fixed_key_size),
+            _ => return Ok(false),
+        };
+        Ok(computed.is_ok_and(|computed| computed == header.checksum))
+    }
+
     fn verify_checksum_helper(
         &self,
         page_number: PageNumber,
@@ -912,12 +951,12 @@ impl RawBtree {
 }
 
 pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
-    mem: Arc<TransactionalMemory>,
+    pub(super) mem: Arc<TransactionalMemory>,
     transaction_guard: Arc<TransactionGuard>,
     // Cache of the root page to avoid repeated lookups
     cached_root: Option<PageImpl>,
     root: Option<BtreeHeader>,
-    hint: PageHint,
+    pub(super) hint: PageHint,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
@@ -930,7 +969,16 @@ impl<K: Key, V: Value> Btree<K, V> {
         mem: Arc<TransactionalMemory>,
     ) -> Result<Self> {
         let cached_root = if let Some(header) = root {
-            Some(mem.get_page(header.root, hint)?)
+            let page = mem.get_page(header.root, hint)?;
+            if hint.verifies_path()
+                && page_checksum(&page, K::fixed_width(), V::fixed_width())? != header.checksum
+            {
+                return Err(crate::StorageError::Corrupted(format!(
+                    "retained snapshot root page {:?} failed checksum verification",
+                    header.root
+                )));
+            }
+            Some(page)
         } else {
             None
         };
@@ -943,6 +991,24 @@ impl<K: Key, V: Value> Btree<K, V> {
             _key_type: Default::default(),
             _value_type: Default::default(),
         })
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn new_lazy(
+        root: Option<BtreeHeader>,
+        hint: PageHint,
+        guard: Arc<TransactionGuard>,
+        mem: Arc<TransactionalMemory>,
+    ) -> Self {
+        Self {
+            mem,
+            transaction_guard: guard,
+            cached_root: None,
+            root,
+            hint,
+            _key_type: PhantomData,
+            _value_type: PhantomData,
+        }
     }
 
     pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
@@ -968,6 +1034,17 @@ impl<K: Key, V: Value> Btree<K, V> {
         .verify_checksum()
     }
 
+    pub(crate) fn verify_root_checksum(&self) -> Result<bool> {
+        RawBtree::new(
+            self.get_root(),
+            K::fixed_width(),
+            V::fixed_width(),
+            self.mem.clone(),
+            self.hint,
+        )
+        .verify_root_checksum()
+    }
+
     pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
     where
         F: FnMut(&PagePath) -> Result,
@@ -985,6 +1062,10 @@ impl<K: Key, V: Value> Btree<K, V> {
     pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
         if let Some(ref root_page) = self.cached_root {
             self.get_helper(root_page, K::as_bytes(key).as_ref())
+        } else if let Some(root) = self.root {
+            let page = self.mem.get_page(root.root, self.hint)?;
+            self.verify_path_page(&page, root.checksum)?;
+            self.get_helper(&page, K::as_bytes(key).as_ref())
         } else {
             Ok(None)
         }
@@ -1006,8 +1087,10 @@ impl<K: Key, V: Value> Btree<K, V> {
             }
             BRANCH => {
                 let accessor = BranchAccessor::new(page, K::fixed_width());
-                let (_, child_page) = accessor.child_for_key::<K>(query);
+                let (child_index, child_page) = accessor.child_for_key::<K>(query);
+                let expected = accessor.child_checksum(child_index).unwrap();
                 let child_page = self.mem.get_page(child_page, self.hint)?;
+                self.verify_path_page(&child_page, expected)?;
                 self.get_helper(&child_page, query)
             }
             _ => unreachable!(),
@@ -1019,6 +1102,10 @@ impl<K: Key, V: Value> Btree<K, V> {
     ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
         if let Some(ref root) = self.cached_root {
             self.first_helper(root.clone())
+        } else if let Some(root) = self.root {
+            let page = self.mem.get_page(root.root, self.hint)?;
+            self.verify_path_page(&page, root.checksum)?;
+            self.first_helper(page)
         } else {
             Ok(None)
         }
@@ -1040,7 +1127,10 @@ impl<K: Key, V: Value> Btree<K, V> {
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, K::fixed_width());
                 let child_page = accessor.child_page(0).unwrap();
-                self.first_helper(self.mem.get_page(child_page, self.hint)?)
+                let expected = accessor.child_checksum(0).unwrap();
+                let page = self.mem.get_page(child_page, self.hint)?;
+                self.verify_path_page(&page, expected)?;
+                self.first_helper(page)
             }
             _ => unreachable!(),
         }
@@ -1051,6 +1141,10 @@ impl<K: Key, V: Value> Btree<K, V> {
     ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
         if let Some(ref root) = self.cached_root {
             self.last_helper(root.clone())
+        } else if let Some(root) = self.root {
+            let page = self.mem.get_page(root.root, self.hint)?;
+            self.verify_path_page(&page, root.checksum)?;
+            self.last_helper(page)
         } else {
             Ok(None)
         }
@@ -1072,8 +1166,12 @@ impl<K: Key, V: Value> Btree<K, V> {
             }
             BRANCH => {
                 let accessor = BranchAccessor::new(&page, K::fixed_width());
-                let child_page = accessor.child_page(accessor.count_children() - 1).unwrap();
-                self.last_helper(self.mem.get_page(child_page, self.hint)?)
+                let child_index = accessor.count_children() - 1;
+                let child_page = accessor.child_page(child_index).unwrap();
+                let expected = accessor.child_checksum(child_index).unwrap();
+                let page = self.mem.get_page(child_page, self.hint)?;
+                self.verify_path_page(&page, expected)?;
+                self.last_helper(page)
             }
             _ => unreachable!(),
         }
@@ -1083,12 +1181,35 @@ impl<K: Key, V: Value> Btree<K, V> {
         &self,
         range: &'_ T,
     ) -> Result<BtreeRangeIter<K, V>> {
-        BtreeRangeIter::new(
+        // The root page was read and checked against `self.root` when this
+        // tree was opened; the range descends from that same page.
+        BtreeRangeIter::new_with_root_page(
             range,
-            self.root.map(|x| x.root),
+            self.root,
+            match (&self.cached_root, self.root) {
+                (Some(page), _) => Some(page.clone()),
+                (None, Some(root)) => {
+                    let page = self.mem.get_page(root.root, self.hint)?;
+                    self.verify_path_page(&page, root.checksum)?;
+                    Some(page)
+                }
+                (None, None) => None,
+            },
             self.mem.clone(),
             self.hint,
         )
+    }
+
+    fn verify_path_page(&self, page: &PageImpl, expected: Checksum) -> Result<()> {
+        if self.hint.verifies_path()
+            && page_checksum(page, K::fixed_width(), V::fixed_width())? != expected
+        {
+            return Err(crate::StorageError::Corrupted(format!(
+                "retained snapshot page {:?} failed checksum verification",
+                page.get_page_number()
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn len(&self) -> Result<u64> {

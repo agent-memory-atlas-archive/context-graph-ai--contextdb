@@ -103,6 +103,9 @@ mod sync_direction_tests;
 mod sync_relay_trigger_tables_tests;
 #[path = "integration/sync_server_nonblocking_apply.rs"]
 mod sync_server_nonblocking_apply;
+#[path = "integration/transactional_callback_delivery.rs"]
+#[cfg(feature = "test-seams")]
+mod transactional_callback_delivery;
 #[path = "integration/trigger_audit_retention_config_tests.rs"]
 mod trigger_audit_retention_config_tests;
 #[path = "integration/version_cleanup_scoping_tests.rs"]

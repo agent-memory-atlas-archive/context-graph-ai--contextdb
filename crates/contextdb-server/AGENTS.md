@@ -37,6 +37,7 @@ aliases; a behavior reaches the binary as a flag.
 | A peer on another protocol is refused, moving no rows and advancing no watermark | `tests/protocol_version_bump_tests.rs` → `a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advancing_no_watermark` |
 | The ALPN stays `contextdb.sync.v6` | `tests/iroh_transport_tests.rs` → `sync_alpn_is_frozen_at_v6` |
 | Each table's declared conflict policy decides a resend | `tests/conflict_policy_honored_tests.rs` → `a_declared_keep_latest_table_takes_the_latest_value_on_a_resend` |
+| A file-backed oversized row-only push can confirm through pull after its reply is lost | `tests/iroh_transport_tests.rs` → `row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost` |
 | A pull right after a push never echoes the edge's own write back as a conflict | `tests/self_echo_pull_after_push_tests.rs` → `pull_right_after_push_does_not_self_echo_as_a_conflict` |
 | Production sync refuses a transport without a node identity | `tests/authenticated_sync_contract_tests.rs` → `production_sync_refuses_identityless_transport` |
 | A usage error creates no database and no identity | `tests/usage_error_no_side_effects_tests.rs` → `usage_error_before_ticket_flag_check_does_not_create_the_database`; `tests/server_resource_policy_contract_tests.rs` → `every_invalid_resource_value_is_a_usage_error_before_database_open` |
@@ -44,6 +45,7 @@ aliases; a behavior reaches the binary as a flag.
 | No binary exits with a bare integer | `tests/binary_exit_code_contract.rs` → `no_binary_exits_with_a_bare_integer_literal` |
 | A vector update syncs with its owner row before delete arbitration | `tests/established_owner_vector_update_sync_tests.rs` → `established_owner_vector_update_syncs_before_delete_arbitration` |
 | A pushed vector schema capability the receiving peer lacks is held back per table, never silently applied and never a wholesale refusal of ordinary tables | `crates/contextdb-engine/tests/vector/vector_schema_mixed_version_push_compatibility_contract.rs` → `newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_after_hub_upgrade`, `a_newer_edge_holds_authored_history_until_the_hub_can_replay_it` (siblings: `vector_schema_mixed_version_recovery_cursor_contract.rs`, `vector_schema_mixed_version_compatibility_contract.rs`, `vector_schema_mixed_version_erasure_frontier_contract.rs`, `vector_schema_mixed_version_restart_contract.rs`) — capability holdback logic (`SchemaSyncCapability`, `SchemaSyncHoldback`) lives in the engine's `sync_server.rs`; these tests drive it through `contextdb-server`'s `SyncClient`/`SyncServer`/`protocol`, so a new server-side refusal test for a schema-capability change belongs beside them, not beside `protocol_version_bump_tests.rs` (that guards protocol *version* mismatch, a different refusal). |
+| A pushed maintained-count declaration reaches the hub; a peer without the capability holds that table while other tables sync | `tests/authenticated_sync_contract_tests.rs` → `a_maintained_count_declaration_crosses_sync_or_holds_back_its_table` |
 | Exactly one of two racing workers wins a claim | `tests/work_ledger_tests.rs` → `two_workers_race_exactly_one_wins_and_one_result_exists` |
 
 ## Where a change lives
@@ -54,11 +56,13 @@ aliases; a behavior reaches the binary as a flag.
 | A `contextdb-server` flag or exit code | `main.rs`, `exit_codes.rs`, `owner_read_options.rs` |
 | When an edge pushes automatically | `sync_plugin.rs` |
 | Claim-by-push, worker polling, lease stand-down | `work_ledger.rs`; the ledger tables themselves are the engine's `work_ledger` |
+| Received column mismatch, partial ALTER, source-transaction replay or retry outcome | Engine `database.rs`; durable schema/migration records in engine `persistence.rs`. No replay implementation here. |
 | A transport or staging change | The engine's `transport/`; then refresh the mirror files here byte for byte |
 
 ## Fast tests
 
 ```bash
 cargo test -p contextdb-server --test transport_boundary_tests --test protocol_version_bump_tests
+cargo test -p contextdb-server --test authenticated_sync_contract_tests
 cargo test -p contextdb-engine --features test-seams --test sync
 ```

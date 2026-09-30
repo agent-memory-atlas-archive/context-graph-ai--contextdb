@@ -1,7 +1,7 @@
 use super::common::{count_rows, empty_params};
 use contextdb_core::{
-    CallbackKind, ContextId, Error, Lsn, Principal, Result, RowId, ScopeLabel, SortDirection, TxId,
-    UpsertResult, Value, VectorIndexRef, VectorPartitionKey, VersionedRow,
+    CallbackKind, ContextId, Error, Incarnation, Lsn, Principal, Result, RowId, ScopeLabel,
+    SortDirection, TxId, UpsertResult, Value, VectorIndexRef, VectorPartitionKey, VersionedRow,
 };
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
@@ -12,7 +12,7 @@ use contextdb_engine::{
     TriggerEvent,
 };
 use contextdb_server::protocol::{
-    WireChangeSet, WireDdlProvenance, canonical_ddl_provenance_digest,
+    WireChangeSet, WireDdlAuthor, WireDdlProvenance, canonical_ddl_provenance_digest,
 };
 use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -6448,6 +6448,12 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
 
 #[test]
 fn t3_d7_wire_split_preserves_sender_lsn_under_byte_pressure() {
+    // Authenticated received DDL's signed
+    // provenance is what attests the schema the author actually sent, so this fixture
+    // carries a real signed author block per entry -- the properly-signed replay is the
+    // delivery shape this test proves. The sibling
+    // `t3_d7_unsigned_authenticated_ddl_claim_is_refused` proves an invalid shape (an
+    // authenticated claim naming no signed author) is refused instead of accepted.
     let trigger_ddl = vec![
         DdlChange::CreateTrigger {
             name: "wire_trigger".into(),
@@ -6477,19 +6483,32 @@ fn t3_d7_wire_split_preserves_sender_lsn_under_byte_pressure() {
                 other => panic!("unexpected trigger DDL in fixture: {other:?}"),
             };
             let ordinal = 0;
+            let digest = canonical_ddl_provenance_digest(
+                ddl,
+                *source_ddl_lsn,
+                ordinal,
+                table.as_deref(),
+                table_generation,
+            )
+            .expect("trigger DDL provenance digest must encode");
             WireDdlProvenance {
                 source_ddl_lsn: *source_ddl_lsn,
                 ordinal,
-                digest: canonical_ddl_provenance_digest(
-                    ddl,
-                    *source_ddl_lsn,
-                    ordinal,
-                    table.as_deref(),
-                    table_generation,
-                )
-                .expect("trigger DDL provenance digest must encode"),
-                table,
+                digest: digest.clone(),
+                table: table.clone(),
                 table_generation,
+                author: Some(WireDdlAuthor {
+                    node_id: "a1".repeat(32),
+                    incarnation: Incarnation(1),
+                    source_ddl_lsn: *source_ddl_lsn,
+                    ordinal,
+                    table,
+                    table_generation,
+                    digest,
+                    attestation: vec![0x5a; 64],
+                    unit_statements: 1,
+                }),
+                unattested: false,
             }
         })
         .collect();
@@ -6594,6 +6613,52 @@ fn t3_d7_wire_split_preserves_sender_lsn_under_byte_pressure() {
     assert_eq!(
         batch_lsn_counts, expected,
         "byte-pressure splitter must split only on complete sender-LSN boundaries across rows, graph edges, and vectors"
+    );
+}
+
+#[test]
+fn t3_d7_unsigned_authenticated_ddl_claim_is_refused() {
+    // Authenticated received DDL is immutable
+    // after transport validation. Its signed provenance, source LSN, ordinal, generation,
+    // and canonical digest attest to the schema the author actually sent" -- a provenance
+    // record that claims to be authenticated (`unattested: false`) but names no signed
+    // author must be refused, not accepted. This is the fixture shape
+    // `t3_d7_wire_split_preserves_sender_lsn_under_byte_pressure` guards using
+    // a real signed author instead.
+    let ddl = DdlChange::CreateTrigger {
+        name: "wire_trigger".into(),
+        table: "host_writes".into(),
+        on_events: vec!["INSERT".into()],
+    };
+    let wire_changes = ChangeSet {
+        ddl: vec![ddl],
+        ddl_lsn: vec![Lsn(5)],
+        ..Default::default()
+    };
+    let mut wire_changes = WireChangeSet::from(wire_changes);
+    let digest = canonical_ddl_provenance_digest(
+        &wire_changes.ddl[0],
+        Lsn(5),
+        0,
+        Some("host_writes"),
+        Some(1),
+    )
+    .expect("trigger DDL provenance digest must encode");
+    wire_changes.ddl_provenance = vec![WireDdlProvenance {
+        source_ddl_lsn: Lsn(5),
+        ordinal: 0,
+        table: Some("host_writes".to_string()),
+        table_generation: Some(1),
+        digest,
+        author: None,
+        unattested: false,
+    }];
+    let error = ChangeSet::try_from(wire_changes).expect_err(
+        "an authenticated claim (unattested: false) naming no signed author must be refused",
+    );
+    assert!(
+        error.to_string().contains("names no signed author"),
+        "must keep the established signed-author refusal, got {error}"
     );
 }
 

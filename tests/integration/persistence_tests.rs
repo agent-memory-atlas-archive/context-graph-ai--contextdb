@@ -413,68 +413,6 @@ fn p01_relational_rows_survive_reopen() {
 }
 
 #[test]
-fn p01b_legacy_u64_relational_table_migrates_to_versioned_keys() {
-    use redb::{ReadableDatabase, ReadableTable};
-
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("legacy-relational.db");
-    let db = Database::open(&path).unwrap();
-    db.execute(
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    let id = Uuid::new_v4();
-    db.execute(
-        "INSERT INTO items (id, name) VALUES ($id, 'legacy')",
-        &HashMap::from([("id".to_string(), Value::Uuid(id))]),
-    )
-    .unwrap();
-    db.close().unwrap();
-
-    let redb_db = redb::Database::open(&path).unwrap();
-    let write_txn = redb_db.begin_write().unwrap();
-    let versioned_def: redb::TableDefinition<&[u8], &[u8]> =
-        redb::TableDefinition::new("rel_items");
-    let legacy_def: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("rel_items");
-    let mut legacy_rows = Vec::new();
-    {
-        let versioned = write_txn.open_table(versioned_def).unwrap();
-        for entry in versioned.iter().unwrap() {
-            let (key, value) = entry.unwrap();
-            let row_id = u64::from_be_bytes(key.value()[..8].try_into().unwrap());
-            legacy_rows.push((row_id, value.value().to_vec()));
-        }
-    }
-    write_txn.delete_table(versioned_def).unwrap();
-    {
-        let mut legacy = write_txn.open_table(legacy_def).unwrap();
-        for (row_id, bytes) in &legacy_rows {
-            legacy.insert(*row_id, bytes.as_slice()).unwrap();
-        }
-    }
-    write_txn.commit().unwrap();
-    drop(redb_db);
-
-    let reopened = Database::open(&path).unwrap();
-    let row = reopened
-        .point_lookup("items", "id", &Value::Uuid(id), reopened.snapshot())
-        .unwrap()
-        .expect("legacy row must load after migration");
-    assert_eq!(text(&row, "name"), "legacy");
-    reopened.close().unwrap();
-
-    let redb_db = redb::Database::open(&path).unwrap();
-    let read_txn = redb_db.begin_read().unwrap();
-    assert!(read_txn.open_table(versioned_def).is_ok());
-    assert!(matches!(
-        read_txn.open_table(legacy_def),
-        Err(redb::TableError::TableTypeMismatch { .. })
-            | Err(redb::TableError::TableDoesNotExist(_))
-    ));
-}
-
-#[test]
 fn p02_ddl_schema_survives_reopen() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("ddl.db");

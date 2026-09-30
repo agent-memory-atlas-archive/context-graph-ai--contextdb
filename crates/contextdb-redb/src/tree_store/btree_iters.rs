@@ -1,10 +1,12 @@
 use crate::Result;
-use crate::tree_store::btree_base::{BRANCH, LEAF};
-use crate::tree_store::btree_base::{BranchAccessor, LeafAccessor};
+use crate::tree_store::btree_base::{
+    BRANCH, BranchAccessor, BtreeHeader, Checksum, LEAF, LeafAccessor, branch_checksum,
+    leaf_checksum,
+};
 use crate::tree_store::btree_iters::RangeIterState::{Internal, Leaf};
 use crate::tree_store::btree_mutator::MutateHelper;
 use crate::tree_store::page_store::{Page, PageHint, PageImpl, TransactionalMemory};
-use crate::tree_store::{BtreeHeader, PageNumber, PageTrackerPolicy};
+use crate::tree_store::{PageNumber, PageTrackerPolicy};
 use crate::types::{Key, Value};
 use Bound::{Excluded, Included, Unbounded};
 use std::borrow::Borrow;
@@ -12,6 +14,34 @@ use std::collections::Bound;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeBounds};
 use std::sync::{Arc, Mutex};
+
+fn checked_page(
+    manager: &TransactionalMemory,
+    page_number: PageNumber,
+    expected: Checksum,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+    hint: PageHint,
+) -> Result<PageImpl> {
+    let page = manager.get_page(page_number, hint)?;
+    if hint.verifies_path() {
+        let actual = match page.memory().first().copied() {
+            Some(LEAF) => leaf_checksum(&page, fixed_key_size, fixed_value_size)?,
+            Some(BRANCH) => branch_checksum(&page, fixed_key_size)?,
+            _ => {
+                return Err(crate::StorageError::Corrupted(format!(
+                    "retained snapshot page {page_number:?} has an invalid btree node type"
+                )));
+            }
+        };
+        if actual != expected {
+            return Err(crate::StorageError::Corrupted(format!(
+                "retained snapshot page {page_number:?} failed checksum verification"
+            )));
+        }
+    }
+    Ok(page)
+}
 
 #[derive(Debug, Clone)]
 pub enum RangeIterState {
@@ -75,8 +105,16 @@ impl RangeIterState {
                 mut parent,
             } => {
                 let accessor = BranchAccessor::new(&page, fixed_key_size);
-                let child_page = accessor.child_page(child).unwrap();
-                let child_page = manager.get_page(child_page, hint)?;
+                let child_page_number = accessor.child_page(child).unwrap();
+                let expected = accessor.child_checksum(child).unwrap();
+                let child_page = checked_page(
+                    manager,
+                    child_page_number,
+                    expected,
+                    fixed_key_size,
+                    fixed_value_size,
+                    hint,
+                )?;
                 let direction = if reverse { -1 } else { 1 };
                 let next_child = isize::try_from(child).unwrap() + direction;
                 if 0 <= next_child && next_child < accessor.count_children().try_into().unwrap() {
@@ -375,7 +413,7 @@ pub(crate) struct BtreeRangeIter<K: Key + 'static, V: Value + 'static> {
     hint: PageHint,
     // When Some, the right boundary is Unbounded and not yet computed.
     // Stores the tree root for lazy initialization on first next_back() call.
-    uninit_right_root: Option<PageNumber>,
+    uninit_right_root: Option<BtreeHeader>,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
@@ -409,6 +447,40 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         manager: Arc<TransactionalMemory>,
         hint: PageHint,
     ) -> Result<Self> {
+        debug_assert!(!hint.verifies_path());
+        Self::new_with_header(
+            query_range,
+            table_root.map(|root| BtreeHeader::new(root, 0, 0)),
+            manager,
+            hint,
+        )
+    }
+
+    pub(crate) fn new_with_header<'a, T: RangeBounds<KR>, KR: Borrow<K::SelfType<'a>>>(
+        query_range: &'_ T,
+        table_root: Option<BtreeHeader>,
+        manager: Arc<TransactionalMemory>,
+        hint: PageHint,
+    ) -> Result<Self> {
+        Self::new_with_root_page(query_range, table_root, None, manager, hint)
+    }
+
+    /// Like `new_with_header`, starting from a root page the caller already
+    /// holds for `table_root` and has verified under the same `hint`.
+    ///
+    /// Both ends of a range descend from the root. Re-reading it for each end
+    /// costs a second copy of the page whenever it is not in the page cache
+    /// -- always so for a page larger than the cache, such as the single leaf
+    /// holding one oversized value -- and both copies are held by the
+    /// iterator at once.
+    pub(crate) fn new_with_root_page<'a, T: RangeBounds<KR>, KR: Borrow<K::SelfType<'a>>>(
+        query_range: &'_ T,
+        table_root: Option<BtreeHeader>,
+        root_page: Option<PageImpl>,
+        manager: Arc<TransactionalMemory>,
+        hint: PageHint,
+    ) -> Result<Self> {
+        let held_root = root_page;
         if range_is_empty::<K, KR, T>(query_range) {
             return Ok(Self {
                 left: None,
@@ -423,9 +495,23 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
             });
         }
         if let Some(root) = table_root {
+            let root_page = || match &held_root {
+                // A held page is not read again, so the failure a read would
+                // have reported -- the database closed, or an earlier I/O
+                // failure -- is checked here instead.
+                Some(page) => manager.check_io_errors().map(|()| page.clone()),
+                None => checked_page(
+                    &manager,
+                    root.root,
+                    root.checksum,
+                    K::fixed_width(),
+                    V::fixed_width(),
+                    hint,
+                ),
+            };
             let (include_left, left) = match query_range.start_bound() {
                 Included(k) => find_iter_left::<K, V>(
-                    manager.get_page(root, hint)?,
+                    root_page()?,
                     None,
                     K::as_bytes(k.borrow()).as_ref(),
                     true,
@@ -433,7 +519,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                     hint,
                 )?,
                 Excluded(k) => find_iter_left::<K, V>(
-                    manager.get_page(root, hint)?,
+                    root_page()?,
                     None,
                     K::as_bytes(k.borrow()).as_ref(),
                     false,
@@ -441,13 +527,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                     hint,
                 )?,
                 Unbounded => {
-                    let state = find_iter_unbounded::<K, V>(
-                        manager.get_page(root, hint)?,
-                        None,
-                        false,
-                        &manager,
-                        hint,
-                    )?;
+                    let state =
+                        find_iter_unbounded::<K, V>(root_page()?, None, false, &manager, hint)?;
                     (true, state)
                 }
             };
@@ -457,7 +538,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
             let (include_right, right, uninit_right_root) = match query_range.end_bound() {
                 Included(k) => {
                     let (inc, state) = find_iter_right::<K, V>(
-                        manager.get_page(root, hint)?,
+                        root_page()?,
                         None,
                         K::as_bytes(k.borrow()).as_ref(),
                         true,
@@ -468,7 +549,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                 }
                 Excluded(k) => {
                     let (inc, state) = find_iter_right::<K, V>(
-                        manager.get_page(root, hint)?,
+                        root_page()?,
                         None,
                         K::as_bytes(k.borrow()).as_ref(),
                         false,
@@ -588,7 +669,14 @@ impl<K: Key, V: Value> DoubleEndedIterator for BtreeRangeIter<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         // Lazily initialize the unbounded right boundary on first next_back() call.
         if let Some(root) = self.uninit_right_root.take() {
-            let page = match self.manager.get_page(root, self.hint) {
+            let page = match checked_page(
+                &self.manager,
+                root.root,
+                root.checksum,
+                K::fixed_width(),
+                V::fixed_width(),
+                self.hint,
+            ) {
                 Ok(p) => p,
                 Err(e) => return Some(Err(e)),
             };
@@ -693,7 +781,14 @@ fn find_iter_unbounded<K: Key, V: Value>(
                 0
             };
             let child_page_number = accessor.child_page(child_index).unwrap();
-            let child_page = manager.get_page(child_page_number, hint)?;
+            let child_page = checked_page(
+                manager,
+                child_page_number,
+                accessor.child_checksum(child_index).unwrap(),
+                K::fixed_width(),
+                V::fixed_width(),
+                hint,
+            )?;
             let direction = if reverse { -1isize } else { 1 };
             parent = Some(Box::new(Internal {
                 page,
@@ -745,7 +840,14 @@ fn find_iter_left<K: Key, V: Value>(
         BRANCH => {
             let accessor = BranchAccessor::new(&page, K::fixed_width());
             let (child_index, child_page_number) = accessor.child_for_key::<K>(query);
-            let child_page = manager.get_page(child_page_number, hint)?;
+            let child_page = checked_page(
+                manager,
+                child_page_number,
+                accessor.child_checksum(child_index).unwrap(),
+                K::fixed_width(),
+                V::fixed_width(),
+                hint,
+            )?;
             if child_index < accessor.count_children() - 1 {
                 parent = Some(Box::new(Internal {
                     page,
@@ -794,7 +896,14 @@ fn find_iter_right<K: Key, V: Value>(
         BRANCH => {
             let accessor = BranchAccessor::new(&page, K::fixed_width());
             let (child_index, child_page_number) = accessor.child_for_key::<K>(query);
-            let child_page = manager.get_page(child_page_number, hint)?;
+            let child_page = checked_page(
+                manager,
+                child_page_number,
+                accessor.child_checksum(child_index).unwrap(),
+                K::fixed_width(),
+                V::fixed_width(),
+                hint,
+            )?;
             if child_index > 0 && accessor.child_page(child_index - 1).is_some() {
                 parent = Some(Box::new(Internal {
                     page,

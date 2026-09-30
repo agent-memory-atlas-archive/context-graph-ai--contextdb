@@ -249,15 +249,20 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
         activity_after_alpha.raw_partition_loads, activity_before_alpha.raw_partition_loads,
         "the indexed route must not disguise candidate scoring as a complete raw-partition load"
     );
-    assert_eq!(
-        activity_after_alpha.raw_candidate_point_loads
-            - activity_before_alpha.raw_candidate_point_loads,
-        alpha_trace
-            .hnsw_candidate_row_ids
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len() as u64,
-        "native scoring point-loads each distinct candidate without loading the raw partition"
+    // The one search scores its candidates nearest first and stops once the
+    // page cannot change, so it point-loads at least the row it returns and
+    // never more than the distinct candidates its graph walk handed back.
+    let point_loads = activity_after_alpha.raw_candidate_point_loads
+        - activity_before_alpha.raw_candidate_point_loads;
+    let distinct_candidates = alpha_trace
+        .hnsw_candidate_row_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u64;
+    assert!(
+        (1..=distinct_candidates).contains(&point_loads),
+        "native scoring point-loads only candidates, each once, without loading the raw \
+         partition: {point_loads} point loads for {distinct_candidates} distinct candidates"
     );
 
     assert_eq!(
@@ -354,15 +359,17 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
         activity_after_pressure.raw_partition_loads, activity_before_alpha.raw_partition_loads,
         "both indexed searches leave complete raw partitions dormant"
     );
-    assert_eq!(
-        activity_after_pressure.raw_candidate_point_loads
-            - activity_before_pressure.raw_candidate_point_loads,
-        pressure_trace
-            .hnsw_candidate_row_ids
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len() as u64,
-        "native scoring point-loads each distinct candidate without loading the raw partition"
+    let point_loads = activity_after_pressure.raw_candidate_point_loads
+        - activity_before_pressure.raw_candidate_point_loads;
+    let distinct_candidates = pressure_trace
+        .hnsw_candidate_row_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u64;
+    assert!(
+        (1..=distinct_candidates).contains(&point_loads),
+        "native scoring point-loads only candidates, each once, without loading the raw \
+         partition: {point_loads} point loads for {distinct_candidates} distinct candidates"
     );
     assert!(
         !db.vector_store_for_test()

@@ -1236,18 +1236,16 @@ fn cwv_05_trigger_staged_counter_parity() {
         trig_stats.staged_vs_staged_comparisons
     );
 
-    assert_eq!(
-        trig_stats.staged_vs_staged_comparisons, plain_stats.staged_vs_staged_comparisons,
-        "trigger-staged comparison work diverged from plain staging"
-    );
-    assert_eq!(
-        trig_stats.rows_validated, plain_stats.rows_validated,
-        "trigger-staged rows-validated diverged from plain staging"
-    );
-    assert_eq!(
-        trig_stats.indexed_probes, plain_stats.indexed_probes,
-        "trigger-staged indexed probes diverged from plain staging"
-    );
+    // Both paths validate the complete transaction once. Trigger dispatch may
+    // prepare additional rows before that final validation.
+    let full_comparisons = 3 * n + 1;
+    let full_rows_validated = 3 * staged_inserts;
+    assert_eq!(plain_stats.staged_vs_staged_comparisons, full_comparisons);
+    assert_eq!(trig_stats.staged_vs_staged_comparisons, full_comparisons);
+    assert_eq!(plain_stats.rows_validated, full_rows_validated);
+    assert_eq!(trig_stats.rows_validated, full_rows_validated);
+    assert_eq!(plain_stats.indexed_probes, full_comparisons);
+    assert_eq!(trig_stats.indexed_probes, full_comparisons);
     assert!(
         plain_stats.index_maintenance_visits >= staged_inserts,
         "plain fixture did not count index maintenance"

@@ -604,6 +604,14 @@ impl Database {
         let mut vector_schema_guard =
             Some(self.vector_schema_read_many(self.vector_store_schema_refs()));
         let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
+        // Armed just before the durable apply; see `PublicationInterruptionWatch`
+        // in `database.rs`. A scheduled job's commit is durable the moment the
+        // manager applies it, and its sink events, trigger audits and commit
+        // event reach memory only afterwards -- so an unwind in between leaves
+        // this handle behind its own durable image, exactly as it does on the
+        // local and received doors, and it must stop serving until reopened.
+        let publication_watch =
+            std::cell::RefCell::new(None::<super::PublicationInterruptionWatch>);
         let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
             tx,
             |reserved_lsn| {
@@ -668,6 +676,16 @@ impl Database {
                     let _validation = self.commit_validate(tx, ws)?;
                     self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
                     let prepared_sink_events = self.prepare_sink_events_for_write_set(ws)?;
+                    if !prepared_sink_events.is_empty() {
+                        self.event_bus
+                            .ensure_queue_capacity(&prepared_sink_events)?;
+                    }
+                    if self.persistence.is_some() && !prepared_sink_events.is_empty() {
+                        ws.config_writes.push((
+                            super::event_bus::NEXT_ACTION_ID_CONFIG_KEY.to_string(),
+                            RedbPersistence::encode_config_value(&self.event_bus.next_action_id())?,
+                        ));
+                    }
                     if self.persistence.is_some()
                         && let Some(lsn) = ws.commit_lsn
                     {
@@ -688,6 +706,9 @@ impl Database {
                     *delete_release_bytes.borrow_mut() =
                         self.delete_release_bytes_for_write_set(ws);
                 }
+                *publication_watch.borrow_mut() = Some(super::PublicationInterruptionWatch::arm(
+                    &self.publication_interrupted,
+                ));
                 Ok(())
             },
         );
@@ -696,6 +717,10 @@ impl Database {
             Ok((lsn, ws)) => {
                 self.pending_commit_metadata.lock().remove(&tx);
                 if !ws.is_empty() {
+                    #[cfg(test)]
+                    super::take_local_commit_stage_fault_for_test(
+                        super::LocalCommitStageFaultPoint::AfterScheduledJobDurableCommit,
+                    );
                     self.release_delete_allocations_from_bytes(&delete_release_bytes.borrow());
                     drop(vector_schema_guard.take());
                     self.plugin.post_commit(&ws, CommitSource::AutoCommit);
@@ -713,9 +738,15 @@ impl Database {
                     self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
                     self.publish_commit_event_if_subscribers(&ws, CommitSource::AutoCommit, lsn);
                 }
+                if let Some(watch) = publication_watch.borrow_mut().take() {
+                    watch.completed();
+                }
                 Ok(lsn)
             }
             Err(failure) => {
+                if let Some(watch) = publication_watch.borrow_mut().take() {
+                    watch.completed();
+                }
                 self.pending_commit_metadata.lock().remove(&tx);
                 if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
                     let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
@@ -797,6 +828,7 @@ impl Database {
             id: super::DatabaseId::next(),
             tx_mgr: self.tx_mgr.clone(),
             relational_store: self.relational_store.clone(),
+            vector_serving_cache_bytes: self.vector_serving_cache_bytes.clone(),
             graph_store: self.graph_store.clone(),
             vector_store: self.vector_store.clone(),
             vector_schema_gates: self.vector_schema_gates.clone(),
@@ -814,20 +846,39 @@ impl Database {
             sync_client_push_locks: self.sync_client_push_locks.clone(),
             received_schema_stages: self.received_schema_stages.clone(),
             local_erasure_stages: self.local_erasure_stages.clone(),
+            received_arriving_table_meta: self.received_arriving_table_meta.clone(),
             pending_local_schema_stages: self.pending_local_schema_stages.clone(),
             local_schema_stages: self.local_schema_stages.clone(),
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
             detached_sync_write_set: self.detached_sync_write_set.clone(),
+            received_staging_access: self.received_staging_access.clone(),
             received_vector_image_pending: self.received_vector_image_pending.clone(),
             persistence: self.persistence.clone(),
             committed_image_startup: self.committed_image_startup.clone(),
+            image_history: self.image_history.clone(),
+            retained_relational_source: self.retained_relational_source.clone(),
             read_image_memory: self.read_image_memory.clone(),
             blob_repository: self.blob_repository.clone(),
             open_registry_path: Mutex::new(None),
             operation_gate: self.operation_gate.clone(),
+            read_publication_gate: self.read_publication_gate.clone(),
             schema_publication_gate: self.schema_publication_gate.clone(),
             apply_phase_pause: self.apply_phase_pause.clone(),
             sync_apply_pre_commit_pause: self.sync_apply_pre_commit_pause.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            received_schema_pre_commit_pause: self.received_schema_pre_commit_pause.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            received_schema_pre_publish_pause: self.received_schema_pre_publish_pause.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            received_schema_apply_observer: self.received_schema_apply_observer.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            local_schema_pre_commit_pause: self.local_schema_pre_commit_pause.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            local_schema_pre_publish_pause: self.local_schema_pre_publish_pause.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            local_schema_between_publication_pause: self
+                .local_schema_between_publication_pause
+                .clone(),
             export_after_capture_pause: self.export_after_capture_pause.clone(),
             relational: MemRelationalExecutor::new(
                 self.relational_store.clone(),
@@ -906,8 +957,16 @@ impl Database {
             auto_compact_min_interval: self.auto_compact_min_interval.clone(),
             sync_watermark: self.sync_watermark.clone(),
             closed: AtomicBool::new(false),
+            close_progress: Arc::new(Mutex::new(CloseProgress::Idle)),
+            close_changed: Arc::new(Condvar::new()),
+            close_error: Mutex::new(None),
+            #[cfg(feature = "test-seams")]
+            close_follower_observer: Mutex::new(None),
             resource_closed: self.resource_closed.clone(),
+            publication_interrupted: self.publication_interrupted.clone(),
             rows_examined: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-seams"))]
+            candidate_rows_materialized: self.candidate_rows_materialized.clone(),
             last_vector_search_used_hnsw: Arc::clone(&self.last_vector_search_used_hnsw),
             last_vector_search_trace: Arc::clone(&self.last_vector_search_trace),
             statement_cache: RwLock::new(HashMap::new()),
@@ -1096,5 +1155,85 @@ mod tests {
         assert!(db.cron.runtime.lock().handle.is_some());
 
         db.close()
+    }
+
+    /// THE STOP-SERVING RULE ON A SCHEDULED JOB'S COMMIT.
+    ///
+    /// A scheduled job commits through the reserved-LSN door and publishes its
+    /// sink events, trigger audits and commit event to memory only after that
+    /// commit is durable. It did not arm the publication-interruption watch,
+    /// so a panic in that window left the handle serving a memory image behind
+    /// its own file. Now it stops serving, and a reopen recovers the complete
+    /// committed state -- the row the job wrote included.
+    #[test]
+    fn a_scheduled_job_whose_publication_is_interrupted_stops_serving_until_reopened() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("cron-publication-interrupted.redb");
+        let params = HashMap::new();
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE cron_notes (id INTEGER PRIMARY KEY, body TEXT) SYNC OFF",
+            &params,
+        )
+        .unwrap();
+        db.execute("INSERT INTO cron_notes VALUES (1, 'one')", &params)
+            .unwrap();
+
+        let callback: CronCallback = Arc::new(|db: &Database| {
+            db.execute(
+                "INSERT INTO cron_notes VALUES (2, 'scheduled')",
+                &HashMap::new(),
+            )
+            .map(|_| ())
+        });
+        LOCAL_COMMIT_STAGE_FAULT.with(|fault| {
+            fault.set(Some(
+                LocalCommitStageFaultPoint::AfterScheduledJobDurableCommit,
+            ))
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = db.run_cron_callback_transaction(callback);
+        }));
+        let fired = LOCAL_COMMIT_STAGE_FAULT.with(|fault| fault.get().is_none());
+        LOCAL_COMMIT_STAGE_FAULT.with(|fault| fault.set(None));
+        assert!(
+            fired,
+            "the scheduled job never reached its own publication boundary"
+        );
+        assert!(
+            outcome.is_err(),
+            "the injected unwind must unwind through the scheduled job's publication"
+        );
+        for (what, result) in [
+            (
+                "a read",
+                db.execute("SELECT id FROM cron_notes", &params).map(|_| ()),
+            ),
+            (
+                "a write",
+                db.execute("INSERT INTO cron_notes VALUES (9001, 'after')", &params)
+                    .map(|_| ()),
+            ),
+            ("a new transaction", db.begin().map(|_| ())),
+        ] {
+            assert!(
+                matches!(result, Err(Error::PublicationInterrupted)),
+                "{what} on a handle whose scheduled job's publication was interrupted after the \
+                 durable commit must be refused until a reopen, got {result:?}"
+            );
+        }
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .execute("SELECT id FROM cron_notes ORDER BY id", &params)
+                .unwrap()
+                .rows
+                .len(),
+            2,
+            "a reopen recovers the complete committed state, the scheduled row included"
+        );
+        reopened.close().unwrap();
     }
 }

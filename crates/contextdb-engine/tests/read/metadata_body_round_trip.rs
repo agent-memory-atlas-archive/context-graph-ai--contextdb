@@ -21,7 +21,7 @@ use contextdb_engine::{
     DirectScopeLabelKind, DirectSinkStatus, DirectStateMachine, DirectVectorQuantization,
     MetadataBody, VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure,
     VectorSearchDisclosure, VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute,
-    VectorSearchScopeShape, VectorSearchTailState,
+    VectorSearchRouteEvidence, VectorSearchScopeShape, VectorSearchTailState,
 };
 use std::collections::BTreeMap;
 
@@ -269,6 +269,7 @@ fn an_events_status() -> DirectEventsStatus {
             delivered: 11,
             queued: 2,
             retried: 3,
+            uncertain: 4,
             permanent_failures: 1,
             examined: 17,
         }],
@@ -341,6 +342,7 @@ fn an_explained_statement_survives_the_wire() {
         physical_plan: "Project -> HNSWSearch".to_owned(),
         index: None,
         vector_search: Some(VectorSearchDisclosure {
+            route_evidence: VectorSearchRouteEvidence::PassivePrediction,
             requested_mode: VectorSearchMode::Auto,
             resolved_mode: VectorSearchMode::Indexed,
             aggregate_allowed_vectors: Some(1_024),
@@ -357,8 +359,15 @@ fn an_explained_statement_survives_the_wire() {
             refusal: None,
             recovery: Some("run vector maintenance and retry".to_owned()),
             query_source: VectorQuerySourceDisclosure::RedactedRowKey,
+            global_candidate_budget: None,
+            admission_evaluations: None,
+            expansion_evaluations: None,
+            layers_admitted: None,
+            budget_terminal: None,
             partition_hnsw: vec![VectorPartitionHnswDisclosure {
                 partition: "<redacted:1>".to_owned(),
+                route: Some(VectorSearchRoute::FilteredIndexed),
+                reason: Some("predicted_indexed_route".to_owned()),
                 hnsw_m: 24,
                 hnsw_ef_construction: 240,
                 hnsw_ef_search: 96,

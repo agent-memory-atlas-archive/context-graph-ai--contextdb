@@ -6,7 +6,9 @@
 //! Rust mode API is available.
 
 use contextdb_core::{ContextId, Error, Principal, ScopeLabel, TxId, Value};
-use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
+use contextdb_engine::{
+    Database, MaintenancePolicy, QueryResult, SemanticQuery, VectorSearchRouteEvidence,
+};
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
@@ -2379,11 +2381,17 @@ fn restricted_inspection_keeps_adaptive_partition_populations_private() {
             .replace("$bucket", "'shared'")
             .replace("$query", "[1.0,0.0]");
         for sql in [fixture.sql(), bound_sql.as_str()] {
+            scoped.__reset_passive_disclosure_work_for_test();
             let explain = scoped.explain_output(sql).unwrap();
             let disclosure = explain.vector_search.unwrap();
             assert!(
                 disclosure.partition_hnsw.is_empty(),
                 "{hidden_by:?}: {disclosure:?}"
+            );
+            assert_eq!(
+                scoped.__passive_disclosure_work_for_test(),
+                (0, 0),
+                "{hidden_by:?}: zero-visible partitions must skip full live counts and state lookup"
             );
         }
     }
@@ -2435,10 +2443,32 @@ fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
                         reader.route()
                     );
                 } else {
+                    let answer = answer.unwrap();
                     assert_eq!(
-                        result_ids(&answer.unwrap()),
+                        result_ids(&answer),
                         fixture.authorized_ids,
                         "{hidden_by:?} {:?} {mode}",
+                        reader.route()
+                    );
+                    let disclosure =
+                        answer.trace.vector_search.as_ref().expect(
+                            "the restricted executed read publishes a vector route receipt",
+                        );
+                    assert_eq!(
+                        disclosure.route_evidence,
+                        VectorSearchRouteEvidence::Executed,
+                        "{hidden_by:?} {:?} {mode}: execution must not be labelled as prediction",
+                        reader.route()
+                    );
+                    assert!(
+                        disclosure.partition_hnsw.is_empty(),
+                        "{hidden_by:?} {:?} {mode}: per-partition adaptive facts stay redacted",
+                        reader.route()
+                    );
+                    assert_ne!(
+                        disclosure.fallback.as_deref(),
+                        Some("maintained_index_unavailable"),
+                        "{hidden_by:?} {:?} {mode}: redaction must not fabricate a missing-index reason",
                         reader.route()
                     );
                 }

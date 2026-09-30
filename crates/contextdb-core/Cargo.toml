@@ -12,6 +12,10 @@ description = "Core types, traits, and error types for contextdb"
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Test-only observation of how a statement shares memory among its loads.
+test-seams = []
+
 [dependencies]
 uuid.workspace = true
 rand = "0.9"

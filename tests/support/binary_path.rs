@@ -18,6 +18,33 @@ pub(crate) fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The directory `cargo build`/`cargo test` actually placed the workspace's
+/// binaries in. A build that runs with `CARGO_TARGET_DIR` set to a directory
+/// other than `<repo>/target` still has that variable in its own process environment
+/// when it runs the compiled test binary, since child processes inherit it
+/// from whoever invoked `cargo test`; honoring it here is what lets the
+/// binary this same build just produced actually be found.
+fn target_root() -> PathBuf {
+    let configured = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    resolve_target_dir(configured.as_deref(), &workspace_root())
+}
+
+/// Anchors a possibly-relative `CARGO_TARGET_DIR` against `workspace_root`
+/// -- the directory the supported invocation always runs `cargo` from --
+/// into the absolute path Cargo actually built into. Cargo resolves a
+/// relative `CARGO_TARGET_DIR` against ITS OWN working directory at
+/// invocation, not the test binary's package directory; the test process
+/// runs from the latter, so using the configured value as-is here silently
+/// pointed a relative value at the wrong directory. An already-absolute
+/// value names its own directory outright and needs no anchor.
+fn resolve_target_dir(configured: Option<&Path>, workspace_root: &Path) -> PathBuf {
+    match configured {
+        Some(configured) if configured.is_absolute() => configured.to_path_buf(),
+        Some(configured) => workspace_root.join(configured),
+        None => workspace_root.join("target"),
+    }
+}
+
 pub(crate) fn binary_name(binary: &str) -> String {
     if cfg!(windows) {
         format!("{binary}.exe")
@@ -38,8 +65,9 @@ pub(crate) fn binary_name(binary: &str) -> String {
 /// explicitly and fails loudly if that profile's binary is missing.
 pub(crate) fn resolve_workspace_binary(binary: &str) -> PathBuf {
     let name = binary_name(binary);
-    let debug = workspace_root().join("target").join("debug").join(&name);
-    let release = workspace_root().join("target").join("release").join(&name);
+    let target_root = target_root();
+    let debug = target_root.join("debug").join(&name);
+    let release = target_root.join("release").join(&name);
 
     if let Ok(profile) = std::env::var(BIN_PROFILE_ENV_VAR) {
         let (label, path) = match profile.as_str() {
@@ -98,4 +126,53 @@ pub(crate) fn resolve_workspace_binary(binary: &str) -> PathBuf {
 
 fn mtime(path: &Path) -> Option<SystemTime> {
     path.metadata().and_then(|meta| meta.modified()).ok()
+}
+
+#[cfg(test)]
+mod resolve_target_dir_tests {
+    //! `target_root()` returned a configured `CARGO_TARGET_DIR` as-is. Cargo
+    //! runs a test binary from its package directory, not the workspace
+    //! root it was invoked from, so a relative configured value resolved
+    //! under the package instead of the workspace root Cargo actually built
+    //! into -- existence checks and binary launches then missed the real build or
+    //! picked up a stale binary left over in the wrong place. These proofs
+    //! exercise the pure resolution rule against synthetic inputs, never the
+    //! real `CARGO_TARGET_DIR` -- mutating that for real would race every
+    //! other test in this same binary that depends on it for its own
+    //! correct binary resolution.
+    use super::*;
+
+    #[test]
+    fn an_absolute_configured_target_dir_is_used_unchanged() {
+        let workspace_root = Path::new("/workspace/contextdb");
+        let configured = Path::new("/var/tmp/some-other-target");
+        assert_eq!(
+            resolve_target_dir(Some(configured), workspace_root),
+            configured.to_path_buf(),
+            "an absolute CARGO_TARGET_DIR names its own directory outright"
+        );
+    }
+
+    #[test]
+    fn a_relative_configured_target_dir_is_anchored_to_the_workspace_root() {
+        let workspace_root = Path::new("/workspace/contextdb");
+        let configured = Path::new(".custom-build-dir/target");
+        assert_eq!(
+            resolve_target_dir(Some(configured), workspace_root),
+            workspace_root.join(".custom-build-dir/target"),
+            "a relative CARGO_TARGET_DIR must resolve against the workspace root Cargo was \
+             invoked from -- the supported invocation base -- not the test binary's own package \
+             directory"
+        );
+    }
+
+    #[test]
+    fn no_configured_target_dir_falls_back_to_workspace_root_target() {
+        let workspace_root = Path::new("/workspace/contextdb");
+        assert_eq!(
+            resolve_target_dir(None, workspace_root),
+            workspace_root.join("target"),
+            "with CARGO_TARGET_DIR unset, the plain build's own target directory is used"
+        );
+    }
 }

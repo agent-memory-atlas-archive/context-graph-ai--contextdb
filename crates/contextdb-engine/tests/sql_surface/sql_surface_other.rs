@@ -4706,6 +4706,123 @@ fn upd_05_row_condition_guard_in_explicit_tx_fails_commit_atomically() {
     );
 }
 
+#[test]
+fn cdb061_row_guard_treats_missing_nullable_columns_as_null_at_claim_and_commit() {
+    let db = Database::open_memory();
+    let old_id = Uuid::new_v4();
+    let stored_null_id = Uuid::new_v4();
+    db.execute(
+        "CREATE TABLE claims (id UUID PRIMARY KEY, owner TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE claim_audit (id UUID PRIMARY KEY, claim_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO claims (id, owner) VALUES ($id, 'old')",
+        &params(vec![("id", Value::Uuid(old_id))]),
+    )
+    .unwrap();
+    db.execute(
+        "ALTER TABLE claims ADD COLUMN last_attempt_at TEXT",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO claims (id, owner, last_attempt_at) VALUES ($id, 'new', NULL)",
+        &params(vec![("id", Value::Uuid(stored_null_id))]),
+    )
+    .unwrap();
+
+    let old_row = db
+        .point_lookup("claims", "id", &Value::Uuid(old_id), db.snapshot())
+        .unwrap()
+        .expect("old claim remains visible after ADD COLUMN");
+    assert!(
+        !old_row.values.contains_key("last_attempt_at"),
+        "the pre-migration row keeps its absent physical column"
+    );
+    let stored_null_row = db
+        .point_lookup("claims", "id", &Value::Uuid(stored_null_id), db.snapshot())
+        .unwrap()
+        .expect("post-migration claim remains visible");
+    assert_eq!(
+        stored_null_row.values.get("last_attempt_at"),
+        Some(&Value::Null),
+        "an explicitly stored NULL remains distinct in the row map"
+    );
+
+    let claim_tx = db.begin_or_panic();
+    assert!(
+        db.guard_row_conditions_in_tx(
+            claim_tx,
+            "claims",
+            "id",
+            &Value::Uuid(old_id),
+            &[("last_attempt_at".to_string(), Value::Null)],
+        )
+        .expect("an old nullable column reads as NULL at claim time")
+    );
+    db.execute_in_tx(
+        claim_tx,
+        "INSERT INTO claim_audit (id, claim_id) VALUES ($id, $claim_id)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("claim_id", Value::Uuid(old_id)),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE claims SET last_attempt_at = 'rival' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(old_id))]),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            db.commit(claim_tx),
+            Err(Error::ConditionalUpdateConflict { count: 1 })
+        ),
+        "a competing claim update must still refuse the stale commit"
+    );
+    assert!(
+        db.execute("SELECT id FROM claim_audit", &empty())
+            .unwrap()
+            .rows
+            .is_empty(),
+        "the refused stale claim rolls its side effect back"
+    );
+
+    let stale_claim_tx = db.begin_or_panic();
+    assert!(
+        !db.guard_row_conditions_in_tx(
+            stale_claim_tx,
+            "claims",
+            "id",
+            &Value::Uuid(old_id),
+            &[("last_attempt_at".to_string(), Value::Null)],
+        )
+        .expect("a changed claim is checked at registration")
+    );
+    db.rollback(stale_claim_tx).unwrap();
+
+    let stored_null_claim_tx = db.begin_or_panic();
+    assert!(
+        db.guard_row_conditions_in_tx(
+            stored_null_claim_tx,
+            "claims",
+            "id",
+            &Value::Uuid(stored_null_id),
+            &[("last_attempt_at".to_string(), Value::Null)],
+        )
+        .expect("an explicitly stored NULL still matches")
+    );
+    db.commit(stored_null_claim_tx).unwrap();
+}
+
 fn setup_cte_sensor_db() -> Database {
     let db = Database::open_memory();
     db.execute(
@@ -5760,7 +5877,13 @@ fn sql_13_null_in_nullable_uuid() {
 
 #[test]
 fn integrity_01_text_memory_estimate_not_pathologically_high() {
-    let accountant = Arc::new(MemoryAccountant::with_budget(32 * 1024));
+    // The PK's auto index now permanently reserves the exact-probe filter at CREATE TABLE
+    // time (the fixed charge is defined in `crates/contextdb-core/src/table_meta.rs`);
+    // raise the budget by exactly that fixed charge so the original leak-detection headroom
+    // (32 KiB) is unchanged (same correction as the `integrity_02` sibling).
+    let accountant = Arc::new(MemoryAccountant::with_budget(
+        32 * 1024 + contextdb_core::EXACT_PROBE_FILTER_BYTES,
+    ));
     let db = Database::open_memory_with_accountant(accountant.clone());
     db.execute(
         "CREATE TABLE docs (id UUID PRIMARY KEY, body TEXT)",
@@ -5780,8 +5903,12 @@ fn integrity_01_text_memory_estimate_not_pathologically_high() {
         result.is_ok(),
         "1KiB TEXT insert should fit within a 32KiB budget: {result:?}"
     );
+    // The pathological-memory ceiling is for the row itself; the PK's fixed exact-probe
+    // charge above is real, legitimate, permanent allocation from CREATE TABLE, not a leak
+    // this 1KiB row caused, so it is added back to the ceiling by the same fixed amount the
+    // budget above was raised by.
     assert!(
-        accountant.usage().used < 16 * 1024,
+        accountant.usage().used < 16 * 1024 + contextdb_core::EXACT_PROBE_FILTER_BYTES,
         "1KiB TEXT row should not consume pathological memory, got {} bytes",
         accountant.usage().used
     );
@@ -5789,7 +5916,13 @@ fn integrity_01_text_memory_estimate_not_pathologically_high() {
 
 #[test]
 fn integrity_02_upsert_noop_does_not_leak_memory() {
-    let accountant = Arc::new(MemoryAccountant::with_budget(12 * 1024));
+    // The PK's auto index now permanently reserves the exact-probe filter at CREATE TABLE
+    // time (crates/contextdb-relational/src/store.rs:388, contract in
+    // crates/contextdb-core/src/table_meta.rs:1207-1213); raise the budget by exactly that
+    // fixed charge so the original leak-detection headroom (12 KiB) is unchanged.
+    let accountant = Arc::new(MemoryAccountant::with_budget(
+        12 * 1024 + contextdb_core::EXACT_PROBE_FILTER_BYTES,
+    ));
     let db = Database::open_memory_with_accountant(accountant.clone());
     db.execute("CREATE TABLE kv (id UUID PRIMARY KEY, val TEXT)", &empty())
         .unwrap();
@@ -5899,15 +6032,29 @@ fn integrity_04_edge_delete_releases_memory() {
     let used_after_insert = accountant.usage().used;
     assert!(used_after_insert > baseline);
 
+    let pre_delete_lsn = db.current_lsn();
     let tx = db.begin_or_panic();
     db.delete_edge(tx, source, target, "REL").unwrap();
     db.commit(tx).unwrap();
 
+    // `crates/contextdb-engine/src/composite_store.rs:1341-1343`: a commit charges the
+    // accountant for the change-log entries it durably retains (extended and never trimmed
+    // except by a caller-driven maintenance/retention pass this test never runs) plus its own
+    // commit-index entry. This delete's commit durably records the deletion as one new
+    // `EdgeDelete` change-log entry -- real, held memory on top of what the tombstoned
+    // adjacency entry (unchanged since the insert) already cost. So `used_after_delete` must
+    // equal `used_after_insert` plus exactly this commit's own retained change-log charge,
+    // computed the same way the commit path computes it (no slack).
+    let expected_delete_commit_charge =
+        db.__change_log_commit_charge_since_for_test(pre_delete_lsn, 1);
+    let expected_after_delete = used_after_insert + expected_delete_commit_charge;
     let used_after_delete = accountant.usage().used;
     assert_eq!(
-        used_after_delete, used_after_insert,
+        used_after_delete, expected_after_delete,
         "a deleted edge is tombstoned rather than removed, so the accountant still covers what \
-         the store is still holding: before={used_after_insert}, after={used_after_delete}"
+         the store is still holding, plus exactly this commit's own retained change-log entry: \
+         before={used_after_insert}, expected_delete_commit_charge={expected_delete_commit_charge}, \
+         after={used_after_delete}"
     );
 
     // Past the declared window. The pass runs on this thread, under the clock
@@ -6099,7 +6246,14 @@ fn integrity_09_drop_table_removes_vectors() {
 
 #[test]
 fn integrity_10_failed_insert_does_not_leak_memory() {
-    let accountant = Arc::new(MemoryAccountant::with_budget(12 * 1024));
+    // Two exact-only automatic indexes here -- the PRIMARY KEY and the UNIQUE constraint on
+    // `name` -- each now permanently reserve the exact-probe filter at CREATE TABLE time
+    // (the fixed charge is defined in `crates/contextdb-core/src/table_meta.rs`); raise
+    // the budget by exactly twice that fixed charge so the original leak-detection headroom
+    // (12 KiB) is unchanged.
+    let accountant = Arc::new(MemoryAccountant::with_budget(
+        12 * 1024 + 2 * contextdb_core::EXACT_PROBE_FILTER_BYTES,
+    ));
     let db = Database::open_memory_with_accountant(accountant.clone());
     db.execute(
         "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT UNIQUE)",
@@ -7512,6 +7666,441 @@ fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
     ));
 }
 
+// The four tests below pin the following contract: a partial ALTER
+// preserves every column it does not mention whether or not the primary key
+// is restated; an explicit DROP COLUMN or RENAME COLUMN replays correctly
+// across sync and restart; and the author's own operation is carried in the
+// authenticated representation, never guessed downstream from which columns
+// are missing or which two columns happen to share a type.
+//
+// A partial (non-full-shape) ALTER cannot be produced through local SQL
+// execution -- `ddl_change_for_statement` always restates every column the
+// simulated meta ends up with. The two synthetic-shape tests below therefore
+// build the arriving `sync::DdlChange::AlterTable` by hand and apply it
+// directly to two independent, freshly seeded databases (`author` and
+// `receiver`), exactly as the neighboring
+// `sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns` above
+// already does for one node. The explicit DROP/RENAME tests instead drive a
+// real `author.execute(...)` and forward the result to `receiver` through
+// `changes_since`/`apply_changes`, the same shape as
+// `sync_vector_rename_persists_row_image_across_reopen` above.
+
+#[test]
+fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column() {
+    let tmp = TempDir::new().unwrap();
+    let author_path = tmp.path().join("author.db");
+    let receiver_path = tmp.path().join("receiver.db");
+    let id = Uuid::from_u128(4702);
+    let schema = "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))";
+
+    // Restates the primary key, keeps the vector column's shape unchanged
+    // (VECTOR(3) -> VECTOR(3), so this does not route through the
+    // vector-shape-change merge path), and omits the side column `note`.
+    let partial_alter = sync::ChangeSet {
+        rows: Vec::new(),
+        edges: Vec::new(),
+        vectors: Vec::new(),
+        ddl: vec![sync::DdlChange::AlterTable {
+            name: "evidence".to_string(),
+            columns: vec![
+                ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                ("embedding".to_string(), "VECTOR(3)".to_string()),
+            ],
+            constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
+        }],
+        ddl_lsn: vec![Lsn(10)],
+    };
+
+    {
+        let author = Database::open(&author_path).unwrap();
+        let receiver = Database::open(&receiver_path).unwrap();
+        for db in [&author, &receiver] {
+            db.execute(schema, &empty()).unwrap();
+            db.execute(
+                "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("embedding", Value::Vector(per_index_axis3(0))),
+                ]),
+            )
+            .unwrap();
+            db.apply_changes(
+                partial_alter.clone(),
+                &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+            )
+            .unwrap();
+        }
+
+        for (label, db) in [("author", &author), ("receiver", &receiver)] {
+            let row = db
+                .execute(
+                    "SELECT note FROM evidence WHERE id = $id",
+                    &params(vec![("id", Value::Uuid(id))]),
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: note column must still be selectable after a partial ALTER \
+                         that restates the primary key but omits note; observed error: {e:?}"
+                    )
+                });
+            assert_eq!(
+                row.rows[0][0],
+                Value::Text("kept".to_string()),
+                "{label}: the omitted side column must keep its row value even though the \
+                 primary key was restated"
+            );
+        }
+
+        author.close().unwrap();
+        receiver.close().unwrap();
+    }
+
+    let reopened_author = Database::open(&author_path).unwrap();
+    let reopened_receiver = Database::open(&receiver_path).unwrap();
+    for (label, db) in [
+        ("author", &reopened_author),
+        ("receiver", &reopened_receiver),
+    ] {
+        let row = db
+            .execute(
+                "SELECT note FROM evidence WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .unwrap_or_else(|e| {
+                panic!("{label} after restart: note column must still be selectable; observed error: {e:?}")
+            });
+        assert_eq!(
+            row.rows[0][0],
+            Value::Text("kept".to_string()),
+            "{label} after restart: the preserved column must still hold its value"
+        );
+    }
+}
+
+#[test]
+fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_operation() {
+    let tmp = TempDir::new().unwrap();
+    let author_path = tmp.path().join("author.db");
+    let receiver_path = tmp.path().join("receiver.db");
+    let id = Uuid::from_u128(4703);
+    let schema = "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))";
+
+    {
+        let author = Database::open(&author_path).unwrap();
+        let receiver = Database::open(&receiver_path).unwrap();
+        for db in [&author, &receiver] {
+            db.execute(schema, &empty()).unwrap();
+            db.execute(
+                "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("embedding", Value::Vector(per_index_axis3(0))),
+                ]),
+            )
+            .unwrap();
+        }
+
+        let watermark = author.current_lsn();
+        author
+            .execute("ALTER TABLE evidence DROP COLUMN note", &empty())
+            .unwrap();
+
+        let changes = author.changes_since(watermark);
+        let constraints = changes
+            .ddl
+            .iter()
+            .find_map(|change| match change {
+                sync::DdlChange::AlterTable {
+                    name, constraints, ..
+                } if name == "evidence" => Some(constraints.clone()),
+                _ => None,
+            })
+            .expect("DROP COLUMN must emit an AlterTable ddl entry in changes_since");
+        // The authenticated schema unit must name the drop as the author's
+        // own operation -- mirroring the existing COLUMN_RENAME/VECTOR_RENAME
+        // markers -- rather than the receiver inferring "dropped" from the
+        // column's mere absence from the restated shape.
+        assert!(
+            constraints
+                .iter()
+                .any(|c| c.to_ascii_uppercase().starts_with("COLUMN_DROP(") && c.contains("note")),
+            "expected the authenticated schema unit (changes_since's AlterTable constraints) to \
+             name the drop as the author's own operation via a marker mirroring \
+             COLUMN_RENAME/VECTOR_RENAME; observed constraints: {constraints:?}"
+        );
+
+        receiver
+            .apply_changes(
+                changes,
+                &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+            )
+            .unwrap();
+
+        for (label, db) in [("author", &author), ("receiver", &receiver)] {
+            let result = db.execute(
+                "SELECT note FROM evidence WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::ColumnNotFound { ref table, ref column })
+                        if table == "evidence" && column == "note"
+                ),
+                "{label}: the dropped column and its data must be gone; observed: {result:?}"
+            );
+        }
+
+        author.close().unwrap();
+        receiver.close().unwrap();
+    }
+
+    let reopened_author = Database::open(&author_path).unwrap();
+    let reopened_receiver = Database::open(&receiver_path).unwrap();
+    for (label, db) in [
+        ("author", &reopened_author),
+        ("receiver", &reopened_receiver),
+    ] {
+        let result = db.execute(
+            "SELECT note FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        );
+        assert!(
+            matches!(result, Err(Error::ColumnNotFound { .. })),
+            "{label} after restart: the dropped column must stay gone; observed: {result:?}"
+        );
+        let row = db
+            .execute(
+                "SELECT id FROM evidence WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .unwrap();
+        assert_eq!(
+            row.rows.len(),
+            1,
+            "{label} after restart: the row itself must survive the column drop"
+        );
+    }
+}
+
+#[test]
+fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors_operation() {
+    let tmp = TempDir::new().unwrap();
+    let author_path = tmp.path().join("author.db");
+    let receiver_path = tmp.path().join("receiver.db");
+    let id = Uuid::from_u128(4704);
+    let schema = "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))";
+
+    {
+        let author = Database::open(&author_path).unwrap();
+        let receiver = Database::open(&receiver_path).unwrap();
+        for db in [&author, &receiver] {
+            db.execute(schema, &empty()).unwrap();
+            db.execute(
+                "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("embedding", Value::Vector(per_index_axis3(0))),
+                ]),
+            )
+            .unwrap();
+        }
+
+        let watermark = author.current_lsn();
+        author
+            .execute(
+                "ALTER TABLE evidence RENAME COLUMN embedding TO embedding_v2",
+                &empty(),
+            )
+            .unwrap();
+
+        let changes = author.changes_since(watermark);
+        let constraints = changes
+            .ddl
+            .iter()
+            .find_map(|change| match change {
+                sync::DdlChange::AlterTable {
+                    name, constraints, ..
+                } if name == "evidence" => Some(constraints.clone()),
+                _ => None,
+            })
+            .expect("RENAME COLUMN must emit an AlterTable ddl entry in changes_since");
+        assert!(
+            constraints
+                .iter()
+                .any(|c| c == "VECTOR_RENAME(embedding,embedding_v2)"),
+            "expected the authenticated schema unit to name the rename as the author's own \
+             operation via a VECTOR_RENAME marker; observed constraints: {constraints:?}"
+        );
+
+        receiver
+            .apply_changes(
+                changes,
+                &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+            )
+            .unwrap();
+
+        for (label, db) in [("author", &author), ("receiver", &receiver)] {
+            assert_eq!(
+                per_index_top_id(db, "evidence", "embedding_v2", per_index_axis3(0)),
+                id,
+                "{label}: the vector must move with the rename"
+            );
+            let row = db
+                .execute(
+                    "SELECT note FROM evidence WHERE id = $id",
+                    &params(vec![("id", Value::Uuid(id))]),
+                )
+                .unwrap();
+            assert_eq!(
+                row.rows[0][0],
+                Value::Text("kept".to_string()),
+                "{label}: the side column must be untouched by the rename"
+            );
+            assert!(
+                matches!(
+                    db.execute(
+                        "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+                        &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+                    ),
+                    Err(Error::UnknownVectorIndex { index })
+                        if index == VectorIndexRef::new("evidence", "embedding")
+                ),
+                "{label}: the old vector index name must no longer resolve"
+            );
+        }
+
+        author.close().unwrap();
+        receiver.close().unwrap();
+    }
+
+    let reopened_author = Database::open(&author_path).unwrap();
+    let reopened_receiver = Database::open(&receiver_path).unwrap();
+    for (label, db) in [
+        ("author", &reopened_author),
+        ("receiver", &reopened_receiver),
+    ] {
+        assert_eq!(
+            per_index_top_id(db, "evidence", "embedding_v2", per_index_axis3(0)),
+            id,
+            "{label} after restart: the vector must still be reachable under the new name"
+        );
+    }
+}
+
+#[test]
+fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename() {
+    let tmp = TempDir::new().unwrap();
+    let author_path = tmp.path().join("author.db");
+    let receiver_path = tmp.path().join("receiver.db");
+    let id = Uuid::from_u128(4705);
+    let schema = "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))";
+
+    // Restates the primary key and adds a NEW same-typed (TEXT) column
+    // `memo` while omitting `note` -- two columns that merely share a type,
+    // with no COLUMN_RENAME marker naming them. This must never be guessed
+    // as a rename of note -> memo.
+    let partial_alter = sync::ChangeSet {
+        rows: Vec::new(),
+        edges: Vec::new(),
+        vectors: Vec::new(),
+        ddl: vec![sync::DdlChange::AlterTable {
+            name: "evidence".to_string(),
+            columns: vec![
+                ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                ("memo".to_string(), "TEXT".to_string()),
+                ("embedding".to_string(), "VECTOR(3)".to_string()),
+            ],
+            constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
+        }],
+        ddl_lsn: vec![Lsn(10)],
+    };
+
+    {
+        let author = Database::open(&author_path).unwrap();
+        let receiver = Database::open(&receiver_path).unwrap();
+        for db in [&author, &receiver] {
+            db.execute(schema, &empty()).unwrap();
+            db.execute(
+                "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("embedding", Value::Vector(per_index_axis3(0))),
+                ]),
+            )
+            .unwrap();
+            db.apply_changes(
+                partial_alter.clone(),
+                &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+            )
+            .unwrap();
+        }
+
+        for (label, db) in [("author", &author), ("receiver", &receiver)] {
+            let note_row = db
+                .execute(
+                    "SELECT note FROM evidence WHERE id = $id",
+                    &params(vec![("id", Value::Uuid(id))]),
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: the omitted same-typed column `note` must be preserved, not \
+                         treated as renamed into `memo`; observed error: {e:?}"
+                    )
+                });
+            assert_eq!(
+                note_row.rows[0][0],
+                Value::Text("kept".to_string()),
+                "{label}: `note` must keep its original row value"
+            );
+            let memo_row = db
+                .execute(
+                    "SELECT memo FROM evidence WHERE id = $id",
+                    &params(vec![("id", Value::Uuid(id))]),
+                )
+                .unwrap();
+            assert_ne!(
+                memo_row.rows[0][0],
+                Value::Text("kept".to_string()),
+                "{label}: the newly declared column `memo` must not silently inherit `note`'s \
+                 value as though a rename had been recorded"
+            );
+        }
+
+        author.close().unwrap();
+        receiver.close().unwrap();
+    }
+
+    let reopened_author = Database::open(&author_path).unwrap();
+    let reopened_receiver = Database::open(&receiver_path).unwrap();
+    for (label, db) in [
+        ("author", &reopened_author),
+        ("receiver", &reopened_receiver),
+    ] {
+        let note_row = db
+            .execute(
+                "SELECT note FROM evidence WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{label} after restart: `note` must still be selectable; observed error: {e:?}"
+                )
+            });
+        assert_eq!(
+            note_row.rows[0][0],
+            Value::Text("kept".to_string()),
+            "{label} after restart: the preserved column must still hold its value"
+        );
+    }
+}
+
 #[test]
 fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_index() {
     let receiver = Database::open_memory();
@@ -8485,6 +9074,13 @@ fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results()
 
     let hnsw_db = Database::open_memory();
     let hnsw_f = prv_seed_hnsw_docs(&hnsw_db, 1024);
+    // The query's explain reports the actual route per partition. The first
+    // maintained graph for a column is built only by a maintenance cycle
+    // (`docs/query-language.md` INDEXED section); before one
+    // runs, AUTO's exact fallback is truthfully labelled exact, not HNSW. Drive one cycle so
+    // this fixture's 1,024-row partition has a maintained graph before asserting the HNSW
+    // label below.
+    hnsw_db.run_maintenance_cycle().unwrap();
     let hnsw_literal = hnsw_db
         .execute(
             &prv_literal_query(""),
@@ -8939,6 +9535,13 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
 
     let db = Database::open_memory();
     let f = prv_seed_rank_policy_docs(&db, 1024);
+    // The query's explain reports the actual route per partition. The first
+    // maintained graph for a column is built only by a maintenance cycle
+    // (`docs/query-language.md` INDEXED section); before
+    // one runs, AUTO's exact fallback is truthfully labelled exact rather than HNSW. Drive one
+    // cycle so this fixture's 1,024-row partition has a maintained graph before asserting the
+    // HNSW label.
+    db.run_maintenance_cycle().unwrap();
     let literal = db
         .execute(
             "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 3",

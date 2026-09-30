@@ -1,10 +1,13 @@
-//! Checkpoint export behavior suite (CE01–CE22).
+//! Checkpoint export behavior suite (CE01–CE22 plus source-integrity controls).
 //!
 //! Contract surface: `Database::export_snapshot(dest) -> Result<ExportReport>`.
-//! All 22 tests are RED at stub time and fail on assertions (see the
-//! `assert_has_tables` gate), never on panics from missing tables.
+//! The export checks assert on the returned tables through `assert_has_tables`.
 
-use contextdb_core::{Direction, Error, Lsn, Value};
+use contextdb_core::{Direction, Error, Lsn, Value, VectorIndexRef, VectorQuantization};
+use contextdb_engine::persistence::read_persistence_test_scaffold::{
+    DurableStoreDamage, load_vector_version_at_snapshot_for_test,
+    prepare_durable_store_damage_for_test,
+};
 use contextdb_engine::{Database, ExportReport, SinkEvent};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -16,6 +19,10 @@ use uuid::Uuid;
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
+}
+
+fn stored_vector(values: &[f32], quantization: VectorQuantization) -> Value {
+    Value::Vector(contextdb_vector::stored_vector_value(values, quantization))
 }
 
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
@@ -1670,5 +1677,231 @@ fn ce22_vector_index_completeness_at_scale() {
         top1(&artifact, 7, "CE22/artifact"),
         Value::Uuid(uuid_for(991)),
         "beacon at insertion index 991 must be the exact nearest neighbor on its axis"
+    );
+}
+
+#[test]
+fn checkpoint_preserves_current_and_historical_vectors_in_every_quantization() {
+    let (_tmp, src, dest) = new_export_fixture();
+    src.execute(
+        "CREATE TABLE vector_history (id INTEGER PRIMARY KEY, f32 VECTOR(3), sq8 VECTOR(3) WITH (quantization = 'SQ8'), sq4 VECTOR(3) WITH (quantization = 'SQ4')) HISTORY ALL",
+        &p(),
+    )
+    .unwrap();
+    let old = [0.1_f32, 0.4, 0.9];
+    let current = [0.8_f32, 0.2, 0.6];
+    src.execute(
+        "INSERT INTO vector_history (id, f32, sq8, sq4) VALUES (1, $f32, $sq8, $sq4)",
+        &params(vec![
+            ("f32", Value::Vector(old.to_vec())),
+            ("sq8", Value::Vector(old.to_vec())),
+            ("sq4", Value::Vector(old.to_vec())),
+        ]),
+    )
+    .unwrap();
+    let old_snapshot = src.snapshot();
+    src.execute(
+        "UPDATE vector_history SET f32 = $f32, sq8 = $sq8, sq4 = $sq4 WHERE id = 1",
+        &params(vec![
+            ("f32", Value::Vector(current.to_vec())),
+            ("sq8", Value::Vector(current.to_vec())),
+            ("sq4", Value::Vector(current.to_vec())),
+        ]),
+    )
+    .unwrap();
+
+    src.export_snapshot(&dest).unwrap();
+    let artifact = Database::open(&dest).unwrap();
+    let sql = "SELECT f32, sq8, sq4 FROM vector_history WHERE id = 1";
+    assert_eq!(
+        artifact.execute(sql, &p()).unwrap().rows,
+        vec![vec![
+            stored_vector(&current, VectorQuantization::F32),
+            stored_vector(&current, VectorQuantization::SQ8),
+            stored_vector(&current, VectorQuantization::SQ4),
+        ]]
+    );
+    assert_eq!(
+        artifact
+            .execute_at_snapshot(sql, &p(), old_snapshot)
+            .unwrap()
+            .rows,
+        vec![vec![
+            stored_vector(&old, VectorQuantization::F32),
+            stored_vector(&old, VectorQuantization::SQ8),
+            stored_vector(&old, VectorQuantization::SQ4),
+        ]]
+    );
+}
+
+#[test]
+fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
+    let (_tmp, src, dest) = new_export_fixture();
+    src.execute(
+        "CREATE TABLE checkpoint_history (id INTEGER PRIMARY KEY, embedding VECTOR(3)) HISTORY CURRENT ONLY SYNC OFF",
+        &p(),
+    )
+    .unwrap();
+    let first = [1.0_f32, 0.0, 0.0];
+    let captured = [0.0_f32, 1.0, 0.0];
+    let later = [0.0_f32, 0.0, 1.0];
+    src.execute(
+        "INSERT INTO checkpoint_history (id, embedding) VALUES (1, $embedding)",
+        &params(vec![("embedding", Value::Vector(first.to_vec()))]),
+    )
+    .unwrap();
+    let old_snapshot = src.snapshot();
+    let old_pin = src.pin_snapshot(old_snapshot);
+    src.execute(
+        "UPDATE checkpoint_history SET embedding = $embedding WHERE id = 1",
+        &params(vec![("embedding", Value::Vector(captured.to_vec()))]),
+    )
+    .unwrap();
+
+    let pause = src.pause_after_export_snapshot_capture_for_test();
+    let compaction = std::thread::scope(|scope| {
+        let source = &src;
+        let destination = &dest;
+        let export = scope.spawn(move || source.export_snapshot(destination));
+        assert!(
+            pause.wait_until_reached(Duration::from_secs(10)),
+            "export must reach its post-capture fence"
+        );
+        src.execute(
+            "UPDATE checkpoint_history SET embedding = $embedding WHERE id = 1",
+            &params(vec![("embedding", Value::Vector(later.to_vec()))]),
+        )
+        .expect("a later commit remains live while checkpoint copying is paused");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let source = &src;
+        let prune = scope.spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(source.compact_currency_versions()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "currency pruning must wait for the checkpoint's exact source lifetime"
+        );
+        pause.release();
+        export.join().unwrap().unwrap();
+        let report = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("pruning resumes after export releases its source")
+            .unwrap();
+        prune.join().unwrap();
+        report
+    });
+    assert!(
+        compaction.versions_deferred_for_readers >= 1,
+        "the registered old snapshot keeps its visible version durable"
+    );
+
+    let artifact = Database::open(&dest).unwrap();
+    let sql = "SELECT embedding FROM checkpoint_history WHERE id = 1";
+    assert_eq!(
+        artifact.execute(sql, &p()).unwrap().rows,
+        vec![vec![Value::Vector(captured.to_vec())]],
+        "the artifact uses the durable source captured before the later commit"
+    );
+    assert_eq!(
+        artifact
+            .execute_at_snapshot(sql, &p(), old_snapshot)
+            .unwrap()
+            .rows,
+        vec![vec![Value::Vector(first.to_vec())]],
+        "the registered historical version remains usable in the artifact"
+    );
+    assert_eq!(
+        src.execute(sql, &p()).unwrap().rows,
+        vec![vec![Value::Vector(later.to_vec())]],
+        "the source continued past the checkpoint boundary"
+    );
+
+    drop(old_pin);
+    let released = src.compact_currency_versions().unwrap();
+    assert!(
+        released.pruned_versions >= 1,
+        "the old version becomes reclaimable after its snapshot pin is released"
+    );
+}
+
+#[test]
+fn checkpoint_refuses_a_changed_f32_row_projection() {
+    let (_tmp, src, dest) = new_export_fixture();
+    src.execute(
+        "CREATE TABLE damaged_checkpoint (id INTEGER PRIMARY KEY, embedding VECTOR(3)) HISTORY ALL",
+        &p(),
+    )
+    .unwrap();
+    src.execute(
+        "INSERT INTO damaged_checkpoint (id, embedding) VALUES (1, $embedding)",
+        &params(vec![("embedding", Value::Vector(vec![1.0_f32, 0.0, 0.0]))]),
+    )
+    .unwrap();
+    src.damage_checkpoint_f32_projection_for_test().unwrap();
+
+    let result = src.export_snapshot(&dest);
+    assert!(
+        matches!(result, Err(Error::StoreCorrupted { .. })),
+        "an F32 row projection changed under its committed root must stop export: {result:?}"
+    );
+    assert!(!dest.exists(), "a refused export must publish no artifact");
+}
+
+#[test]
+fn historical_vector_body_is_authenticated_at_the_snapshot_that_returns_it() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("historical-vector-authentication.db");
+    let database = Database::open(&path).unwrap();
+    database
+        .execute(
+            "CREATE TABLE historical_vectors (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (quantization = 'SQ8')) HISTORY ALL",
+            &p(),
+        )
+        .unwrap();
+    let old = [0.1_f32, 0.4, 0.9];
+    let current = [0.9_f32, 0.3, 0.2];
+    database
+        .execute(
+            "INSERT INTO historical_vectors (id, embedding) VALUES (1, $embedding)",
+            &params(vec![("embedding", Value::Vector(old.to_vec()))]),
+        )
+        .unwrap();
+    let old_snapshot = database.snapshot();
+    let row_id = database.scan("historical_vectors", old_snapshot).unwrap()[0].row_id;
+    database
+        .execute(
+            "UPDATE historical_vectors SET embedding = $embedding WHERE id = 1",
+            &params(vec![("embedding", Value::Vector(current.to_vec()))]),
+        )
+        .unwrap();
+    let current_snapshot = database.snapshot();
+    database.close().unwrap();
+
+    let index = VectorIndexRef::new("historical_vectors", "embedding");
+    let healthy_old =
+        load_vector_version_at_snapshot_for_test(&path, &index, row_id, old_snapshot).unwrap();
+    assert_eq!(
+        healthy_old.vector,
+        contextdb_vector::stored_vector_value(&old, VectorQuantization::SQ8),
+        "the old snapshot selects the superseded body before damage"
+    );
+    prepare_durable_store_damage_for_test(&path, DurableStoreDamage::Sq8VectorDivergence).unwrap();
+    let healthy_current =
+        load_vector_version_at_snapshot_for_test(&path, &index, row_id, current_snapshot).unwrap();
+    assert_eq!(
+        healthy_current.vector,
+        contextdb_vector::stored_vector_value(&current, VectorQuantization::SQ8),
+        "changing the superseded body does not replace the current version"
+    );
+    let historical = load_vector_version_at_snapshot_for_test(&path, &index, row_id, old_snapshot);
+    assert!(
+        historical
+            .as_ref()
+            .is_err_and(|error| error.contains("does not authenticate")),
+        "the entitled old snapshot must authenticate the old body it would return: {historical:?}"
     );
 }

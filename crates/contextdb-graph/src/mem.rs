@@ -743,6 +743,11 @@ pub struct MemGraphExecutor<S: WriteSetApplicator> {
     bfs_visited_cap: std::sync::atomic::AtomicUsize,
 }
 
+/// A complete DAG declaration set built before a schema commit becomes durable.
+pub struct PreparedDagEdgeTypes {
+    edge_types: HashSet<String>,
+}
+
 impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     pub fn new(store: Arc<GraphStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {
         Self {
@@ -767,6 +772,16 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         for t in types {
             set.insert(t.clone());
         }
+    }
+
+    pub fn prepare_dag_edge_types(types: impl IntoIterator<Item = String>) -> PreparedDagEdgeTypes {
+        PreparedDagEdgeTypes {
+            edge_types: types.into_iter().collect(),
+        }
+    }
+
+    pub fn publish_prepared_dag_edge_types(&self, prepared: PreparedDagEdgeTypes) {
+        *self.dag_edge_types.write() = prepared.edge_types;
     }
 
     pub fn edge_count(&self, source: NodeId, edge_type: &str, snapshot: SnapshotId) -> usize {

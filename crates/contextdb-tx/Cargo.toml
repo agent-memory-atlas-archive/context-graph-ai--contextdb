@@ -12,6 +12,9 @@ description = "MVCC transaction manager for contextdb"
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+test-seams = []
+
 [dependencies]
 contextdb-core = { path = "../contextdb-core", version = "1.0" }
 parking_lot.workspace = true

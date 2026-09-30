@@ -27,6 +27,12 @@ pub struct ReadCredit {
 }
 
 impl ReadCredit {
+    /// Passive observation of the charge held by this allocation owner.
+    #[doc(hidden)]
+    pub fn bytes_for_test(&self) -> usize {
+        self.bytes
+    }
+
     pub fn try_new(
         budget: Arc<dyn ReadMemoryBudget>,
         bytes: usize,

@@ -526,6 +526,8 @@ pub(crate) fn prepare_manifest(
         .iter()
         .map(|r| (r.reference.table.clone(), r.creator.table_generation))
         .collect::<std::collections::BTreeSet<_>>();
+    // The snapshot is one authored unit: every statement signs how many it holds.
+    let unit_statements = u32::try_from(tables.len()).map_err(|_| invalid())?;
     for (ordinal, (table, generation)) in tables.into_iter().enumerate() {
         let meta = db.table_meta(&table).ok_or_else(invalid)?;
         let ddl = crate::protocol::WireDdlChange::from(crate::database::ddl_change_from_meta(
@@ -539,6 +541,7 @@ pub(crate) fn prepare_manifest(
             author_incarnation: incarnation,
             source_lsn,
             ordinal,
+            unit_statements,
             table: table.clone(),
             table_generation: generation,
             ddl_digest: crate::protocol::canonical_ddl_provenance_digest(
@@ -1303,6 +1306,21 @@ pub(crate) fn commit_terminal(
                     table: Some(schema.table.clone()),
                     table_generation: Some(schema.table_generation),
                     digest: schema.ddl_digest.clone(),
+                    // The manifest's schema dependency IS the author's signed
+                    // provenance, just verified above. Carrying it here is what
+                    // lets this node serve the schema onward under the author's
+                    // name, with the author's own signature.
+                    author: Some(crate::protocol::WireDdlAuthor {
+                        node_id: schema.author_node.clone(),
+                        incarnation: schema.author_incarnation,
+                        source_ddl_lsn: schema.source_lsn,
+                        ordinal: schema.ordinal,
+                        table: Some(schema.table.clone()),
+                        table_generation: Some(schema.table_generation),
+                        digest: schema.ddl_digest.clone(),
+                        attestation: schema.signature.clone(),
+                        unit_statements: schema.unit_statements,
+                    }),
                 });
             }
             Some(context)
@@ -1328,6 +1346,7 @@ pub(crate) fn commit_terminal(
             incarnation: input.edge_incarnation,
             source_lsn: input.manifest.seal.source.0,
             dependency_complete: true,
+            hub_contact_ms: None,
         };
         db.apply_delivery_prepared(
             changes,
@@ -1521,6 +1540,7 @@ pub(crate) fn commit_terminal_batch(
         incarnation: requests[0].edge_incarnation,
         source_lsn: requests[0].manifest.seal.source.0,
         dependency_complete: true,
+        hub_contact_ms: None,
     };
     db.apply_delivery_prepared(changes, receipt, &hub, &lineages, None, &mut |db, ws| {
         let incarnation = binding(db, &edge)?.namespace.hub_incarnation;

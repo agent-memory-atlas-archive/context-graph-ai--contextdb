@@ -20,6 +20,11 @@ pub enum Statement {
     ShowDiskLimit,
     SetMaintenancePollInterval(u64),
     ShowMaintenancePollInterval,
+    /// The serving page cache a maintained vector partition may keep resident.
+    /// `None` returns the column to the engine's default share of the declared
+    /// memory limit.
+    SetVectorServingCache(Option<u64>),
+    ShowVectorServingCache,
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     DeclareTenantTablePolicy(DeclareTenantTablePolicy),
@@ -262,6 +267,10 @@ pub enum Expr {
         column: String,
         key: Box<Expr>,
     },
+    /// ISO SQL row-value constructor: `(a, b)`. Only meaningful where SQL gives
+    /// a row a meaning -- on either side of `IN` -- which is the one place the
+    /// grammar admits it.
+    Row(Vec<Expr>),
     InList {
         expr: Box<Expr>,
         list: Vec<Expr>,
@@ -364,6 +373,21 @@ pub struct CreateTable {
     pub history: Option<contextdb_core::HistoryPolicy>,
     pub delivery_manifest_tables: Option<Vec<String>>,
     pub edge_discard: Option<contextdb_core::EdgeDiscardMode>,
+    /// The `MAINTAIN COUNT` clause the declaration wrote, when it wrote one.
+    /// `None` means it named none, and the engine maintains no index-prefix
+    /// count for this table — [`contextdb_core::DEFAULT_MAINTAINED_COUNTS`].
+    pub maintained_counts: Option<MaintainedCountsDecl>,
+}
+
+/// Which index-prefix counts a table declares the engine keeps current on
+/// every write. `Default` is the ALTER-only spelling that clears an existing
+/// declaration and returns the table to silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintainedCountsDecl {
+    Default,
+    None,
+    AllPrefixes,
+    Lists(Vec<Vec<(String, SortDirection)>>),
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +479,7 @@ pub enum AlterAction {
     DropRetain,
     SetHistory(contextdb_core::HistoryPolicy),
     SetSyncConflict(contextdb_core::ConflictPolicy),
+    SetMaintainedCounts(MaintainedCountsDecl),
 }
 
 #[derive(Debug, Clone)]

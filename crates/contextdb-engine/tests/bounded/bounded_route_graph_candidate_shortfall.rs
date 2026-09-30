@@ -120,7 +120,7 @@ fn enrolled_vector_index() -> Database {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
-        "CREATE TABLE neighbourhoods (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        "CREATE TABLE neighbourhoods (id UUID PRIMARY KEY, embedding VECTOR(3) HNSW (M = 4, EF_CONSTRUCTION = 64, EF_SEARCH = 32))",
         &HashMap::new(),
     )
     .expect("create the vector table");
@@ -140,16 +140,21 @@ fn enrolled_vector_index() -> Database {
     // Queries never build an index. Drive the declared finite maintenance
     // owner until this fixture really has the graph whose shortfall it tests.
     let index = VectorIndexRef::new("neighbourhoods", "embedding");
-    for _ in 0..32 {
-        if db.vector_store_for_test().has_hnsw_index_for(&index) {
+    let expected_points = usize::try_from(ENROLLED_VECTORS).expect("fixture count fits usize");
+    for _ in 0..256 {
+        if db
+            .__debug_vector_hnsw_stats(index.clone())
+            .is_some_and(|stats| stats.point_count >= expected_points)
+        {
             break;
         }
         db.run_maintenance_cycle()
             .expect("one caller-driven vector maintenance batch succeeds");
     }
     assert!(
-        db.vector_store_for_test().has_hnsw_index_for(&index),
-        "the finite maintenance fixture publishes its graph"
+        db.__debug_vector_hnsw_stats(index)
+            .is_some_and(|stats| stats.point_count >= expected_points),
+        "the finite maintenance fixture publishes every enrolled point"
     );
     db
 }

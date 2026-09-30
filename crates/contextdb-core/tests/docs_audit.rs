@@ -302,24 +302,24 @@ fn test_target_files(crate_dir: &Path, file_stem: &str) -> Vec<PathBuf> {
     files
 }
 
-fn is_test_attribute(attr: &str) -> bool {
+fn is_test_attribute(attr: &str, guide: bool) -> bool {
     let inner = attr
         .trim()
         .trim_start_matches("#[")
         .trim_end_matches(']')
         .trim();
     let path = inner.split('(').next().unwrap_or(inner).trim();
-    path == "test" || path.ends_with("::test") || path == "serial" || path.ends_with("::serial")
+    path == "test"
+        || path == "tokio::test"
+        || path == "async_std::test"
+        || (!guide && (path.ends_with("::test") || path == "serial" || path.ends_with("::serial")))
 }
 
-/// A binding names a test function: `fn NAME` immediately preceded by
-/// `#[test]`, `#[tokio::test]`, `#[serial]`, or the same attributes with
-/// arguments (`#[tokio::test(flavor = "multi_thread")]`,
-/// `#[serial_test::serial(safe_fs_pause)]`). A plain helper of the same
-/// name does not count.
-fn defines_fn(file: &Path, name: &str) -> bool {
-    let fn_pattern = regex::Regex::new(&format!(r"\bfn\s+{}\s*[<(]", regex::escape(name))).unwrap();
-    let source = read_document(file);
+/// Collect actual test functions, including async tests with `#[tokio::test]`.
+/// Other attributes may appear between the test attribute and the function.
+fn test_function_names_in_source(source: &str, guide: bool) -> BTreeSet<String> {
+    let fn_pattern = regex::Regex::new(r"\bfn\s+([A-Za-z_][A-Za-z_0-9]*)\s*[<(]").unwrap();
+    let mut names = BTreeSet::new();
     let mut pending_attrs: Vec<String> = Vec::new();
     let mut attr_accum: Option<String> = None;
     for line in source.lines() {
@@ -344,12 +344,25 @@ fn defines_fn(file: &Path, name: &str) -> bool {
             }
             continue;
         }
-        if fn_pattern.is_match(trimmed) {
-            return pending_attrs.iter().any(|attr| is_test_attribute(attr));
+        if let Some(found) = fn_pattern.captures(trimmed)
+            && pending_attrs
+                .iter()
+                .any(|attr| is_test_attribute(attr, guide))
+        {
+            names.insert(found[1].to_string());
         }
         pending_attrs.clear();
     }
-    false
+    names
+}
+
+fn test_function_names(file: &Path) -> BTreeSet<String> {
+    test_function_names_in_source(&read_document(file), false)
+}
+
+/// A plain helper of the same name does not satisfy a binding.
+fn defines_fn(file: &Path, name: &str) -> bool {
+    test_function_names(file).contains(name)
 }
 
 /// Resolves one binding entry to the test that enforces it, or says why it
@@ -444,6 +457,521 @@ fn documentation_bindings_reference_existing_tests() {
         dead.len(),
         dead.join("\n")
     );
+}
+
+/// Only backticked citations in the Guard column of the invariant table are
+/// citations. Both `file.rs::test` and `file.rs` → `test` are used by the guides.
+/// A following `::test` or bare test name inherits the preceding file in its row.
+fn guide_guard_citations(text: &str) -> Vec<(usize, Vec<(String, String)>)> {
+    let code_span = regex::Regex::new(r"`([^`]+)`").unwrap();
+    let mut in_invariants = false;
+    let mut citations = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim() == "## Invariants and their guards" {
+            in_invariants = true;
+            continue;
+        }
+        if in_invariants && line.starts_with("## ") {
+            break;
+        }
+        if !in_invariants || !line.trim_start().starts_with('|') || line.contains("|---") {
+            continue;
+        }
+        let Some(guard) = line.rsplit('|').nth(1) else {
+            continue;
+        };
+        if guard.trim().starts_with("Guard") {
+            continue;
+        }
+        let mut previous_file = None::<String>;
+        let mut arrow_names = false;
+        let mut previous_end = 0;
+        let mut row = Vec::new();
+        for found in code_span.captures_iter(guard) {
+            let whole = found.get(0).unwrap();
+            let cited = found[1].to_string();
+            let between = &guard[previous_end..whole.start()];
+            let expanded = if cited.starts_with("::") {
+                match &previous_file {
+                    Some(file) => format!("{file}{cited}"),
+                    None => cited.clone(),
+                }
+            } else if cited.ends_with(".rs") {
+                previous_file = Some(cited.clone());
+                arrow_names = false;
+                if cited.contains('/') {
+                    row.push((cited.clone(), cited));
+                }
+                previous_end = whole.end();
+                continue;
+            } else if cited.contains(".rs::") {
+                if let Some((file, _)) = cited.split_once(".rs::") {
+                    previous_file = Some(format!("{file}.rs"));
+                }
+                arrow_names = false;
+                cited.clone()
+            } else if previous_file.is_some()
+                && (between.contains('→') || arrow_names)
+                && cited
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+            {
+                if !arrow_names
+                    && between.contains('→')
+                    && row
+                        .last()
+                        .is_some_and(|(_, expanded)| Some(expanded) == previous_file.as_ref())
+                {
+                    row.pop();
+                }
+                arrow_names = true;
+                format!("{}::{cited}", previous_file.as_ref().unwrap())
+            } else {
+                previous_end = whole.end();
+                continue;
+            };
+            row.push((cited, expanded));
+            previous_end = whole.end();
+        }
+        citations.push((index + 1, row));
+    }
+    citations
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, l) in left.bytes().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, r) in right.bytes().enumerate() {
+            current.push(
+                (previous[j + 1] + 1)
+                    .min(current[j] + 1)
+                    .min(previous[j] + usize::from(l != r)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn nearest_guard_match(root: &Path, crate_dir: &Path, name: &str) -> String {
+    [crate_dir.join("src"), crate_dir.join("tests")]
+        .iter()
+        .flat_map(|dir| {
+            walkdir::WalkDir::new(dir)
+                .into_iter()
+                .filter_map(Result::ok)
+        })
+        .map(|entry| entry.into_path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .flat_map(|path| {
+            guide_test_names(&path)
+                .into_iter()
+                .map(move |test| (edit_distance(name, &test), path.clone(), test))
+        })
+        .min_by(|a, b| a.cmp(b))
+        .map(|(_, path, test)| format!("{}::{test}", relative_display(root, &path)))
+        .unwrap_or_else(|| "no nearby test".to_string())
+}
+
+/// Blank comments and literals before counting scopes. Preserve offsets/newlines so
+/// braces or apparent module declarations in test data cannot change identity.
+fn rust_scope_text(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        if bytes[i..].starts_with(b"//") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if bytes[i..].starts_with(b"/*") {
+            i += 2;
+            let mut depth = 1;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else if bytes[i] == b'r' {
+            let mut quote = i + 1;
+            while quote < bytes.len() && bytes[quote] == b'#' {
+                quote += 1;
+            }
+            if bytes.get(quote) != Some(&b'"') {
+                i += 1;
+                continue;
+            }
+            let hashes = quote - i - 1;
+            i = quote + 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"'
+                    && bytes
+                        .get(i + 1..i + 1 + hashes)
+                        .is_some_and(|tail| tail.iter().all(|b| *b == b'#'))
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+        } else if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            // A lifetime is not a character literal. Character literals end
+            // after one UTF-8 scalar or an escape (possibly a Unicode escape).
+            if quote == b'\'' {
+                let tail = &source[i + 1..];
+                let char_len = tail.chars().next().map_or(0, char::len_utf8);
+                if !tail.starts_with('\\') && bytes.get(i + 1 + char_len) != Some(&b'\'') {
+                    i += 1;
+                    continue;
+                }
+            }
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                } else if bytes[i] == quote {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            i += 1;
+            continue;
+        }
+        for byte in &mut masked[start..i] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(masked).expect("masking whole literals preserves UTF-8")
+}
+
+fn immediate_scope(source: &str) -> String {
+    let mut depth = 0usize;
+    let masked = source
+        .bytes()
+        .map(|ch| {
+            let previous = depth;
+            match ch {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if previous > 0 && ch != b'\n' {
+                b' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    String::from_utf8(masked).expect("masking whole scopes preserves UTF-8")
+}
+
+fn guide_test_names(file: &Path) -> BTreeSet<String> {
+    test_function_names_in_source(&rust_scope_text(&read_document(file)), true)
+}
+
+fn module_defines_test(file: &Path, qualified: &str) -> bool {
+    let source = rust_scope_text(&read_document(file));
+    let mut body = source.as_str();
+    let mut parts: Vec<&str> = qualified.split("::").collect();
+    let name = parts.pop().unwrap_or("");
+    for module in parts {
+        let declaration =
+            regex::Regex::new(&format!(r"\bmod\s+{}\s*\{{", regex::escape(module))).unwrap();
+        let scope = immediate_scope(body);
+        let Some(found) = declaration.find(&scope) else {
+            return false;
+        };
+        let open = found.end() - 1;
+        let mut depth = 0usize;
+        let mut close = None;
+        for (offset, ch) in body[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = close else { return false };
+        body = &body[open + 1..end];
+    }
+    test_function_names_in_source(&immediate_scope(body), true).contains(name)
+}
+
+fn resolve_guide_guard(root: &Path, guide: &Path, citation: &str) -> Result<(), String> {
+    let (source, function) = if let Some((source, function)) = citation.split_once(".rs::") {
+        (format!("{source}.rs"), Some(function))
+    } else if citation.ends_with(".rs") {
+        (citation.to_string(), None)
+    } else {
+        return Err("has no source file and test function".to_string());
+    };
+    let source_in_crate = if source.starts_with("crates/") {
+        source.splitn(3, '/').nth(2).unwrap_or("")
+    } else {
+        source.as_str()
+    };
+    if !(source_in_crate.starts_with("src/")
+        || source_in_crate.starts_with("tests/")
+        || source_in_crate.starts_with("../../tests/"))
+    {
+        return Err("must cite a crate src/ or tests/ Rust file".to_string());
+    }
+    let function = function.unwrap_or("");
+    let function_name = function.rsplit("::").next().unwrap_or("");
+    if (function.is_empty() && citation.contains(".rs::"))
+        || !function
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+    {
+        return Err("has no valid test function".to_string());
+    }
+    let file = if source.starts_with("crates/") {
+        root.join(&source)
+    } else {
+        guide.parent().unwrap().join(&source)
+    };
+    let crate_dir = if source_in_crate.starts_with("../../tests/") {
+        root.to_path_buf()
+    } else if source.starts_with("crates/") {
+        let crate_name = source.split('/').nth(1).unwrap_or("");
+        root.join("crates").join(crate_name)
+    } else {
+        guide.parent().unwrap().to_path_buf()
+    };
+    if !file.is_file() {
+        return Err(format!(
+            "names missing source file `{source}`; nearest match: {}",
+            nearest_guard_match(root, &crate_dir, function_name)
+        ));
+    }
+    let found = if function.is_empty() {
+        !guide_test_names(&file).is_empty()
+    } else {
+        module_defines_test(&file, function)
+    };
+    if !found {
+        return Err(format!(
+            "names no test `{}` in `{source}`; nearest match: {}",
+            if function.is_empty() {
+                "#[test]"
+            } else {
+                function
+            },
+            nearest_guard_match(root, &crate_dir, function_name)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn crate_guide_invariant_guards_reference_existing_tests() {
+    let root = workspace_root();
+    let mut guides = 0;
+    let mut checked = 0;
+    let mut dead = Vec::new();
+    for guide in crate_dirs(&root)
+        .into_iter()
+        .map(|dir| dir.join("AGENTS.md"))
+        .filter(|guide| guide.is_file())
+    {
+        guides += 1;
+        let text = read_document(&guide);
+        let rows = guide_guard_citations(&text);
+        if rows.is_empty() {
+            dead.push(format!(
+                "{}: invariant guard table missing or empty",
+                relative_display(&root, &guide)
+            ));
+        }
+        let mut guide_checked = 0;
+        for (line, row) in rows {
+            if row.is_empty() {
+                let guard = text.lines().nth(line - 1).unwrap_or("");
+                let explicit_unguarded = guard.to_ascii_lowercase();
+                if !explicit_unguarded.contains("unguarded")
+                    && !explicit_unguarded.contains("no rust test")
+                {
+                    dead.push(format!(
+                        "{}:{line}: no test citation in guard row",
+                        relative_display(&root, &guide)
+                    ));
+                }
+            }
+            for (cited, expanded) in row {
+                checked += 1;
+                guide_checked += 1;
+                if let Err(reason) = resolve_guide_guard(&root, &guide, &expanded) {
+                    dead.push(format!(
+                        "{}:{line}: `{cited}` {reason}",
+                        relative_display(&root, &guide)
+                    ));
+                }
+            }
+        }
+        if guide_checked == 0 {
+            dead.push(format!(
+                "{}: no test citations scanned",
+                relative_display(&root, &guide)
+            ));
+        }
+    }
+    assert!(
+        guides > 0 && checked > 0,
+        "no crate-guide invariant guard citations were scanned"
+    );
+    assert!(
+        dead.is_empty(),
+        "stale crate-guide guard citation(s):\n{}",
+        dead.join("\n")
+    );
+}
+
+#[test]
+fn guide_guard_parser_and_resolver_reject_bad_citations() {
+    let root = tempfile::tempdir().unwrap();
+    let crate_dir = root.path().join("crates/example");
+    std::fs::create_dir_all(crate_dir.join("tests")).unwrap();
+    let file = crate_dir.join("tests/guards.rs");
+    std::fs::write(
+        &file,
+        "#[test]\nfn good() {}\n#[tokio::test]\nasync fn async_good() {}\nfn helper() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        crate_dir.join("tests/other.rs"),
+        "#[test]\nfn different() {}\n",
+    )
+    .unwrap();
+    let guide = crate_dir.join("AGENTS.md");
+    let text = "## Invariants and their guards\n| Invariant | Guard |\n|---|---|\n| Combined | `tests/guards.rs::good`, `::async_good`, `crates/example/tests/guards.rs::good` |\n| Arrow | `tests/guards.rs` → `good`, `async_good` |\n| Source | `src/embedded.rs` → `source_good` |\n| Bad | `tests/guards.rs::helper`, `::goood`, `tests/other.rs::good`, `tests/missing.rs::good`, `tests/typo/guards.rs` → `good`, `tests/other.rs` → `helper` |\n## Where a change lives\n| unrelated | `tests/other.rs::good` |\n";
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    std::fs::write(
+        crate_dir.join("src/embedded.rs"),
+        "#[test]\nfn source_good() {}\nmod inner {\n    #[test]\n    fn module_good() {}\n}\n",
+    )
+    .unwrap();
+    let rows = guide_guard_citations(text);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.iter().map(|(_, row)| row.len()).sum::<usize>(), 12);
+    let citations: Vec<_> = rows.into_iter().flat_map(|(_, row)| row).collect();
+    assert_eq!(citations[1].1, "tests/guards.rs::async_good");
+    assert_eq!(citations[4].1, "tests/guards.rs::async_good");
+    for (_, expanded) in &citations[..6] {
+        assert!(resolve_guide_guard(root.path(), &guide, expanded).is_ok());
+    }
+    for (_, expanded) in &citations[6..] {
+        let reason = resolve_guide_guard(root.path(), &guide, expanded).unwrap_err();
+        assert!(reason.contains("nearest match:"), "{reason}");
+        assert!(
+            reason.contains("crates/example/tests/guards.rs::good")
+                || reason.contains("crates/example/tests/other.rs::different")
+                || reason.contains("crates/example/src/embedded.rs::source_good"),
+            "{reason}"
+        );
+    }
+    assert!(resolve_guide_guard(root.path(), &guide, "tests/guards.rs").is_ok());
+    std::fs::create_dir_all(root.path().join("tests/acceptance")).unwrap();
+    std::fs::write(
+        root.path().join("tests/acceptance/root.rs"),
+        "#[test]\nfn root_good() {}\n",
+    )
+    .unwrap();
+    assert!(
+        resolve_guide_guard(
+            root.path(),
+            &guide,
+            "../../tests/acceptance/root.rs::root_good"
+        )
+        .is_ok()
+    );
+    assert!(
+        resolve_guide_guard(root.path(), &guide, "src/embedded.rs::inner::module_good").is_ok()
+    );
+    assert!(
+        resolve_guide_guard(root.path(), &guide, "src/embedded.rs::other::module_good").is_err()
+    );
+    let typo = resolve_guide_guard(root.path(), &guide, "tests/typo/guards.rs::good").unwrap_err();
+    assert!(
+        typo.contains("crates/example/tests/guards.rs::good"),
+        "{typo}"
+    );
+}
+
+#[test]
+fn guide_guards_require_test_markers_and_complete_module_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let crate_dir = root.path().join("crates/example");
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    let guide = crate_dir.join("AGENTS.md");
+    std::fs::write(
+        crate_dir.join("src/guards.rs"),
+        r##"
+#[serial]
+fn serial_helper() {}
+#[serial_test::serial]
+fn qualified_serial_helper() {}
+mod outer {
+    const DATA: &str = r#"} mod inner { #[test] fn fake() {} }"#;
+    // } mod skipped {
+    /* } /* nested comment */ */
+    #[test]
+    #[serial]
+    fn direct() {}
+    mod inner {
+        #[tokio::test]
+        async fn guard() {}
+    }
+}
+"##,
+    )
+    .unwrap();
+    for name in [
+        "serial_helper",
+        "qualified_serial_helper",
+        "direct",
+        "guard",
+        "outer::guard",
+        "inner::guard",
+        "outer::fake",
+    ] {
+        assert!(
+            resolve_guide_guard(root.path(), &guide, &format!("src/guards.rs::{name}")).is_err(),
+            "accepted {name}"
+        );
+    }
+    for name in ["outer::direct", "outer::inner::guard"] {
+        assert!(
+            resolve_guide_guard(root.path(), &guide, &format!("src/guards.rs::{name}")).is_ok(),
+            "rejected {name}"
+        );
+    }
+    assert!(resolve_guide_guard(root.path(), &guide, "src/guards.rs").is_ok());
+    std::fs::write(
+        crate_dir.join("src/serial_only.rs"),
+        "#[serial]\nfn helper() {}\n",
+    )
+    .unwrap();
+    assert!(resolve_guide_guard(root.path(), &guide, "src/serial_only.rs").is_err());
 }
 
 struct Section {

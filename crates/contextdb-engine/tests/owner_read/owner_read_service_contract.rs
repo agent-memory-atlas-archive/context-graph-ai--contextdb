@@ -318,6 +318,11 @@ impl Harness {
         config.test_hooks = Some(OwnerReadTestHooks {
             clock: Arc::new(clock.clone()),
             drain_started,
+            active_request_registered: None,
+            accept_thread_exited: None,
+            accept_thread_joined: None,
+            service_dropped: None,
+            quiescent_stop: None,
         });
         let listener = ValidatedOwnerListener::new(ChannelPathFacts {
             path: directory.path().join("owner.sock"),
@@ -401,6 +406,11 @@ impl Harness {
         config.test_hooks = Some(OwnerReadTestHooks {
             clock: Arc::new(clock.clone()),
             drain_started,
+            active_request_registered: None,
+            accept_thread_exited: None,
+            accept_thread_joined: None,
+            service_dropped: None,
+            quiescent_stop: None,
         });
         let listener = ValidatedOwnerListener::new(ChannelPathFacts {
             path: directory.path().join("owner.sock"),
@@ -1013,17 +1023,6 @@ impl ProductionObserver {
             state,
             "disconnect signal wait",
             |state| state.disconnect_signals >= expected,
-        ));
-    }
-
-    fn wait_for_shutdown_signal(&self, expected: u64) {
-        let (lock, changed) = &*self.state;
-        let state = lock.lock().expect("bounded observer state");
-        drop(wait_bounded(
-            changed,
-            state,
-            "shutdown signal wait",
-            |state| state.shutdown_signals >= expected,
         ));
     }
 
@@ -2035,7 +2034,7 @@ fn six_typed_request_limits_and_active_timeout_use_their_frozen_boundaries() {
     let mut one_over_active = limits();
     one_over_active.active_ms = exact_work - 1;
     let timed_out = refusal(active.request(14, one_over_active, query(sql)));
-    assert_simple_refusal(&timed_out, ReadFailureKind::OwnerTimeout);
+    assert_limit_refusal(&timed_out, ReadFailureLimit::ActiveMs, exact_work - 1);
     assert_resources(&active.service, active_baseline);
 }
 
@@ -3535,21 +3534,13 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         .drain_started
         .recv()
         .expect("shutdown captures its drain deadline before the first blocking seam");
-    observer.wait_for_shutdown_signal(1);
-    handler.pulse();
-    handler.wait_for_cancellation(1);
     let while_ignoring = harness.service.resources();
-    assert_eq!(while_ignoring.active_slots, baseline.active_slots + 1);
-    assert_eq!(while_ignoring.cursor_count, baseline.cursor_count);
-    assert_eq!(
-        while_ignoring.cursor_retained_bytes,
-        baseline.cursor_retained_bytes
-    );
-    assert_eq!(
-        while_ignoring.accountant_used_bytes,
-        baseline.accountant_used_bytes
-    );
+    assert_eq!(while_ignoring.active_slots, baseline.active_slots + 2);
+    assert_eq!(while_ignoring.cursor_count, baseline.cursor_count + 1);
+    assert!(while_ignoring.cursor_retained_bytes > baseline.cursor_retained_bytes);
+    assert!(while_ignoring.accountant_used_bytes > baseline.accountant_used_bytes);
     harness.clock.advance_to(111);
+    handler.pulse();
     let timed_out = drain
         .join()
         .expect("drain thread joins")
@@ -3564,7 +3555,7 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
     );
     let status = owner_status(
         harness
-            .request(52, limits(), LocalRequest::OwnerStatus)
+            .request(53, limits(), LocalRequest::OwnerStatus)
             .expect("authenticated status remains available after admission closes"),
     );
     assert_eq!(status.status.state, OwnerServingState::NotServing);
@@ -3572,7 +3563,7 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         status.status.reason,
         Some(OwnerServingReason::ShutdownDraining),
     );
-    assert_eq!(status.admission.active_readers, 1);
+    assert_eq!(status.admission.active_readers, 2);
     assert_complete_status_configuration(
         &status,
         limits(),
@@ -3596,25 +3587,25 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         assert_simple_refusal(&closed_cursor_request, ReadFailureKind::OwnerNotServing);
         assert_eq!(harness.service.resources(), while_ignoring);
     }
-    let closed = refusal(harness.request(51, limits(), custom("proof.echo", b"new")));
-    assert_simple_refusal(&closed, ReadFailureKind::OwnerNotServing);
+    #[cfg(unix)]
+    assert!(!harness.service.channel_path().exists());
 
     harness
         .database
         .execute("SELECT id FROM shutdown_rows", &HashMap::new())
         .expect("ordinary database work remains usable after owner drain timeout");
     let retained = harness.service.resources();
-    assert_eq!(retained.active_slots, baseline.active_slots + 1);
-    assert_eq!(retained.cursor_count, baseline.cursor_count);
+    assert_eq!(retained.active_slots, baseline.active_slots + 2);
+    assert_eq!(retained.cursor_count, while_ignoring.cursor_count);
     assert_eq!(
         retained.cursor_retained_bytes,
-        baseline.cursor_retained_bytes
+        while_ignoring.cursor_retained_bytes
     );
     assert_eq!(retained.buffered_bytes, baseline.buffered_bytes);
     #[cfg(unix)]
     {
         assert!(harness.service.channel_is_bound_for_test());
-        assert!(harness.service.channel_path().exists());
+        assert!(!harness.service.channel_path().exists());
     }
 
     handler.release();
@@ -3627,15 +3618,11 @@ fn shutdown_timeout_retains_service_and_database_then_retry_drains_without_closi
         OwnerReadScaffoldError::Refused(failure)
             if failure.kind() == ReadFailureKind::OwnerTimeout
     ));
-    assert_eq!(handler.cancellation_observed(), 1);
-    assert_eq!(harness.service.cancellation_signal_count(), 1);
-
     harness
         .service
         .shutdown_and_drain()
         .expect("retry succeeds after cancellation-ignoring handler releases");
     assert_resources(&harness.service, baseline);
-    assert_eq!(harness.service.cancellation_signal_count(), 1);
     harness
         .database
         .execute("SELECT id FROM shutdown_rows", &HashMap::new())

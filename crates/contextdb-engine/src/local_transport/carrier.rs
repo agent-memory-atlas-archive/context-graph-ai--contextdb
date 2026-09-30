@@ -10,7 +10,7 @@ use super::{
     LocalTransportError, MAX_FRAME_BYTES, StaleChannelAction, StaleChannelEvidence,
     StaleFilesystemEvidence, StaleIdentityEvidence, connect_with_deadline, frame_read_refusal,
     invalid_channel_data, owner_disconnected, receive_response_with_deadline,
-    retry_route_with_deadline, write_request_with_deadline,
+    response_decode_refusal, retry_route_with_deadline, write_request_with_deadline,
 };
 #[cfg(unix)]
 use contextdb_core::read_contract::{DeadlineClock, ReadFailureKind};
@@ -155,6 +155,35 @@ impl UnixLocalCarrier {
         result
     }
 
+    pub(crate) fn send_message_async<'a>(
+        &'a self,
+        stream: &'a std::os::unix::net::UnixStream,
+        boundary: &'a LocalProtocolBoundary,
+        message: LocalOutboundMessage<'_>,
+    ) -> LocalDeadlineOperation<'a> {
+        let ordinary_response = matches!(
+            message,
+            LocalOutboundMessage::Response {
+                expectation,
+                ..
+            } if *expectation == LocalResponseExpectation::OrdinaryResult
+        );
+        let operation: LocalDeadlineOperation<'a> = match boundary.encode_frame(message) {
+            Ok(frame) => match write_readiness(stream, frame) {
+                Ok(write) => Box::pin(write),
+                Err(error) => Box::pin(std::future::ready(Err(error))),
+            },
+            Err(error) => Box::pin(std::future::ready(Err(error))),
+        };
+        Box::pin(async move {
+            let result = operation.await;
+            if result.is_err() && ordinary_response {
+                boundary.reset_ordinary_outbound();
+            }
+            result
+        })
+    }
+
     pub fn receive_message(
         &self,
         stream: &mut std::os::unix::net::UnixStream,
@@ -205,7 +234,7 @@ impl UnixLocalCarrier {
                 let payload = reader.await.map_err(frame_read_refusal)?;
                 let inbound = boundary
                     .decode_payload(LocalInboundKind::Response(expectation), &payload)
-                    .map_err(|_| invalid_channel_data())?;
+                    .map_err(response_decode_refusal)?;
                 let LocalInboundMessage::Response(response) = inbound else {
                     return Err(invalid_channel_data());
                 };

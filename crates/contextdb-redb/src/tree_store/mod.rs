@@ -1,3 +1,7 @@
+#[cfg(feature = "contextdb-internal")]
+mod bounded_bytes;
+#[cfg(feature = "contextdb-internal")]
+pub use bounded_bytes::{BoundedByteCursor, BoundedByteHandle};
 mod btree;
 mod btree_base;
 mod btree_iters;

@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Existing compatibility and test seam shape.
 use crate::memory_accounting::MemoryAccountant;
 use crate::sync_types::{DdlChange, NaturalKey, natural_key_from_row_values};
 use contextdb_core::{
@@ -46,6 +47,14 @@ pub(crate) type ChangeLogLsnRefcounts = BTreeMap<Lsn, u64>;
 /// present empty vector means the guard proved that no active snapshot needs
 /// an emptied maintained partition.
 pub(crate) type VectorPartitionSnapshotStageRegistry = Arc<Mutex<HashMap<Lsn, Arc<[SnapshotId]>>>>;
+
+/// The shape a received unit is INSTALLING, staged under its own commit LSN
+/// before the schema swap that would otherwise make it visible. A unit that
+/// declares a table and carries that table's vectors in the same delivery
+/// needs its vector writes resolved against this arriving shape, not the
+/// receiver's current one -- the table exists only here until publication.
+pub(crate) type ReceivedArrivingTableMetaRegistry =
+    Arc<Mutex<HashMap<Lsn, Arc<HashMap<String, TableMeta>>>>>;
 
 /// The exact row/declaration pair from which one local partition identity was
 /// derived. This is deliberately an engine sidecar: neither `VectorEntry` nor
@@ -205,6 +214,72 @@ pub(crate) fn record_change_log_entries(
     }
 }
 
+/// The per-table shadow index keeps one `(Lsn, RowId)` per row entry, in a
+/// `Vec` that is at most half empty once it has grown.
+const CHANGE_LOG_TABLE_INDEX_SLOT_BYTES: usize = 2 * std::mem::size_of::<(Lsn, RowId)>();
+
+/// One ordered-map node's share of a per-LSN refcount. Entries of the same
+/// commit share one refcount, so the map holds fewer of these than there are
+/// entries: charging one per entry over-states the map and never under-states
+/// it.
+const CHANGE_LOG_LSN_REFCOUNT_SLOT_BYTES: usize = std::mem::size_of::<(Lsn, u64)>() + 16;
+
+/// One `BTreeMap<Lsn, TxId>` entry in the transaction manager's commit index,
+/// with its share of an ordered node.
+pub(crate) const COMMIT_INDEX_ENTRY_BYTES: usize = std::mem::size_of::<(Lsn, TxId)>() + 16;
+
+/// What one change-log entry costs the store that KEEPS it: its slot in the
+/// log's own `Vec`, the heap its owned names hold, its slot in the per-table
+/// shadow index, and its share of the per-LSN refcount map.
+///
+/// The log is trimmed only by a maintenance cycle the caller drives. Until
+/// this was charged, a caller-driven policy that never runs one grew it
+/// without bound and no declared `MEMORY_LIMIT` ever saw it -- so past Redb's
+/// own page-cache cap, what stopped an import that outgrew the limit was the
+/// machine's out-of-memory kill, not the engine's typed refusal.
+pub(crate) fn change_log_entry_retained_bytes(entry: &ChangeLogEntry) -> usize {
+    let owned = match entry {
+        ChangeLogEntry::RowInsert { table, .. } => table.len(),
+        ChangeLogEntry::RowDelete {
+            table, natural_key, ..
+        } => table
+            .len()
+            .saturating_add(natural_key_retained_bytes(natural_key)),
+        ChangeLogEntry::EdgeInsert { edge_type, .. }
+        | ChangeLogEntry::EdgeDelete { edge_type, .. } => edge_type.len(),
+        ChangeLogEntry::VectorInsert { index, .. } | ChangeLogEntry::VectorDelete { index, .. } => {
+            index.table.len().saturating_add(index.column.len())
+        }
+    };
+    // Half a grown `Vec`'s slots are empty, which is memory the log is
+    // holding just as much as the entries themselves.
+    std::mem::size_of::<ChangeLogEntry>()
+        .saturating_mul(2)
+        .saturating_add(owned)
+        .saturating_add(CHANGE_LOG_TABLE_INDEX_SLOT_BYTES)
+        .saturating_add(CHANGE_LOG_LSN_REFCOUNT_SLOT_BYTES)
+}
+
+/// The heap one natural key owns: its column names and its values.
+fn natural_key_retained_bytes(key: &NaturalKey) -> usize {
+    key.rest.iter().fold(
+        key.column.len().saturating_add(key.value.estimated_bytes()),
+        |bytes, (column, value)| {
+            bytes
+                .saturating_add(column.len())
+                .saturating_add(value.estimated_bytes())
+                .saturating_add(std::mem::size_of::<(String, Value)>())
+        },
+    )
+}
+
+/// What a run of change-log entries costs together.
+pub(crate) fn change_log_retained_bytes(entries: &[ChangeLogEntry]) -> usize {
+    entries.iter().fold(0usize, |bytes, entry| {
+        bytes.saturating_add(change_log_entry_retained_bytes(entry))
+    })
+}
+
 pub(crate) const RETENTION_EXPIRY_PREFIX: &str = "retention_expiry.v1.";
 
 pub(crate) fn retention_expiry_key(table: &str, row: RowId, created: TxId) -> String {
@@ -359,6 +434,7 @@ pub(crate) fn build_received_schema_change_log_entries(
 /// indexes. Received-schema publication calls this after Redb succeeds,
 /// without replaying any data WriteSet into the stores a second time.
 pub(crate) fn publish_prepared_change_log_entries(
+    accountant: &MemoryAccountant,
     change_log: &RwLock<Vec<ChangeLogEntry>>,
     table_index: &RwLock<ChangeLogTableIndex>,
     lsn_refcounts: &RwLock<ChangeLogLsnRefcounts>,
@@ -368,7 +444,9 @@ pub(crate) fn publish_prepared_change_log_entries(
     let mut table_index = table_index.write();
     let mut lsn_refcounts = lsn_refcounts.write();
     let mut change_log = change_log.write();
+    accountant.charge_retained(change_log_retained_bytes(&entries));
     if !structurally_dropped_tables.is_empty() {
+        let before = change_log_retained_bytes(&change_log);
         change_log.retain(|entry| match entry {
             ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } => {
                 !structurally_dropped_tables.contains(table)
@@ -379,6 +457,7 @@ pub(crate) fn publish_prepared_change_log_entries(
             }
             ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => true,
         });
+        accountant.release(before.saturating_sub(change_log_retained_bytes(&change_log)));
         table_index.clear();
         lsn_refcounts.clear();
         record_change_log_entries(&mut table_index, &mut lsn_refcounts, &change_log);
@@ -389,6 +468,7 @@ pub(crate) fn publish_prepared_change_log_entries(
 
 pub struct CompositeStore {
     pub(crate) local_erasure_stages: crate::database::discard::StageRegistry,
+    pub(crate) received_arriving_table_meta: ReceivedArrivingTableMetaRegistry,
     pub relational: Arc<RelationalStore>,
     pub graph: Arc<GraphStore>,
     pub vector: Arc<VectorStore>,
@@ -523,6 +603,7 @@ impl CompositeStore {
     ) -> Self {
         Self {
             local_erasure_stages: Arc::new(Mutex::new(HashMap::new())),
+            received_arriving_table_meta: Arc::new(Mutex::new(HashMap::new())),
             relational,
             graph,
             vector,
@@ -802,6 +883,7 @@ impl CompositeStore {
             deleted_rows,
             HashSet::new(),
             None,
+            false,
         )
     }
 
@@ -821,6 +903,7 @@ impl CompositeStore {
             deleted_rows,
             reclaimable_partitions,
             None,
+            false,
         )
     }
 
@@ -837,6 +920,7 @@ impl CompositeStore {
             deleted_rows,
             HashSet::new(),
             Some(registered_snapshots),
+            false,
         )
     }
 
@@ -847,6 +931,20 @@ impl CompositeStore {
         commit_lsn.and_then(|lsn| self.vector_partition_snapshot_stages.lock().remove(&lsn))
     }
 
+    /// The shape a received unit is installing, staged under its own commit LSN
+    /// by `Database::register_received_schema_stage` before the schema
+    /// swap that would otherwise make it visible. Consumed here so a caller
+    /// that never reaches `apply_exact` for this commit LSN (the durable
+    /// persistence path for a registered received-schema stage never does)
+    /// is not required to also clean it up on that account -- the stage
+    /// registration's own unwind guard removes it unconditionally regardless.
+    fn take_received_arriving_table_meta(
+        &self,
+        commit_lsn: Option<Lsn>,
+    ) -> Option<Arc<HashMap<String, TableMeta>>> {
+        commit_lsn.and_then(|lsn| self.received_arriving_table_meta.lock().remove(&lsn))
+    }
+
     fn prepare_vector_partition_mutations_with_reclamation(
         &self,
         ws: &WriteSet,
@@ -854,6 +952,7 @@ impl CompositeStore {
         deleted_rows: Option<&HashMap<String, HashMap<RowId, VersionedRow>>>,
         reclaimable_partitions: HashSet<contextdb_vector::VectorPartitionRef>,
         registered_snapshots: Option<&[SnapshotId]>,
+        resolving_staged_arrival: bool,
     ) -> Result<PreparedVectorPartitionMutationBatch> {
         let commit_lsn = ws.commit_lsn.unwrap_or(Lsn(0));
         let new_rows = ws
@@ -878,7 +977,11 @@ impl CompositeStore {
         for (index, row_id, deleted_tx) in &ws.vector_deletes {
             let meta = Self::vector_table_meta(table_meta, index)?;
             let declaration = Self::vector_declaration(table_meta, index)?;
-            if checked_declarations.insert(index.clone()) {
+            // A staged arriving table has no registered live vector layout
+            // yet -- the detached worker that produced this write set already
+            // ran this exact check against the arriving shape, so this is a
+            // re-check against not-yet-published state, not a missing one.
+            if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
                 self.validate_registered_vector_declaration(index, &declaration)?;
             }
             let row = self
@@ -918,7 +1021,7 @@ impl CompositeStore {
         for entry in &ws.vector_inserts {
             let meta = Self::vector_table_meta(table_meta, &entry.index)?;
             let declaration = Self::vector_declaration(table_meta, &entry.index)?;
-            if checked_declarations.insert(entry.index.clone()) {
+            if !resolving_staged_arrival && checked_declarations.insert(entry.index.clone()) {
                 self.validate_registered_vector_declaration(&entry.index, &declaration)?;
             }
             let row = accepted_new_row(&entry.index.table, entry.row_id).ok_or_else(|| {
@@ -950,7 +1053,7 @@ impl CompositeStore {
         for (index, old_row_id, new_row_id, moved_tx) in &ws.vector_moves {
             let meta = Self::vector_table_meta(table_meta, index)?;
             let declaration = Self::vector_declaration(table_meta, index)?;
-            if checked_declarations.insert(index.clone()) {
+            if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
                 self.validate_registered_vector_declaration(index, &declaration)?;
             }
             let old_row = self
@@ -1031,7 +1134,7 @@ impl CompositeStore {
                 {
                     continue;
                 }
-                if checked_declarations.insert(index.clone()) {
+                if !resolving_staged_arrival && checked_declarations.insert(index.clone()) {
                     self.validate_registered_vector_declaration(&index, declaration)?;
                 }
                 let Some(vector) =
@@ -1130,25 +1233,48 @@ impl CompositeStore {
 
     pub(crate) fn apply_exact(&self, ws: &WriteSet) -> Result<()> {
         let registered_snapshots = self.take_vector_partition_snapshot_stage(ws.commit_lsn);
-        let table_meta = self.relational.table_meta.read().clone();
-        let deleted_rows = self.deleted_rows_snapshot_for_write_set(ws);
-        let log_entries = self.build_change_log_entries_with_snapshots(
-            ws,
-            Some(&table_meta),
-            deleted_rows.as_ref(),
-        );
-        let partition_mutations = match registered_snapshots.as_deref() {
-            Some(registered_snapshots) => self
-                .prepare_vector_partition_mutations_with_registered_snapshots(
-                    ws,
-                    &table_meta,
-                    deleted_rows.as_ref(),
-                    registered_snapshots,
-                )?,
-            None => {
-                self.prepare_vector_partition_mutations(ws, &table_meta, deleted_rows.as_ref())?
-            }
+        // A received unit that declares a table in the same delivery that
+        // carries that table's rows/vectors has not published its schema
+        // yet -- the receiver's live `table_meta` does not have the table,
+        // and its live vector store has no registered layout for it either.
+        // Resolve against the shape the unit is installing instead, staged
+        // under this same commit LSN when the stage was registered. The
+        // detached worker that produced this write set already validated
+        // the registered vector layout against that same arriving shape, so
+        // the ordinary re-check below is skipped rather than re-run against
+        // not-yet-published state.
+        let arriving = self.take_received_arriving_table_meta(ws.commit_lsn);
+        let resolving_staged_arrival = arriving.is_some();
+        let table_meta = match arriving {
+            Some(arriving) => (*arriving).clone(),
+            None => self.relational.table_meta.read().clone(),
         };
+        let deleted_rows = self.deleted_rows_snapshot_for_write_set(ws);
+        // One publication owner per affected state, and the change log's owner
+        // for a received unit's commit is its stage: the stage already built
+        // the entries for this exact write set with
+        // `build_received_schema_change_log_entries`, which also knows which
+        // deletes belong to a structurally dropped table and must not become
+        // outbound row history. Deriving a second set here would append every
+        // row and edge the unit installs to the log twice, so a receiver asked
+        // for `changes_since` would hand a peer each of them two times over.
+        let log_entries = if resolving_staged_arrival {
+            Vec::new()
+        } else {
+            self.build_change_log_entries_with_snapshots(
+                ws,
+                Some(&table_meta),
+                deleted_rows.as_ref(),
+            )
+        };
+        let partition_mutations = self.prepare_vector_partition_mutations_with_reclamation(
+            ws,
+            &table_meta,
+            deleted_rows.as_ref(),
+            HashSet::new(),
+            registered_snapshots.as_deref(),
+            resolving_staged_arrival,
+        )?;
         self.apply_exact_with_log_entries(ws, log_entries, partition_mutations)
     }
 
@@ -1207,6 +1333,14 @@ impl CompositeStore {
                     },
                 ));
         }
+        // What the log and its two side indexes now hold, plus the one
+        // commit-index entry the transaction manager inserts for this commit
+        // the moment this apply returns. Both exist once the commit is
+        // durable, so the charge cannot refuse here -- the typed refusal
+        // fires on the next admission, which is what a declared limit is for.
+        self.accountant.charge_retained(
+            change_log_retained_bytes(&log_entries).saturating_add(COMMIT_INDEX_ENTRY_BYTES),
+        );
         record_change_log_entries(
             &mut self.change_log_table_index.write(),
             &mut self.change_log_lsn_refcounts.write(),
@@ -1337,6 +1471,7 @@ mod tests {
         );
 
         publish_prepared_change_log_entries(
+            &MemoryAccountant::no_limit(),
             &change_log,
             &table_index,
             &lsn_refcounts,

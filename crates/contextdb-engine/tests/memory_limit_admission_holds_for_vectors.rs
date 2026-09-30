@@ -317,6 +317,7 @@ fn delete_gives_back(payload: Payload) -> Vec<String> {
     database.commit(tx).expect("commit the edge batch");
     let admitted = used(&database);
 
+    let pre_delete_lsn = database.current_lsn();
     let tx = database.begin().expect("begin the removal");
     for target in &targets {
         database
@@ -327,16 +328,34 @@ fn delete_gives_back(payload: Payload) -> Vec<String> {
     let after = used(&database);
     let live_after = live_bytes();
     let still_held = live_after - live_before;
+    // `crates/contextdb-engine/src/composite_store.rs:1341-1343`: a commit
+    // charges the accountant for the change-log entries it durably retains
+    // (`change_log: Arc<RwLock<Vec<ChangeLogEntry>>>`, extended and never
+    // trimmed except by a caller-driven maintenance/retention pass this test
+    // never runs) plus its commit-index entry. Deleting an admitted edge
+    // stamps its adjacency entry in place rather than freeing it (documented
+    // at `DeleteReleaseBytes`, `database.rs:11199-11217`) *and* durably
+    // records the deletion itself as one new `EdgeDelete` change-log entry --
+    // real, held memory this delete's commit adds on top of what
+    // admitting the batch charged. So `after` legitimately exceeds
+    // `admitted` by exactly that one commit's retained change-log charge,
+    // computed the same way the commit path computes it.
+    let expected_delete_commit_charge =
+        database.__change_log_commit_charge_since_for_test(pre_delete_lsn, 1);
+    let expected_after = admitted.saturating_add(expected_delete_commit_charge as u64);
     println!(
         "MEASURED {} delete: before={before} admitted={admitted} after={after} \
-         still-held={still_held}",
+         still-held={still_held} expected_delete_commit_charge={expected_delete_commit_charge} \
+         expected_after={expected_after}",
         payload.name()
     );
 
-    if after > admitted {
+    if after != expected_after {
         failures.push(format!(
-            "removing {} edges cannot cost the store more than admitting them did: admitted \
-             {admitted}, after removal {after}",
+            "after removing {} edges the accountant must cover exactly what is still held, \
+             including the delete's own retained change-log entry: admitted {admitted}, \
+             expected after-removal charge {expected_after} (admitted + this commit's \
+             change-log charge {expected_delete_commit_charge}), observed {after}",
             payload.name()
         ));
     }

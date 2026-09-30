@@ -483,6 +483,28 @@ impl Database {
         self.prepare_received_trigger_publication_from_projection(declarations)
     }
 
+    pub(super) fn received_trigger_projection_bytes(&self) -> Result<usize> {
+        let declarations = self.trigger.declarations.lock();
+        let encoded = bincode::serde::encode_into_std_write(
+            &*declarations,
+            &mut std::io::sink(),
+            bincode::config::standard(),
+        )
+        .map_err(|error| Error::Other(format!("price received triggers: {error}")))?;
+        let callbacks = self.trigger.callbacks.read();
+        let callback_bytes = callbacks.keys().fold(0usize, |bytes, name| {
+            bytes.saturating_add(name.len()).saturating_add(256)
+        });
+        let active = self.trigger.active_trigger_names.lock();
+        let active_bytes = active.iter().fold(0usize, |bytes, name| {
+            bytes.saturating_add(name.len()).saturating_add(128)
+        });
+        Ok(encoded
+            .saturating_add(declarations.len().saturating_mul(512))
+            .saturating_add(callback_bytes)
+            .saturating_add(active_bytes))
+    }
+
     pub(super) fn prepare_received_trigger_publication_from_projection(
         &self,
         declarations: BTreeMap<String, TriggerDeclaration>,
@@ -1035,6 +1057,55 @@ impl Database {
             }))
     }
 
+    /// Check the same final staged row and event that local dispatch will see.
+    /// Ordinary commits with no matching trigger need only final validation.
+    pub(super) fn has_matching_local_trigger_for_tx(&self, tx: TxId) -> Result<bool> {
+        let declarations = self.trigger_declarations_from(None);
+        if declarations.is_empty() {
+            return Ok(false);
+        }
+        let mut events_by_table = HashMap::new();
+        for declaration in declarations {
+            let events = events_by_table
+                .entry(declaration.table)
+                .or_insert((false, false));
+            events.0 |= declaration.on_events.contains(&TriggerEvent::Insert);
+            events.1 |= declaration.on_events.contains(&TriggerEvent::Update);
+        }
+        let snapshot = self.trigger_dispatch_snapshot(tx, None, TriggerDispatchMode::Local)?;
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.relational_inserts
+                .iter()
+                .enumerate()
+                .any(|(index, (table, row))| {
+                    if !snapshot.triggered_tables.contains(table)
+                        || snapshot
+                            .latest_insert_index
+                            .get(&(table.clone(), row.row_id))
+                            != Some(&index)
+                    {
+                        return false;
+                    }
+                    let event = if snapshot.deleted_rows.contains(&(table.clone(), row.row_id))
+                        && self
+                            .relational_store
+                            .row_by_id(table, row.row_id, SnapshotId::from_raw_wire(u64::MAX))
+                            .is_some()
+                    {
+                        TriggerEvent::Update
+                    } else {
+                        TriggerEvent::Insert
+                    };
+                    events_by_table
+                        .get(table)
+                        .is_some_and(|events| match event {
+                            TriggerEvent::Insert => events.0,
+                            TriggerEvent::Update => events.1,
+                        })
+                })
+        })
+    }
+
     fn dispatch_triggers_for_tx_from(
         &self,
         tx: TxId,
@@ -1109,7 +1180,10 @@ impl Database {
             )?;
             self.rewrite_commit_time_upserts_for_write_set(ws, snapshot, &upsert_intents)?;
             ws.canonicalize_final_state();
-            Ok(validation)
+            Ok(CommitValidationOutcome {
+                conditional_noop_count: validation.conditional_noop_count,
+                conditional_conflict_count: validation.conditional_conflict_count,
+            })
         })?
     }
 
@@ -1122,7 +1196,7 @@ impl Database {
             if ws.is_empty() {
                 return Ok(CommitValidationOutcome::default());
             }
-            self.commit_validate(tx, ws)
+            Ok(CommitValidationOutcome::default())
         })?
     }
 
@@ -1898,7 +1972,7 @@ impl Database {
         } else {
             self.record_ddl_generation_sidecars(lsn, &ddl)?;
         }
-        self.drop_table_aux_state(table);
+        self.apply_graph_edges_after_table_drop(graph_edges);
         self.remove_rank_formulas_for_table(table);
         self.vector_store_deregister_table(table);
         self.relational_store().drop_table(table);

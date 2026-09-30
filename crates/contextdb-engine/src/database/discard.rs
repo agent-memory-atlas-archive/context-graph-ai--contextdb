@@ -176,6 +176,21 @@ impl Database {
         // Selection and every policy check have completed before changing the overlay.
         let mut removed = WriteSet::default();
         self.tx_mgr.with_write_set(tx, |ws| {
+            // The admitted figure travels with the version it describes, so
+            // the release below answers what storing the row took instead of
+            // re-pricing it against the table's current shape.
+            let discarded_admissions = ws
+                .relational_insert_admitted_bytes
+                .iter()
+                .flat_map(|(table, rows)| {
+                    rows.iter()
+                        .map(move |(row_id, bytes)| (table.clone(), *row_id, *bytes))
+                })
+                .filter(|(table, row_id, _)| selected_rows.contains(&(table.clone(), *row_id)))
+                .collect::<Vec<_>>();
+            for (table, row_id, bytes) in discarded_admissions {
+                removed.set_relational_insert_admitted_bytes(table, row_id, bytes);
+            }
             ws.relational_inserts.retain(|(table, row)| {
                 if selected_rows.contains(&(table.clone(), row.row_id)) {
                     removed
@@ -186,6 +201,7 @@ impl Database {
                     true
                 }
             });
+            ws.forget_admitted_bytes_for_unstaged_rows();
             ws.vector_inserts.retain(|entry| {
                 if selected_rows.contains(&(entry.index.table.clone(), entry.row_id)) {
                     removed.vector_inserts.push(entry.clone());
@@ -233,7 +249,7 @@ impl Database {
         selections: &[AuthoritativePurgeSelection],
         token: event_bus::AuthoritativePurgeQueueMutationToken,
         guard: &crate::blob_repository::BlobExclusiveHashSetGuard,
-    ) -> Result<()> {
+    ) -> Result<CommitStageRegistration<Stage>> {
         let lsn = ws
             .commit_lsn
             .ok_or_else(crate::custody::canonical::invalid)?;
@@ -367,6 +383,9 @@ impl Database {
                 }),
             },
         );
-        Ok(())
+        Ok(CommitStageRegistration::new(
+            &self.local_erasure_stages,
+            lsn,
+        ))
     }
 }

@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! Sync contract types for contextDB change-tracking and replication.
 //!
 //! These types define the public API for sync operations and the durable wire
@@ -19,6 +20,7 @@ pub enum SchemaSyncCapability {
     VectorSearchMode,
     VectorAutoIndexAt,
     VectorHnswPolicy,
+    MaintainedIndexCounts,
 }
 
 impl std::fmt::Display for SchemaSyncCapability {
@@ -28,6 +30,7 @@ impl std::fmt::Display for SchemaSyncCapability {
             Self::VectorSearchMode => "declared vector search mode",
             Self::VectorAutoIndexAt => "declared vector AUTO_INDEX_AT policy",
             Self::VectorHnswPolicy => "declared vector HNSW policy",
+            Self::MaintainedIndexCounts => "declared maintained index-prefix counts",
         })
     }
 }
@@ -53,6 +56,23 @@ pub(crate) struct DurableSchemaSyncHoldback {
     pub through: Lsn,
     #[serde(default)]
     pub held_through: Lsn,
+    /// Tables whose arriving schema unit a RECEIVER refused because its
+    /// declared `MEMORY_LIMIT` could not hold the whole unit. Same record,
+    /// same two frontiers, a different reason: a table listed here is waiting
+    /// for memory rather than for a peer to be upgraded. Units for tables not
+    /// listed keep applying, and the held unit is retried when memory allows.
+    #[serde(default)]
+    pub memory_held_tables: BTreeMap<String, SchemaSyncMemoryHold>,
+}
+
+/// One table's memory hold: the author's DDL position the receiver is held at,
+/// and what the whole unit needed there. The position is what a retry starts
+/// from; the figure is what the refusal reports so an operator can see how much
+/// larger the limit has to be.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaSyncMemoryHold {
+    pub held_at: Lsn,
+    pub required_bytes: usize,
 }
 
 impl std::fmt::Display for SchemaSyncHoldback {
@@ -344,6 +364,36 @@ impl ChangeSet {
         self.filter_schema_tables(tables, false)
     }
 
+    /// Source transaction boundaries containing any of `tables`' DDL.
+    pub(crate) fn ddl_lsn_groups_for_tables(&self, tables: &HashSet<String>) -> HashSet<Lsn> {
+        self.ddl
+            .iter()
+            .zip(&self.ddl_lsn)
+            .filter_map(|(change, lsn)| {
+                change
+                    .table_name()
+                    .is_some_and(|table| tables.contains(table))
+                    .then_some(*lsn)
+            })
+            .collect()
+    }
+
+    /// Every table named by declarations in the selected source transactions.
+    pub(crate) fn tables_in_ddl_lsn_groups(&self, groups: &HashSet<Lsn>) -> HashSet<String> {
+        self.ddl
+            .iter()
+            .zip(&self.ddl_lsn)
+            .filter(|(_, lsn)| groups.contains(lsn))
+            .filter_map(|(change, _)| change.table_name().map(str::to_string))
+            .collect()
+    }
+
+    /// Remove complete source transactions, including connected data and
+    /// declarations without a table identity such as sinks.
+    pub(crate) fn without_lsn_groups(&self, groups: &HashSet<Lsn>) -> ChangeSet {
+        self.filter_by_lsn_and_table(|_, lsn| !groups.contains(&lsn))
+    }
+
     /// Keep source work newer than the sender's private compatibility
     /// frontier. The public sync watermark stays behind a held table, while
     /// this filter prevents already delivered compatible work from crossing
@@ -359,15 +409,18 @@ impl ChangeSet {
         self.filter_by_lsn_and_table(|_, lsn| lsn <= frontier)
     }
 
-    /// Recover every held table from the public watermark while taking only
-    /// newer work for tables that already crossed under the older protocol.
-    pub(crate) fn for_schema_recovery(
+    /// Recover each held source transaction from the public watermark while
+    /// taking only newer work that already crossed under the older protocol.
+    pub(crate) fn for_schema_recovery_with_ddl_groups(
         &self,
         held_tables: &HashSet<String>,
+        held_groups: &HashSet<Lsn>,
         compatible_through: Lsn,
     ) -> ChangeSet {
         self.filter_by_lsn_and_table(|table, lsn| {
-            table.is_some_and(|table| held_tables.contains(table)) || lsn > compatible_through
+            held_groups.contains(&lsn)
+                || table.is_some_and(|table| held_tables.contains(table))
+                || lsn > compatible_through
         })
     }
 
@@ -710,10 +763,120 @@ pub struct RowChange {
     /// clock, so a row keeps its age when it moves: a hub does not hand a
     /// day-old backlog a fresh retention window just because it arrived
     /// today, and apply-queue latency never extends a row's life. `None` for
-    /// a row whose origin recorded no stamp (a delete tombstone, or a peer
-    /// older than this field), in which case the receiver stamps its own.
+    /// a row whose origin recorded no stamp, including a delete tombstone;
+    /// in that case the receiver supplies its own stamp.
     #[serde(default)]
     pub created_at: Option<contextdb_core::Wallclock>,
+}
+
+/// What a projected history answer's parts actually occupy in memory: every
+/// container at the size it allocates, every string and value body it owns,
+/// and each allocation's header. A bounded answer is admitted and held at
+/// these sizes, so what it is charged never falls below what it holds.
+pub(crate) mod held {
+    use contextdb_core::Value;
+    use std::collections::HashMap;
+
+    /// What the allocator itself keeps beside each allocation.
+    pub(crate) const ALLOCATION_BYTES: usize = 16;
+
+    /// A hash map holding `len` entries of `(K, V)`, collected at that size.
+    pub(crate) fn map<K, V>(len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let buckets = if len < 4 {
+            4
+        } else if len < 8 {
+            8
+        } else {
+            len.saturating_mul(8).div_ceil(7).next_power_of_two()
+        };
+        buckets
+            .saturating_mul(std::mem::size_of::<(K, V)>() + 1)
+            .saturating_add(16 + ALLOCATION_BYTES)
+    }
+
+    /// An owned string's body.
+    pub(crate) fn text(text: &str) -> usize {
+        if text.is_empty() {
+            0
+        } else {
+            text.len() + ALLOCATION_BYTES
+        }
+    }
+
+    /// What a value owns beyond its own slot.
+    pub(crate) fn value(value: &Value) -> usize {
+        match value {
+            Value::Text(text) => self::text(text),
+            Value::Vector(vector) if vector.is_empty() => 0,
+            Value::Vector(vector) => std::mem::size_of_val(vector.as_slice()) + ALLOCATION_BYTES,
+            Value::Json(_) => value.estimated_bytes(),
+            _ => 0,
+        }
+    }
+
+    /// A column-to-value map and everything it owns.
+    pub(crate) fn values(values: &HashMap<String, Value>) -> usize {
+        values.iter().fold(
+            map::<String, Value>(values.len()),
+            |bytes, (column, value)| {
+                bytes
+                    .saturating_add(text(column))
+                    .saturating_add(self::value(value))
+            },
+        )
+    }
+}
+
+impl NaturalKey {
+    /// What this key owns beyond its own slot.
+    pub(crate) fn held_bytes(&self) -> usize {
+        // The list's buffer is what it allocated, which can be room for
+        // entries it never received.
+        let rest = if self.rest.capacity() == 0 {
+            0
+        } else {
+            self.rest
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Value)>())
+                .saturating_add(held::ALLOCATION_BYTES)
+        };
+        self.rest.iter().fold(
+            held::text(&self.column)
+                .saturating_add(held::value(&self.value))
+                .saturating_add(rest),
+            |bytes, (column, value)| {
+                bytes
+                    .saturating_add(held::text(column))
+                    .saturating_add(held::value(value))
+            },
+        )
+    }
+}
+
+impl RowChange {
+    /// What this change occupies in an answer: its slot and everything it
+    /// owns.
+    pub(crate) fn held_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(held::text(&self.table))
+            .saturating_add(self.natural_key.held_bytes())
+            .saturating_add(held::values(&self.values))
+    }
+
+    /// What one copy of this row change costs a projected answer -- the
+    /// table name, the natural key and one copy of the values, the same
+    /// per-value measurement `estimate_row_value_bytes` uses for a store's
+    /// own retention, without the retention multiple: a read holds exactly
+    /// one copy of what it projects.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        96 + self.table.len()
+            + self.natural_key.estimated_bytes()
+            + contextdb_core::estimate_row_value_bytes(&self.values)
+            + self.created_at.map(|_| 8).unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -725,12 +888,37 @@ pub struct EdgeChange {
     pub lsn: Lsn,
 }
 
+impl EdgeChange {
+    /// What this change occupies in an answer: its slot and everything it
+    /// owns.
+    pub(crate) fn held_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(held::text(&self.edge_type))
+            .saturating_add(held::values(&self.properties))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorChange {
     pub index: VectorIndexRef,
     pub row_id: RowId,
     pub vector: Vec<f32>,
     pub lsn: Lsn,
+}
+
+impl VectorChange {
+    /// What this change occupies in an answer: its slot and everything it
+    /// owns.
+    pub(crate) fn held_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(held::text(&self.index.table))
+            .saturating_add(held::text(&self.index.column))
+            .saturating_add(if self.vector.is_empty() {
+                0
+            } else {
+                std::mem::size_of_val(self.vector.as_slice()) + held::ALLOCATION_BYTES
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -817,6 +1005,23 @@ impl DdlChange {
             | Self::CreateTriggerIncludingSync { table, .. } => Some(table),
             Self::DropTrigger { .. } | Self::CreateSink { .. } => None,
         }
+    }
+
+    /// What one copy of this statement costs a projected answer.
+    ///
+    /// A schema statement's shape varies too much across its variants --
+    /// thousands of declared columns on a wide `CREATE TABLE`, a handful of
+    /// words on a `DROP INDEX` -- for a per-field walk to stay honest as
+    /// variants are added. Its own canonical encoding already visits every
+    /// field once and is exactly the byte cost a store outside this process
+    /// pays for the same statement, so it stands in for the estimate here:
+    /// tripled, because a decoded `String`/`Vec` costs more than its wire
+    /// bytes once container growth is counted.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let encoded_len = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map(|bytes| bytes.len())
+            .unwrap_or(4096);
+        128 + encoded_len.saturating_mul(3)
     }
 }
 
@@ -1009,19 +1214,22 @@ impl<'de> Deserialize<'de> for TableDdlFields {
                 let constraints = seq
                     .next_element::<Vec<String>>()?
                     .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                // Bincode's serde representation for struct variants is not
-                // self-describing, so old three-field table DDL records cannot
-                // be distinguished from new records with trailing fields
-                // without risking an EOF error. Treat sequence-form records as
-                // legacy and let the engine enrich structured fields from
-                // current TableMeta when serving DDL logs.
+                let foreign_keys = seq
+                    .next_element::<Vec<SingleColumnForeignKey>>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                let composite_foreign_keys = seq
+                    .next_element::<Vec<CompositeForeignKey>>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(4, &self))?;
+                let composite_unique = seq
+                    .next_element::<Vec<Vec<String>>>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(5, &self))?;
                 Ok(TableDdlFields {
                     name,
                     columns,
                     constraints,
-                    foreign_keys: Vec::new(),
-                    composite_foreign_keys: Vec::new(),
-                    composite_unique: Vec::new(),
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
                 })
             }
 
@@ -1057,9 +1265,12 @@ impl<'de> Deserialize<'de> for TableDdlFields {
                     columns: columns.ok_or_else(|| serde::de::Error::missing_field("columns"))?,
                     constraints: constraints
                         .ok_or_else(|| serde::de::Error::missing_field("constraints"))?,
-                    foreign_keys: foreign_keys.unwrap_or_default(),
-                    composite_foreign_keys: composite_foreign_keys.unwrap_or_default(),
-                    composite_unique: composite_unique.unwrap_or_default(),
+                    foreign_keys: foreign_keys
+                        .ok_or_else(|| serde::de::Error::missing_field("foreign_keys"))?,
+                    composite_foreign_keys: composite_foreign_keys
+                        .ok_or_else(|| serde::de::Error::missing_field("composite_foreign_keys"))?,
+                    composite_unique: composite_unique
+                        .ok_or_else(|| serde::de::Error::missing_field("composite_unique"))?,
                 })
             }
         }
@@ -1176,6 +1387,16 @@ impl NaturalKey {
             value,
             rest: pairs,
         })
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        32 + self.column.len()
+            + self.value.estimated_bytes()
+            + self
+                .rest
+                .iter()
+                .map(|(column, value)| 16 + column.len() + value.estimated_bytes())
+                .sum::<usize>()
     }
 
     /// The identity's column names in declared order (leading first).
@@ -1419,5 +1640,89 @@ mod trigger_ddl_binary_compatibility_tests {
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, declaration);
+    }
+}
+
+#[cfg(test)]
+mod table_ddl_binary_roundtrip_tests {
+    use super::DdlChange;
+    use contextdb_core::{CompositeForeignKey, SingleColumnForeignKey};
+
+    fn authored(alter: bool) -> DdlChange {
+        let name = "notes".to_string();
+        let columns = vec![
+            ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+            ("owner_id".to_string(), "INTEGER".to_string()),
+        ];
+        let constraints = vec!["SYNC PUSH ONLY".to_string()];
+        let foreign_keys = vec![SingleColumnForeignKey {
+            child_column: "owner_id".to_string(),
+            parent_table: "owners".to_string(),
+            parent_column: "id".to_string(),
+        }];
+        let composite_foreign_keys = vec![CompositeForeignKey {
+            child_columns: vec!["tenant".to_string(), "owner_id".to_string()],
+            parent_table: "owners".to_string(),
+            parent_columns: vec!["tenant".to_string(), "id".to_string()],
+        }];
+        let composite_unique = vec![vec!["tenant".to_string(), "slug".to_string()]];
+        if alter {
+            DdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            }
+        } else {
+            DdlChange::CreateTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            }
+        }
+    }
+
+    #[test]
+    fn stored_table_ddl_decodes_to_exactly_what_its_author_wrote() {
+        for alter in [false, true] {
+            let change = authored(alter);
+            let bytes =
+                bincode::serde::encode_to_vec(&change, bincode::config::standard()).unwrap();
+            let (decoded, consumed): (DdlChange, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(consumed, bytes.len(), "every stored byte is read");
+            assert_eq!(decoded, change, "foreign keys and composite keys survive");
+        }
+    }
+
+    #[test]
+    fn a_table_ddl_record_missing_its_structured_fields_is_refused() {
+        #[derive(serde::Serialize)]
+        enum ThreeField {
+            CreateTable {
+                name: String,
+                columns: Vec<(String, String)>,
+                constraints: Vec<String>,
+            },
+        }
+        let bytes = bincode::serde::encode_to_vec(
+            ThreeField::CreateTable {
+                name: "notes".to_string(),
+                columns: Vec::new(),
+                constraints: Vec::new(),
+            },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        assert!(
+            bincode::serde::decode_from_slice::<DdlChange, _>(&bytes, bincode::config::standard())
+                .is_err(),
+            "a short record is damage, never an empty key list"
+        );
     }
 }

@@ -100,7 +100,6 @@ readonly -a META_COMMAND_DECLARATIONS=(
 )
 
 readonly -a OPERATIONAL_COMMAND_DECLARATIONS=(
-    'Migrate|migrate'
     'Reset|reset'
     'Diagnose|diagnose'
     'Snapshot|snapshot'
@@ -751,7 +750,7 @@ for case_row in "${AST_READ_STATEMENTS[@]}"; do
                             "maintenance_vectors_total": null, "maintenance_vectors_done": null,
                             "maintenance_vectors_remaining": null, "maintenance_checkpoint_tx": null,
                             "desired_hnsw_m": 16, "desired_hnsw_ef_construction": 200,
-                            "desired_hnsw_ef_search": 200, "serving_hnsw_m": null,
+                            "desired_hnsw_ef_search": 10, "serving_hnsw_m": null,
                             "serving_hnsw_ef_construction": null, "serving_hnsw_ef_search": null,
                             "declared_consolidation_mode": null,
                             "declared_consolidation_change_percent": null,

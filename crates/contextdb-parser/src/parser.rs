@@ -88,6 +88,10 @@ pub fn parse(input: &str) -> Result<Statement> {
             Statement::SetMaintenancePollInterval(build_maintenance_poll_interval(inner)?)
         }
         Rule::show_maintenance_poll_interval => Statement::ShowMaintenancePollInterval,
+        Rule::set_vector_serving_cache => {
+            Statement::SetVectorServingCache(build_vector_serving_cache(inner)?)
+        }
+        Rule::show_vector_serving_cache => Statement::ShowVectorServingCache,
         _ => return Err(Error::ParseError("unsupported statement".to_string())),
     };
 
@@ -858,13 +862,39 @@ fn build_comparison_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let left_pair = inner
         .next()
         .ok_or_else(|| Error::ParseError("comparison missing left operand".to_string()))?;
-    let left = build_additive_expr(left_pair)?;
+    let left = match left_pair.as_rule() {
+        Rule::row_value => build_row_value(left_pair)?,
+        _ => build_additive_expr(left_pair)?,
+    };
 
     if let Some(suffix) = inner.next() {
         build_comparison_suffix(left, suffix)
+    } else if matches!(left, Expr::Row(_)) {
+        // A row value is only a value where SQL gives a row a meaning. Standing
+        // alone it is neither a scalar nor a parenthesised expression, and
+        // letting it through here would hand the planner something no operator
+        // can evaluate.
+        Err(Error::ParseError(
+            "a row value is only meaningful on either side of IN".to_string(),
+        ))
     } else {
         Ok(left)
     }
+}
+
+fn build_row_value(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut elements = Vec::new();
+    for element in pair.into_inner() {
+        if element.as_rule() == Rule::expr {
+            elements.push(build_expr(element)?);
+        }
+    }
+    if elements.len() < 2 {
+        return Err(Error::ParseError(
+            "a row value names at least two columns".to_string(),
+        ));
+    }
+    Ok(Expr::Row(elements))
 }
 
 fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
@@ -996,6 +1026,14 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
                                     }
                                 }
                             }
+                            Rule::row_value => {
+                                list.push(build_row_value(first)?);
+                                for rest in parts {
+                                    if rest.as_rule() == Rule::row_value {
+                                        list.push(build_row_value(rest)?);
+                                    }
+                                }
+                            }
                             _ => return Err(Error::ParseError("invalid IN contents".to_string())),
                         }
                     }
@@ -1010,6 +1048,31 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
                     negated,
                 })
             } else {
+                // Both sides agree on arity or neither side means anything: a
+                // two-column row compared against three-column tuples is not a
+                // narrower question, it is a different one.
+                let arity = match &left {
+                    Expr::Row(columns) => Some(columns.len()),
+                    _ => None,
+                };
+                for element in &list {
+                    let element_arity = match element {
+                        Expr::Row(values) => Some(values.len()),
+                        _ => None,
+                    };
+                    if element_arity != arity {
+                        return Err(Error::ParseError(match (arity, element_arity) {
+                            (Some(columns), Some(values)) => format!(
+                                "IN compares a row of {columns} columns against a row of \
+                                 {values} values"
+                            ),
+                            (Some(columns), None) => format!(
+                                "IN compares a row of {columns} columns against a single value"
+                            ),
+                            _ => "IN compares a single value against a row value".to_string(),
+                        }));
+                    }
+                }
                 Ok(Expr::InList {
                     expr: Box::new(left),
                     list,
@@ -1200,6 +1263,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut history = None;
     let mut delivery_manifest_tables = None;
     let mut edge_discard = None;
+    let mut maintained_counts = None;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -1329,6 +1393,27 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                             ));
                         }
                         edge_discard = Some(build_edge_discard_option(opt)?);
+                    }
+                    Rule::maintain_count_option => {
+                        if maintained_counts.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate MAINTAIN COUNT clause".to_string(),
+                            ));
+                        }
+                        let declared = build_maintain_count_option(opt)?;
+                        // `DEFAULT` means "clear whatever this table already
+                        // declares". A fresh CREATE declares nothing, so the
+                        // spelling would say nothing and render back as a
+                        // clause nobody wrote.
+                        if declared == MaintainedCountsDecl::Default {
+                            return Err(Error::ParseError(
+                                "MAINTAIN COUNT DEFAULT clears an existing declaration and is \
+                                 only meaningful on ALTER TABLE; omit the clause on CREATE TABLE \
+                                 to maintain no index-prefix count"
+                                    .to_string(),
+                            ));
+                        }
+                        maintained_counts = Some(declared);
                     }
                     other => return Err(unexpected_rule(other, "build_create_table.table_option")),
                 }
@@ -1464,7 +1549,78 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         history,
         delivery_manifest_tables,
         edge_discard,
+        maintained_counts,
     })
+}
+
+/// Read one `MAINTAIN COUNT ...` clause. Each parenthesised list reuses
+/// `indexed_column`, so the optional per-column `ASC`/`DESC` is spelled
+/// exactly as `CREATE INDEX` spells it and defaults to `ASC`.
+fn build_maintain_count_option(pair: Pair<'_, Rule>) -> Result<MaintainedCountsDecl> {
+    let mut lists: Vec<Vec<(String, SortDirection)>> = Vec::new();
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::maintain_count_all => return Ok(MaintainedCountsDecl::AllPrefixes),
+            Rule::maintain_count_none => return Ok(MaintainedCountsDecl::None),
+            Rule::maintain_count_default => return Ok(MaintainedCountsDecl::Default),
+            Rule::maintain_count_list => {
+                let mut columns: Vec<(String, SortDirection)> = Vec::new();
+                for column in part.into_inner() {
+                    match column.as_rule() {
+                        Rule::indexed_column => {
+                            let mut name: Option<String> = None;
+                            let mut direction = SortDirection::Asc;
+                            for inner in column.into_inner() {
+                                match inner.as_rule() {
+                                    Rule::identifier if name.is_none() => {
+                                        name = Some(parse_identifier(inner.as_str()));
+                                    }
+                                    Rule::index_sort_direction => {
+                                        if inner.as_str().eq_ignore_ascii_case("DESC") {
+                                            direction = SortDirection::Desc;
+                                        }
+                                    }
+                                    other => {
+                                        return Err(unexpected_rule(
+                                            other,
+                                            "build_maintain_count_option/column",
+                                        ));
+                                    }
+                                }
+                            }
+                            let name = name.ok_or_else(|| {
+                                Error::ParseError("MAINTAIN COUNT missing a column".to_string())
+                            })?;
+                            if columns.iter().any(|(existing, _)| existing == &name) {
+                                return Err(Error::ParseError(format!(
+                                    "MAINTAIN COUNT names column '{name}' twice in one list"
+                                )));
+                            }
+                            columns.push((name, direction));
+                        }
+                        other => {
+                            return Err(unexpected_rule(other, "build_maintain_count_option/list"));
+                        }
+                    }
+                }
+                if lists.contains(&columns) {
+                    return Err(Error::ParseError(
+                        "MAINTAIN COUNT names the same column list twice".to_string(),
+                    ));
+                }
+                lists.push(columns);
+            }
+            other => return Err(unexpected_rule(other, "build_maintain_count_option")),
+        }
+    }
+    if lists.is_empty() {
+        return Err(Error::ParseError(
+            "MAINTAIN COUNT names no column list; write ALL PREFIXES, NONE, or one or more \
+             parenthesised column lists"
+                .to_string(),
+        ));
+    }
+    Ok(MaintainedCountsDecl::Lists(lists))
 }
 
 fn build_identifier_list(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
@@ -1720,6 +1876,17 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             Ok(AlterAction::SetSyncDirection(build_sync_direction_option(
                 clause,
             )?))
+        }
+        Rule::set_maintain_count_action => {
+            let clause = action
+                .into_inner()
+                .find(|part| part.as_rule() == Rule::maintain_count_option)
+                .ok_or_else(|| {
+                    Error::ParseError("SET MAINTAIN COUNT missing a declaration".to_string())
+                })?;
+            Ok(AlterAction::SetMaintainedCounts(
+                build_maintain_count_option(clause)?,
+            ))
         }
         Rule::set_sync_conflict_action => {
             let clause = action
@@ -3403,6 +3570,11 @@ fn validate_expr(expr: &Expr) -> Result<()> {
             validate_expr(left)?;
             validate_expr(right)?;
         }
+        Expr::Row(elements) => {
+            for element in elements {
+                validate_expr(element)?;
+            }
+        }
         Expr::RowVectorSource { key, .. } => validate_row_vector_key_expr(key)?,
         Expr::FunctionCall { args, .. } => {
             for arg in args {
@@ -3457,6 +3629,11 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 validate_subquery_expr(arg, cte_names)?;
+            }
+        }
+        Expr::Row(elements) => {
+            for element in elements {
+                validate_subquery_expr(element, cte_names)?;
             }
         }
         Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
@@ -3725,6 +3902,31 @@ fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
             value_inner.as_str(),
         )? as usize)),
         _ => Ok(SetMemoryLimitValue::None),
+    }
+}
+
+/// `None` means the column returns to the engine's default share.
+fn build_vector_serving_cache(pair: Pair<'_, Rule>) -> Result<Option<u64>> {
+    let inner = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::vector_serving_cache_value)
+        .ok_or_else(|| Error::ParseError("missing vector_serving_cache_value".to_string()))?;
+
+    if inner.as_str().eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+
+    let value_inner = inner
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("empty vector_serving_cache_value".to_string()))?;
+
+    match value_inner.as_rule() {
+        Rule::size_with_unit => Ok(Some(parse_size_with_unit(value_inner.as_str())?)),
+        Rule::integer => value_inner.as_str().parse::<u64>().map(Some).map_err(|_| {
+            Error::ParseError("VECTOR_SERVING_CACHE is outside the numeric range".to_string())
+        }),
+        _ => Ok(None),
     }
 }
 

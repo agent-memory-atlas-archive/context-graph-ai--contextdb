@@ -1,7 +1,7 @@
 use super::engine_answer::{BodyField, ReadChannelError, body_grammar};
 use super::{
     LOCAL_PROTOCOL_MARKER, LOCAL_PROTOCOL_VERSION, LocalTransportError, MAX_FRAME_BYTES,
-    frame_read_refusal, invalid_channel_data,
+    frame_read_refusal, invalid_channel_data, response_decode_refusal,
 };
 use crate::read_contract::{decode_cursor_page, decode_metadata_page};
 use bincode::config::standard;
@@ -248,6 +248,12 @@ pub struct TerminalSuccess {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorOpenedResponse {
+    pub effective_limits: Option<ReadLimits>,
+    #[serde(default)]
+    pub physical_identity: Option<(u64, u64)>,
+    #[serde(default)]
+    #[allow(clippy::type_complexity)]
+    pub storage_snapshot: Option<(u64, Option<([u8; 8], [u8; 16], u64)>)>,
     pub cursor_id: [u8; 16],
     pub payload: Vec<u8>,
 }
@@ -752,6 +758,7 @@ impl LocalProtocolBoundary {
         reader: &mut dyn FrameReader,
         allocator: &mut dyn FrameBufferAllocator,
     ) -> Result<LocalInboundMessage, LocalTransportError> {
+        let response_frame = matches!(&kind, LocalInboundKind::Response(_));
         let ordinary_response = matches!(
             &kind,
             LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult)
@@ -759,8 +766,13 @@ impl LocalProtocolBoundary {
         let received = (|| {
             let payload =
                 read_payload_with_admission(reader, allocator).map_err(frame_read_refusal)?;
-            self.decode_payload(kind, &payload)
-                .map_err(|_| invalid_channel_data())
+            self.decode_payload(kind, &payload).map_err(|error| {
+                if response_frame {
+                    response_decode_refusal(error)
+                } else {
+                    invalid_channel_data()
+                }
+            })
         })();
         if received.is_err() && ordinary_response {
             self.reset_ordinary_inbound();
@@ -1421,6 +1433,7 @@ impl<'a> CanonicalAllocationPreflight<'a> {
     fn vector_search_disclosure(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
         self.string()?;
         self.string()?;
+        self.string()?;
         if self.option()? {
             self.u64()?;
         }
@@ -1449,11 +1462,25 @@ impl<'a> CanonicalAllocationPreflight<'a> {
         self.charge::<crate::read_contract::CanonicalVectorPartitionHnswDisclosure>(partitions)?;
         for _ in 0..partitions {
             self.string()?;
+            if self.option()? {
+                self.string()?;
+            }
+            if self.option()? {
+                self.string()?;
+            }
             self.u64()?;
             self.u64()?;
             self.u64()?;
             self.string()?;
             self.u64()?;
+        }
+        for _ in 0..4 {
+            if self.option()? {
+                self.u64()?;
+            }
+        }
+        if self.option()? {
+            self.string()?;
         }
         Ok(())
     }
@@ -1484,6 +1511,38 @@ impl<'a> CanonicalAllocationPreflight<'a> {
             self.vector_search_disclosure()?;
         }
         self.u64()?;
+        // The maintained-count route disclosure. This walk mirrors
+        // `CanonicalMaintainedCountDisclosure` field for field: a field added
+        // there without a step here leaves wire bytes unconsumed, which the
+        // caller reads as a malformed answer.
+        if self.option()? {
+            self.charge::<crate::read_contract::CanonicalMaintainedCountDisclosure>(1)?;
+            self.boolean()?;
+            self.boolean()?;
+            self.string()?;
+            self.maintained_count_columns()?;
+            let lists = self.length()?;
+            if lists > self.remaining() {
+                return Self::malformed();
+            }
+            for _ in 0..lists {
+                self.maintained_count_columns()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One `Vec<(String, bool)>` column list of a maintained-count disclosure.
+    fn maintained_count_columns(&mut self) -> Result<(), crate::read_contract::ReadEncodingError> {
+        let columns = self.length()?;
+        if columns > self.remaining() {
+            return Self::malformed();
+        }
+        self.charge::<(String, bool)>(columns)?;
+        for _ in 0..columns {
+            self.string()?;
+            self.boolean()?;
+        }
         Ok(())
     }
 
@@ -1921,9 +1980,18 @@ impl OrdinaryResultReceiver {
                         Self::decode_preflighted_canonical_result(&bytes, self.memory_ceiling)
                     })
                     .map(|_decoded| ());
-                if admitted.is_err() {
+                if let Err(error) = admitted {
                     self.discard_buffered();
-                    return Err(invalid_channel_data());
+                    return Err(match error {
+                        crate::read_contract::ReadEncodingError::MemoryCeilingExceeded {
+                            ceiling,
+                        } => {
+                            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+                                ceiling,
+                            })
+                        }
+                        _ => invalid_channel_data(),
+                    });
                 }
                 #[cfg(feature = "test-seams")]
                 Self::observe_canonical_publication_for_test();
@@ -2244,6 +2312,9 @@ impl<'a> WirePreflight<'a> {
 
     fn byte_vector(&mut self) -> Result<&'a [u8], LocalTransportError> {
         let length = self.length()?;
+        if length > self.remaining() {
+            return Self::malformed();
+        }
         self.charge::<u8>(length)?;
         self.take(length)
     }
@@ -2727,6 +2798,21 @@ fn preflight_response(
             wire.byte_vector()?;
         }
         2 => {
+            if wire.option()? {
+                preflight_read_limits(&mut wire)?;
+            }
+            if wire.option()? {
+                wire.u64()?;
+                wire.u64()?;
+            }
+            if wire.option()? {
+                wire.u64()?;
+                if wire.option()? {
+                    wire.fixed(8)?;
+                    wire.fixed(16)?;
+                    wire.u64()?;
+                }
+            }
             wire.fixed(16)?;
             let payload = wire.byte_vector()?;
             if !continued {
@@ -2949,6 +3035,14 @@ fn validate_response(
             validate_payload_limit(success.final_bytes.len(), limits.result_bytes)?;
         }
         LocalResponse::CursorOpened { opened } => {
+            if let Some(limits) = opened.effective_limits {
+                limits.validate().map_err(|_| invalid_channel_data())?;
+            }
+            if opened.storage_snapshot.is_some()
+                && (opened.physical_identity.is_none() || opened.effective_limits.is_none())
+            {
+                return Err(invalid_channel_data());
+            }
             validate_answer_payload_limit(
                 opened.payload.len(),
                 position,

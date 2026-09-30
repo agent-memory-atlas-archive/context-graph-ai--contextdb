@@ -101,7 +101,11 @@ impl Predicate {
                 Self::CosineDistance(Box::new(capture(left)?), Box::new(capture(right)?))
             }
             // Neither subqueries nor another table's vector lookup is self-contained.
-            Expr::InSubquery { .. } | Expr::RowVectorSource { .. } => {
+            // A row value has no captured form either: this predicate is
+            // replayed on other nodes, and inventing a wire shape for it here
+            // would let a node replay something this one never proved it could
+            // evaluate. Refused until it has one.
+            Expr::InSubquery { .. } | Expr::RowVectorSource { .. } | Expr::Row(_) => {
                 return Err(Error::SubqueryNotSupported);
             }
         })

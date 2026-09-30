@@ -21,7 +21,7 @@
 
 use contextdb_core::read_contract::ReadLimits;
 use contextdb_core::{Value, VectorIndexRef};
-use contextdb_engine::{Database, QueryResult, QueryTrace};
+use contextdb_engine::{Database, MaintenancePolicy, QueryResult, QueryTrace};
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
@@ -195,6 +195,7 @@ const VECTOR_DIMENSIONS: usize = 3;
 /// over, and both plan words have to be covered.
 fn vector_store(rows: u128) -> Database {
     let database = Database::open_memory();
+    database.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     database
         .execute(
             &format!(
@@ -219,6 +220,27 @@ fn vector_store(rows: u128) -> Database {
                 ]),
             )
             .expect("insert a document");
+    }
+    if rows > 1_000 {
+        let index = VectorIndexRef::new("docs", "embedding");
+        let expected_points = usize::try_from(rows).expect("fixture count fits usize");
+        for _ in 0..256 {
+            if database
+                .__debug_vector_hnsw_stats(index.clone())
+                .is_some_and(|stats| stats.point_count >= expected_points)
+            {
+                break;
+            }
+            database
+                .run_maintenance_cycle()
+                .expect("caller-driven graph maintenance succeeds");
+        }
+        assert!(
+            database
+                .__debug_vector_hnsw_stats(index)
+                .is_some_and(|stats| stats.point_count >= expected_points),
+            "the approximate-route fixture has a complete maintained graph"
+        );
     }
     database
 }

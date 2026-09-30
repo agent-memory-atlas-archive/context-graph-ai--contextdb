@@ -933,14 +933,27 @@ async fn authenticated_iroh_rejects_stale_connected_replay_as_a_whole_before_rec
         persisted_pull_cursor_before,
         "the failed pull cannot persist a new source-bound cursor"
     );
+    // The transfer receipt counts what MOVED on the wire, not the apply
+    // outcome (`transfer_receipts.rs:43-48`): "A received row that the
+    // conflict policy then skipped still moved, so it is still counted."
+    // The receiving edge counts a decoded pull reply before a
+    // source mismatch or a failed apply can discard it, matching the sibling
+    // proof `bounded_tables_sync_tests::c9_failed_pull_still_records_the_rows_and_payload_received_from_the_hub`.
+    // The stale hub sent both connected members as one dependency-complete
+    // reply, so both are recorded as received even though the whole unit is
+    // then refused; the durable acceptance receipt this refusal must not
+    // advance (LSN, watermarks, pull cursor, above) is a different, atomic
+    // commit, not this in-memory wire
+    // counter.
     assert_eq!(
         sync_receipt_items(
             &stale_client.transfer_receipts(),
             &stale.node_id,
             TransferDirection::Received,
         ),
-        received_before,
-        "the receiving edge records no received receipt before rejecting the whole unit"
+        received_before + 2,
+        "the receiving edge records both connected members as received before rejecting the whole \
+         unit: the receipt counts what crossed the wire, not what the refusal kept"
     );
 
     stale_client.shutdown().await;

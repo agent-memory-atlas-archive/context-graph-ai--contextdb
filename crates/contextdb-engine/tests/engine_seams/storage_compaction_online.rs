@@ -287,10 +287,18 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
     let db = Database::open(&path).unwrap();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     db.execute(
-        "CREATE TABLE recordings (id INT PRIMARY KEY)",
+        "CREATE TABLE recordings (id INT PRIMARY KEY, note TEXT) HISTORY CURRENT ONLY SYNC OFF",
         &HashMap::new(),
     )
     .unwrap();
+    db.execute("INSERT INTO recordings VALUES (0, 'old')", &HashMap::new())
+        .unwrap();
+    db.execute(
+        "UPDATE recordings SET note = 'current' WHERE id = 0",
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert_eq!(db.__physical_version_count_for_test("recordings"), 2);
     let used = db.accountant().usage().used;
     db.set_memory_limit(Some(used + 1024)).unwrap();
     let error = db.run_maintenance_cycle().unwrap_err();
@@ -298,15 +306,23 @@ fn automatic_storage_memory_refusal_keeps_the_store_usable() {
         matches!(error, contextdb_core::Error::MemoryBudgetExceeded { .. }),
         "typed compaction refusal: {error:?}"
     );
+    assert_eq!(
+        db.__physical_version_count_for_test("recordings"),
+        1,
+        "the healthy currency-cleanup sibling completes before closing compaction reports its typed deferral"
+    );
     assert!(!db.__storage_compaction_progress_for_test().0);
     db.set_memory_limit(None).unwrap();
-    db.execute("INSERT INTO recordings VALUES (1)", &HashMap::new())
-        .unwrap();
+    db.execute(
+        "INSERT INTO recordings VALUES (1, 'later')",
+        &HashMap::new(),
+    )
+    .unwrap();
     assert_eq!(
         db.execute("SELECT id FROM recordings", &HashMap::new())
             .unwrap()
             .rows,
-        vec![vec![Value::Int64(1)]]
+        vec![vec![Value::Int64(0)], vec![Value::Int64(1)]]
     );
     assert!(db.run_maintenance_cycle().unwrap().compaction.ran);
     db.close().unwrap();

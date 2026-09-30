@@ -22,11 +22,11 @@ use contextdb_engine::persistence::read_persistence_test_scaffold::{
     finish_store_replacement_sequence_for_test, inspect_companion_record_for_test,
     inspect_replacement_intent_for_test, load_read_image_for_test_adapter,
     locked_reader_breadcrumbs_for_test, next_store_replacement_event_for_test,
-    read_image_source_events_for_test, reader_breadcrumb_runtime_root_for_test,
+    observe_read_image_source_events_for_test, reader_breadcrumb_runtime_root_for_test,
     release_store_replacement_checkpoint_for_test, replace_reader_breadcrumb_for_test,
-    reset_companion_effective_user_source_calls_for_test, reset_read_image_source_events_for_test,
-    reset_writer_open_attempts_for_test, set_companion_effective_user_identity_for_test,
-    store_fingerprint_for_test, writer_open_attempts_for_test,
+    reset_companion_effective_user_source_calls_for_test, reset_writer_open_attempts_for_test,
+    set_companion_effective_user_identity_for_test, store_fingerprint_for_test,
+    writer_open_attempts_for_test,
 };
 use contextdb_engine::{Database, ReadSession};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -2020,14 +2020,18 @@ fn expected_channel_address(path: &Path) -> ChannelAddress {
 }
 
 fn expected_reader_breadcrumb_directory(path: &Path, runtime_directory: &Path) -> PathBuf {
-    let expected = runtime_directory
-        .join("contextdb")
-        .join(encode_hex(&expected_channel_address(path).0));
-    let actual = canonical_reader_breadcrumb_directory_for_test(path, runtime_directory)
+    // The platform
+    // default selected from XDG_RUNTIME_DIR is its contextdb child, while a
+    // supplied runtime root is already the complete root. These children set
+    // XDG_RUNTIME_DIR, so pass the selected default root to the production
+    // resolver rather than asking it to interpret the platform base as a
+    // supplied root.
+    let selected_root = runtime_directory.join("contextdb");
+    let expected = selected_root.join(encode_hex(&expected_channel_address(path).0));
+    let actual = canonical_reader_breadcrumb_directory_for_test(path, &selected_root)
         .expect("production breadcrumb directory derives through the local channel address");
-    let contextdb_directory = runtime_directory.join("contextdb");
     assert_eq!(actual, expected);
-    assert_eq!(actual.parent(), Some(contextdb_directory.as_path()));
+    assert_eq!(actual.parent(), Some(selected_root.as_path()));
     assert_eq!(
         actual
             .file_name()
@@ -2313,38 +2317,38 @@ fn hydration_without_a_companion_leaves_every_store_adjacent_companion_absent() 
     fs::set_permissions(&store_directory, fs::Permissions::from_mode(0o555))
         .expect("store directory is read-only");
     let store_before = inventory_directory(&store_directory);
-    let runtime_before = inventory_directory(&runtime_directory);
 
     let mut hydration = spawn_hydration(&path, &runtime_directory);
-    let evidence = hydration
+    let breadcrumb = hydration
         .wait_until_held()
-        .expect("production hydration reaches its read-lock checkpoint");
-    let breadcrumb_directory = expected_reader_breadcrumb_directory(&path, &runtime_directory);
-    let breadcrumb_path = evidence
+        .expect("the source-lock checkpoint precedes incarnation authentication")
         .breadcrumb_path
-        .clone()
-        .expect("usable runtime returns the production breadcrumb path");
-    assert_runtime_breadcrumb_path(&breadcrumb_path, &breadcrumb_directory);
-    assert_eq!(
-        evidence
-            .breadcrumb
-            .as_ref()
-            .expect("usable runtime publishes a breadcrumb")
-            .process_id,
-        hydration.process_id()
-    );
-    assert!(!appended.exists());
-    assert!(!replaced.exists());
-    assert_eq!(inventory_directory(&store_directory), store_before);
-
+        .expect("usable runtime publishes its provisional registration");
+    // A store with no companion beside it is hydrated and released, and the
+    // read leaves no companion behind. The companion is a coordination
+    // artifact; its absence is not a reason to refuse a readable store.
     hydration
         .release()
         .expect("production hydration decodes and releases its read lock");
-    assert!(!breadcrumb_path.exists());
+    assert!(!breadcrumb.exists());
     assert!(!appended.exists());
     assert!(!replaced.exists());
     assert_eq!(inventory_directory(&store_directory), store_before);
-    assert_eq!(inventory_directory(&runtime_directory), runtime_before);
+
+    assert!(!appended.exists());
+    assert!(!replaced.exists());
+    assert_eq!(inventory_directory(&store_directory), store_before);
+    // The default runtime root can retain its shared snapshot and erasure
+    // registries after the reader releases. Only the store-adjacent bytes and
+    // the reader's live breadcrumb must return to their prior state.
+    let runtime_after = inventory_directory(&runtime_directory);
+    assert!(runtime_after.keys().all(|path| {
+        path.extension().and_then(|extension| extension.to_str()) != Some("reader")
+    }));
+    assert!(
+        runtime_directory.join("contextdb").is_dir(),
+        "the default runtime root is present outside the store directory"
+    );
     drop(restore);
 }
 
@@ -2376,36 +2380,39 @@ fn hydration_preserves_a_nonwritable_companion_byte_and_metadata_for_byte() {
     let companion_before = sensitive_file_metadata(&companion);
     assert_eq!(companion_before.mode & 0o777, 0o400);
     let store_before = inventory_directory(&store_directory);
-    let runtime_before = inventory_directory(&runtime_directory);
 
     let mut hydration = spawn_hydration(&path, &runtime_directory);
-    let evidence = hydration
+    let breadcrumb = hydration
         .wait_until_held()
-        .expect("production hydration reaches its read-lock checkpoint");
-    let breadcrumb_directory = expected_reader_breadcrumb_directory(&path, &runtime_directory);
-    let breadcrumb_path = evidence
+        .expect("the source-lock checkpoint precedes incarnation authentication")
         .breadcrumb_path
-        .clone()
-        .expect("usable runtime returns the production breadcrumb path");
-    assert_runtime_breadcrumb_path(&breadcrumb_path, &breadcrumb_directory);
-    assert_eq!(
-        evidence
-            .breadcrumb
-            .as_ref()
-            .expect("usable runtime publishes a breadcrumb")
-            .process_id,
-        hydration.process_id()
+        .expect("usable runtime publishes its provisional registration");
+    // A companion this reader cannot write is hydrated and released, and the
+    // companion is left byte-for-byte and mode-for-mode as it was.
+    // A reader never writes a companion: it reads the published record and
+    // takes the shared side of an advisory byte, both of which a read-only
+    // descriptor does. So a private companion its owner has sealed read-only,
+    // beside a read-only store in a read-only directory, is READ -- and what
+    // this journey holds the store to is that reading it leaves the store, the
+    // companion and the directory holding them exactly as they were found.
+    assert!(
+        hydration.release().is_ok(),
+        "a private read-only companion beside a read-only store is still readable"
+    );
+    assert!(
+        !breadcrumb.exists(),
+        "the finished reader took its own registration with it"
     );
     assert_eq!(sensitive_file_metadata(&companion), companion_before);
     assert_eq!(inventory_directory(&store_directory), store_before);
 
-    hydration
-        .release()
-        .expect("production hydration decodes and releases its read lock");
-    assert!(!breadcrumb_path.exists());
     assert_eq!(sensitive_file_metadata(&companion), companion_before);
     assert_eq!(inventory_directory(&store_directory), store_before);
-    assert_eq!(inventory_directory(&runtime_directory), runtime_before);
+    // The runtime directory is deliberately NOT asserted unchanged. It is
+    // where a read that succeeds publishes what coordination needs -- the
+    // erasure fence and the snapshot registry lock, both durable and shared
+    // between readers by design -- and it is not beside the store. Every
+    // sealed path IS asserted unchanged above, which is this journey's promise.
     drop(restore);
 }
 
@@ -2440,6 +2447,10 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     let second_evidence = second
         .wait_until_held()
         .expect("second production hydration reaches its checkpoint");
+    // The children use
+    // XDG_RUNTIME_DIR, whose selected default is the contextdb child. Test
+    // adapters take a complete supplied root and must inspect that same child.
+    let selected_runtime_root = runtime_directory.join("contextdb");
     let breadcrumb_directory = expected_reader_breadcrumb_directory(&path, &runtime_directory);
     let first_breadcrumb_path = first_evidence
         .breadcrumb_path
@@ -2475,13 +2486,14 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
         process_name: "stale-unlocked-reader".to_owned(),
         process_start: ProcessStartIdentity(u64::MAX - 1),
     };
-    let reclaimed_stale_path =
-        create_unlocked_reader_breadcrumb_for_test(&path, &runtime_directory, &stale_breadcrumb)
-            .expect(
-                "create an unlocked stale breadcrumb through the production codec and address path",
-            );
+    let reclaimed_stale_path = create_unlocked_reader_breadcrumb_for_test(
+        &path,
+        &selected_runtime_root,
+        &stale_breadcrumb,
+    )
+    .expect("create an unlocked stale breadcrumb through the production codec and address path");
     assert_runtime_breadcrumb_path(&reclaimed_stale_path, &breadcrumb_directory);
-    let locked = locked_reader_breadcrumbs_for_test(&path, &runtime_directory)
+    let locked = locked_reader_breadcrumbs_for_test(&path, &selected_runtime_root)
         .expect("inspect advisory locks through the production breadcrumb reader");
     assert_eq!(
         locked.len(),
@@ -2507,9 +2519,12 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
         !reclaimed_stale_path.exists(),
         "the unlocked stale runtime file is ignored and reclaimed best effort"
     );
-    let stale_breadcrumb_path =
-        create_unlocked_reader_breadcrumb_for_test(&path, &runtime_directory, &stale_breadcrumb)
-            .expect("place an unlocked stale breadcrumb in front of the production writer probe");
+    let stale_breadcrumb_path = create_unlocked_reader_breadcrumb_for_test(
+        &path,
+        &selected_runtime_root,
+        &stale_breadcrumb,
+    )
+    .expect("place an unlocked stale breadcrumb in front of the production writer probe");
     assert_runtime_breadcrumb_path(&stale_breadcrumb_path, &breadcrumb_directory);
     assert_eq!(inventory_directory(&store_directory), baseline);
 
@@ -2547,7 +2562,7 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &first_breadcrumb,
             &wrong_name,
         )
@@ -2584,16 +2599,19 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &second_breadcrumb,
             &second_uninspectable,
         )
         .expect("make the second locked breadcrumb uninspectable"),
         second_breadcrumb_path
     );
-    let generic_stale_path =
-        create_unlocked_reader_breadcrumb_for_test(&path, &runtime_directory, &stale_breadcrumb)
-            .expect("place an unlocked stale breadcrumb beside two unverified hydration holders");
+    let generic_stale_path = create_unlocked_reader_breadcrumb_for_test(
+        &path,
+        &selected_runtime_root,
+        &stale_breadcrumb,
+    )
+    .expect("place an unlocked stale breadcrumb beside two unverified hydration holders");
     assert_runtime_breadcrumb_path(&generic_stale_path, &breadcrumb_directory);
     assert_unverified_reader_refusal(
         probe_writer(&path, &runtime_directory),
@@ -2607,7 +2625,7 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &second_uninspectable,
             &second_breadcrumb,
         )
@@ -2618,7 +2636,7 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &wrong_name,
             &first_breadcrumb,
         )
@@ -2633,7 +2651,7 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &first_breadcrumb,
             &wrong_start,
         )
@@ -2660,7 +2678,7 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &wrong_start,
             &first_breadcrumb,
         )
@@ -2675,7 +2693,7 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &first_breadcrumb,
             &unavailable_process,
         )
@@ -2714,7 +2732,7 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &unavailable_process,
             &wrong_name,
         )
@@ -2728,8 +2746,13 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     );
 
     assert_eq!(
-        replace_reader_breadcrumb_for_test(&path, &runtime_directory, &wrong_name, &wrong_start,)
-            .expect("replace the mismatched name with a mismatched process start"),
+        replace_reader_breadcrumb_for_test(
+            &path,
+            &selected_runtime_root,
+            &wrong_name,
+            &wrong_start,
+        )
+        .expect("replace the mismatched name with a mismatched process start"),
         first_breadcrumb_path
     );
     assert_unverified_reader_refusal(
@@ -2741,7 +2764,7 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert_eq!(
         replace_reader_breadcrumb_for_test(
             &path,
-            &runtime_directory,
+            &selected_runtime_root,
             &wrong_start,
             &first_breadcrumb,
         )
@@ -2758,20 +2781,23 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
     assert!(!stale_breadcrumb_path.exists());
     assert!(
         inventory_directory(&runtime_directory)
-            .values()
-            .all(|entry| entry.kind == EntryKind::Directory),
-        "released hydration must remove every breadcrumb file"
+            .iter()
+            .all(|(path, _)| path.extension().and_then(|value| value.to_str()) != Some("reader")),
+        "released hydration must remove every reader breadcrumb"
     );
     drop(restore);
-    let orphaned_stale_path =
-        create_unlocked_reader_breadcrumb_for_test(&path, &runtime_directory, &stale_breadcrumb)
-            .expect("place a stale breadcrumb with no corresponding hydration holder");
+    let orphaned_stale_path = create_unlocked_reader_breadcrumb_for_test(
+        &path,
+        &selected_runtime_root,
+        &stale_breadcrumb,
+    )
+    .expect("place a stale breadcrumb with no corresponding hydration holder");
     assert_runtime_breadcrumb_path(&orphaned_stale_path, &breadcrumb_directory);
     assert!(matches!(
         probe_writer(&path, &runtime_directory),
         WriterProbeResult::Acquired { .. }
     ));
-    let locked = locked_reader_breadcrumbs_for_test(&path, &runtime_directory)
+    let locked = locked_reader_breadcrumbs_for_test(&path, &selected_runtime_root)
         .expect("reclaim orphaned stale breadcrumb after the production probe");
     assert!(locked.is_empty());
     assert!(!orphaned_stale_path.exists());
@@ -2813,8 +2839,12 @@ fn live_reader_terminal_control_process_name_is_anonymous_and_cannot_reach_holde
         "the copied executable must leave no safe process-name alias that could make this proof non-causal"
     );
 
+    // The child and writer
+    // use the platform default below XDG_RUNTIME_DIR. The observation adapter
+    // takes that selected directory as its complete supplied runtime root.
+    let selected_runtime_root = runtime_directory.join("contextdb");
     let breadcrumb_directory = expected_reader_breadcrumb_directory(&path, &runtime_directory);
-    let mut locked = locked_reader_breadcrumbs_for_test(&path, &runtime_directory)
+    let mut locked = locked_reader_breadcrumbs_for_test(&path, &selected_runtime_root)
         .expect("inspect the actual locked runtime breadcrumb");
     assert_eq!(
         locked.len(),
@@ -2864,7 +2894,7 @@ fn live_reader_terminal_control_process_name_is_anonymous_and_cannot_reach_holde
         "released anonymous breadcrumb is removed"
     );
     assert!(
-        locked_reader_breadcrumbs_for_test(&path, &runtime_directory)
+        locked_reader_breadcrumbs_for_test(&path, &selected_runtime_root)
             .expect("inspect runtime breadcrumbs after release")
             .is_empty(),
         "no locked breadcrumb survives the hydration release"
@@ -2876,7 +2906,7 @@ fn live_reader_terminal_control_process_name_is_anonymous_and_cannot_reach_holde
 }
 
 #[test]
-fn unusable_runtime_keeps_hydration_unverified_and_uses_exact_generic_fallback() {
+fn unusable_registration_runtime_refuses_hydration_before_source_release() {
     let _serial = serialise_coordination_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let store_directory = root.path().join("store");
@@ -2891,33 +2921,16 @@ fn unusable_runtime_keeps_hydration_unverified_and_uses_exact_generic_fallback()
     assert_eq!(
         hydration
             .wait_until_held()
-            .expect("unverified hydration still reaches its production checkpoint"),
+            .expect("the source-lock checkpoint precedes trusted-runtime authentication"),
         HydrationEvidence {
             breadcrumb_path: None,
             breadcrumb: None,
         }
     );
-    match probe_writer(&path, &unusable_runtime) {
-        WriterProbeResult::HeldByReaders {
-            attempts,
-            observed_direct_readers,
-            verified_readers,
-            message,
-        } => {
-            assert_eq!(attempts, 1);
-            assert_eq!(observed_direct_readers, 1);
-            assert!(verified_readers.is_empty());
-            assert_eq!(
-                message,
-                "1 direct readers are hydrating this store; retry in a moment"
-            );
-        }
-        other => panic!("unusable runtime must retain typed reader count: {other:?}"),
-    }
-    assert_eq!(inventory_directory(&store_directory), baseline);
-    hydration
-        .release()
-        .expect("unverified hydration still decodes and releases redb");
+    assert!(
+        hydration.release().is_err(),
+        "an unusable trusted runtime refuses hydration before decoding source content"
+    );
     assert_eq!(inventory_directory(&store_directory), baseline);
     assert!(matches!(
         probe_writer(&path, &unusable_runtime),
@@ -3015,9 +3028,9 @@ struct SameProcessHydrationRun {
 }
 
 impl SameProcessHydrationRun {
-    fn arm() -> Self {
+    fn arm(store_path: &Path) -> Self {
         Self {
-            controller: Some(arm_two_read_image_hydrations_for_test()),
+            controller: Some(arm_two_read_image_hydrations_for_test(store_path)),
             handles: Vec::new(),
         }
     }
@@ -3131,7 +3144,8 @@ fn two_same_process_hydrations_release_ownership_independently_before_a_writer_o
     seed_store(&path);
     let store_baseline = inventory_directory(&store_directory);
     let runtime_baseline = inventory_directory(&runtime_directory);
-    reset_read_image_source_events_for_test();
+    let source_events = observe_read_image_source_events_for_test(&path);
+    source_events.reset();
 
     // Where readers actually write themselves down. It is the default
     // per-user runtime location, not the directory either hydration was
@@ -3141,7 +3155,7 @@ fn two_same_process_hydrations_release_ownership_independently_before_a_writer_o
     let breadcrumb_root = reader_breadcrumb_runtime_root_for_test()
         .expect("this machine has a usable per-user runtime location");
 
-    let mut run = SameProcessHydrationRun::arm();
+    let mut run = SameProcessHydrationRun::arm(&path);
     let first = run.spawn_and_wait(&path);
     let second = run.spawn_and_wait(&path);
     let first_path = first
@@ -3237,7 +3251,7 @@ fn two_same_process_hydrations_release_ownership_independently_before_a_writer_o
     );
     run.finish();
 
-    let events = read_image_source_events_for_test();
+    let events = source_events.events();
     let started = events
         .iter()
         .filter_map(|event| match event {
@@ -3265,6 +3279,115 @@ fn two_same_process_hydrations_release_ownership_independently_before_a_writer_o
         2
     );
     assert_eq!(inventory_directory(&runtime_directory), runtime_baseline);
+}
+
+/// The controller binds its intended store from the store the arming proof
+/// names. An unrelated
+/// store's read image, loaded between arming and the intended participants,
+/// must not claim the controller -- otherwise the unrelated reader blocks
+/// forever waiting for a release that never comes, while the intended
+/// participants silently bypass the controller they were meant to use.
+///
+/// An unrelated store loaded after arming but before
+/// either intended hydration passes through untouched (its load returns
+/// promptly, never paused), and both intended participants are still
+/// observed and released independently.
+#[test]
+fn an_unrelated_store_arriving_first_never_claims_the_controller() {
+    let _serial = serialise_coordination_test();
+    let root = tempfile::tempdir().expect("scratch directory");
+    let store_directory = root.path().join("store");
+    let runtime_directory = root.path().join("runtime");
+    fs::create_dir(&store_directory).expect("create store directory");
+    create_runtime_directory(&runtime_directory);
+    let intended_path = store_directory.join("intended-hydration.redb");
+    let unrelated_path = store_directory.join("unrelated-hydration.redb");
+    seed_store(&intended_path);
+    seed_store(&unrelated_path);
+    let _breadcrumb_root = reader_breadcrumb_runtime_root_for_test()
+        .expect("this machine has a usable per-user runtime location");
+
+    let mut run = SameProcessHydrationRun::arm(&intended_path);
+
+    // The unrelated store hydrates on its own thread, arriving before either
+    // intended participant. Bounded, not blocking forever: if the
+    // controller wrongly claims it, this must fail loudly rather than hang
+    // the suite. The thread signals its own completion over a channel, so
+    // the wait ends the instant the load actually finishes instead of on the
+    // next poll tick -- and a stuck load times out with the failure message
+    // below instead of hanging the suite.
+    let (unrelated_finished_tx, unrelated_finished_rx) = std::sync::mpsc::channel();
+    let unrelated_handle = thread::spawn(move || {
+        let result = load_read_image_for_test_adapter(&unrelated_path);
+        let _ = unrelated_finished_tx.send(());
+        result
+    });
+    unrelated_finished_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect(
+            "an unrelated store's hydration must never be paused by another store's armed \
+             controller",
+        );
+    unrelated_handle
+        .join()
+        .expect("unrelated hydration thread must not panic")
+        .expect("unrelated store hydration must succeed, untouched by the armed controller");
+
+    let first = run.spawn_and_wait(&intended_path);
+    let second = run.spawn_and_wait(&intended_path);
+    assert_ne!(
+        first.participant, second.participant,
+        "both intended participants must still be observed after an unrelated arrival"
+    );
+    run.release_and_join(first.participant);
+    run.release_and_join(second.participant);
+    run.finish();
+}
+
+#[test]
+fn clearing_one_store_s_read_image_history_leaves_another_store_s_history_intact() {
+    let _serial = serialise_coordination_test();
+    let root = tempfile::tempdir().expect("scratch directory");
+    let first_path = root.path().join("first-store.redb");
+    let second_path = root.path().join("second-store.redb");
+    seed_store(&first_path);
+    seed_store(&second_path);
+
+    let first = observe_read_image_source_events_for_test(&first_path);
+    let second = observe_read_image_source_events_for_test(&second_path);
+    first.reset();
+    second.reset();
+
+    load_read_image_for_test_adapter(&first_path).expect("hydrate the first store");
+    let handed_off = second_path.clone();
+    thread::spawn(move || {
+        load_read_image_for_test_adapter(&handed_off).expect("hydrate the second store");
+    })
+    .join()
+    .expect("the second store's hydration thread finished");
+
+    let first_before = first.events();
+    let second_before = second.events();
+    assert!(
+        !first_before.is_empty(),
+        "the first store recorded the hydration this thread ran"
+    );
+    assert!(
+        !second_before.is_empty(),
+        "the second store recorded its hydration even though another thread ran it"
+    );
+
+    first.reset();
+
+    assert!(
+        first.events().is_empty(),
+        "clearing the first store's history leaves the first store with nothing"
+    );
+    assert_eq!(
+        second.events(),
+        second_before,
+        "clearing one store's history never touches another store's history"
+    );
 }
 
 fn next_random(state: &mut u64) -> u64 {

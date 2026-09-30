@@ -102,9 +102,12 @@ and the CLI contract in [`docs/cli.md`](docs/cli.md#cli-client-contextdb).
 
 contextdb rejects PG-style validation triggers as an invariant mechanism:
 constraints such as `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` are
-engine-enforced. It does support host-callback Triggers for
-transactional observation and cascade writes that belong with the firing
-transaction.
+engine-enforced. It supports two handler kinds: transactional trigger handlers
+prepare related records inside the firing transaction, and sink handlers deliver
+external actions after a durable commit. A trigger may complete a dependency
+such as a referenced parent. The engine validates the complete write set,
+including callback-created records, and commits all records and pending sink
+deliveries together or none of them.
 
 ```rust
 use contextdb_core::Value;
@@ -122,7 +125,7 @@ db.execute(
     &HashMap::new(),
 )?;
 
-db.register_trigger_callback("observation_seen", |db, ctx| {
+db.register_transactional_trigger_callback("observation_seen", |db, ctx| {
     db.execute_in_tx(
         ctx.tx,
         "INSERT INTO derived (id, observation_id) VALUES ($id, $observation)",
@@ -139,7 +142,27 @@ db.register_trigger_callback("observation_seen", |db, ctx| {
 db.complete_initialization()?;
 ```
 
-The callback runs synchronously inside the firing transaction's commit window.
+The trigger handler runs synchronously inside the firing transaction's commit
+window. It must only prepare database work; a later constraint check, plugin,
+or durable write can still reject the transaction. Do not send notifications,
+publish user-facing events, or perform irreversible work from this handler.
+Declare an event type, sink and route for a notification record, insert that
+record in the same transaction, and register the sink with `register_sink`.
+The existing durable queue invokes the sink only after commit, preserves pending
+work across restart, and retries with the same `SinkEvent::action_id`. Receivers
+that support deduplication should key on that identity. A sink that loses an
+acknowledgement can return `SinkError::OutcomeUncertain`; `sink_metrics().uncertain`
+exposes that uncertainty while delivery remains pending. An endpoint without
+deduplication cannot be promised exactly-once effects.
+Scheduled transaction callbacks use the same commit boundary for their rows
+and routed pending actions. A sink panic after delivery begins is also treated
+as an uncertain outcome and retried with the same action identity.
+<!-- enforced by: tests/integration/transactional_callback_delivery.rs::callback_created_dependency_commits_with_observation_and_pending_delivery, tests/integration/transactional_callback_delivery.rs::final_commit_validation_failure_discards_callback_records_delivery_and_event, tests/integration/transactional_callback_delivery.rs::restart_after_commit_recovers_pending_action_and_delivers_committed_records, tests/integration/transactional_callback_delivery.rs::lost_acknowledgement_retries_same_identity_and_deduplicates_visible_event, tests/integration/transactional_callback_delivery.rs::scheduled_action_identity_survives_drained_queue_and_restart, tests/integration/transactional_callback_delivery.rs::delivery_panic_retains_uncertain_action_for_restart_and_deduplicated_retry -->
+
+`DatabasePlugin::post_query(Success)` for a statement staged in a private
+transaction means that statement succeeded, not that the transaction committed.
+Use post-commit sink delivery for a durable external signal.
+
 Same-DB cross-thread writers wait-and-proceed inside the engine, unrelated
 databases proceed independently, same-thread callback reentry receives
 `CallbackReentry`, callback tx-bound handles stay isolated to the runner
@@ -185,6 +208,9 @@ and invalidates its tickets). See the [CLI Reference](docs/cli.md) for the full
 list of files it writes.
 
 ## Or Explore With the CLI
+
+If a store was written by an earlier build, it is not read. Move it aside and
+create the store again.
 
 ```bash
 cargo build --release -p contextdb-cli
@@ -236,15 +262,6 @@ VECTOR_PARTITIONS FOR table.column` shows each partition's state. Use `VECTOR(N)
 per-column storage footprint; omitted quantization defaults to `F32`.
 <!-- enforced by: vector_serving_merge_contract::updated_base_and_tail_publish_one_visible_row_per_identity, vector_partition_query_contract::equality_on_every_partition_component_selects_one_named_tuple, vector_lazy_raw_residency_contract::reopen_and_selected_queries_keep_raw_vector_residency_partition_local, vector_partition_sync_inspection_contract::existing_two_row_sync_keeps_each_vector_with_its_row_and_shows_summary, vector_partition_sync_inspection_contract::show_vector_partitions_supports_all_sql_forms -->
 
-### Upgrading From 0.3.x
-
-Opening a legacy vector store without the named-index format marker returns
-`LegacyVectorStoreDetected`. `contextdb migrate <path>` brings the store forward
-in place, writing a `<path>.bak` backup first — rehearse it on a copy, and take a
-`contextdb snapshot export` beforehand. If that store is unavailable to you,
-recovery is still explicit: sync from a peer already on the named-index storage
-format, or recreate the schema and reimport the data.
-
 ## What It Does
 
 **Relational (PostgreSQL-compatible SQL)** — SELECT, INSERT, UPDATE, DELETE, JOINs (INNER/LEFT), CTEs, upsert (`ON CONFLICT DO UPDATE`), DISTINCT, LIMIT, IN with subqueries, LIKE, BETWEEN, parameter binding (`$name`).
@@ -280,7 +297,7 @@ Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/
 | **[Query Language](docs/query-language.md)** | SQL, graph MATCH, vector search, constraints, built-in functions |
 | **[Sync Across Two Machines](docs/sync-two-machines.md)** | Stand up a hub, enroll two edges, converge in both directions |
 | **[CLI Reference](docs/cli.md)** | REPL commands, sync commands, non-interactive scripting |
-| **[Architecture](docs/architecture.md)** | Crate map, storage engine, MVCC, sync protocol, work ledger and blob plane, upgrades and recovery, plugin system |
+| **[Architecture](docs/architecture.md)** | Crate map, storage engine, MVCC, sync protocol, work ledger and blob plane, store format and recovery, plugin system |
 | **[Benchmarking](docs/benchmarking.md)** | How the benchmarks are built and run |
 | **[Agent Readiness](docs/agent-readiness.md)** | How this repo measures whether AI assistants can use and contribute to it |
 

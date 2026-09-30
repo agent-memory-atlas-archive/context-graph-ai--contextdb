@@ -19,6 +19,25 @@ pub trait MemoryBudget: Debug + Send + Sync {
 
     fn release(&self, bytes: usize);
 
+    /// Atomically replace the caller's held charge. Delta-based budgets can
+    /// use the default: it never exposes the old charge or adds old + new.
+    /// A shared budget must validate growth against its published limit.
+    fn transition_reservation_for(
+        &self,
+        old_bytes: usize,
+        new_bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> Result<()> {
+        if new_bytes > old_bytes {
+            self.try_allocate_for(new_bytes - old_bytes, subsystem, operation, hint)?;
+        } else if new_bytes < old_bytes {
+            self.release(old_bytes - new_bytes);
+        }
+        Ok(())
+    }
+
     /// Bytes currently available under a finite shared budget. Unlimited or
     /// request-local budgets return `None`, so residency is retained.
     fn available_bytes(&self) -> Option<usize> {
@@ -80,21 +99,25 @@ impl VectorWorkspaceReservation {
         })
     }
 
-    /// Reconcile this reservation when a workspace changes ownership phase.
-    /// Growth is admitted before the visible charge changes; shrinkage keeps
-    /// the old charge until the released bytes no longer have an owner.
+    /// Atomically replace this phase's charge after dead owners are dropped
+    /// and before new owners allocate. Refusal preserves the old token and
+    /// charge; success changes the token and the live workspace counter once.
     #[doc(hidden)]
     pub fn resize(&mut self, bytes: usize, operation: &str, hint: &str) -> Result<()> {
+        self.accountant.transition_reservation_for(
+            self.bytes,
+            bytes,
+            "vector_index",
+            operation,
+            hint,
+        )?;
         if bytes > self.bytes {
             let additional = bytes - self.bytes;
-            self.accountant
-                .try_allocate_for(additional, "vector_index", operation, hint)?;
             self.live_bytes.fetch_add(additional, Ordering::SeqCst);
         } else if bytes < self.bytes {
             let released = self.bytes - bytes;
             let previous = self.live_bytes.fetch_sub(released, Ordering::SeqCst);
             debug_assert!(previous >= released);
-            self.accountant.release(released);
         }
         self.bytes = bytes;
         Ok(())
@@ -125,7 +148,18 @@ mod tests {
             _operation: &str,
             _hint: &str,
         ) -> Result<()> {
-            self.0.fetch_add(bytes, Ordering::SeqCst);
+            self.0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= 1_000)
+                })
+                .map_err(|used| contextdb_core::Error::MemoryBudgetExceeded {
+                    subsystem: "vector_index".into(),
+                    operation: "resize".into(),
+                    requested_bytes: bytes,
+                    available_bytes: 1_000 - used,
+                    budget_limit_bytes: 1_000,
+                    hint: "test".into(),
+                })?;
             Ok(())
         }
 
@@ -144,6 +178,15 @@ mod tests {
                 .unwrap();
         assert_eq!(budget.0.load(Ordering::SeqCst), 900);
         assert_eq!(live.load(Ordering::SeqCst), 900);
+        assert!(reservation.resize(1_001, "encode", "test").is_err());
+        assert_eq!(
+            reservation.bytes, 900,
+            "refusal preserves the ownership token"
+        );
+        assert_eq!(budget.0.load(Ordering::SeqCst), 900);
+        assert_eq!(live.load(Ordering::SeqCst), 900);
+        reservation.resize(900, "encode", "test").unwrap();
+        assert_eq!(budget.0.load(Ordering::SeqCst), 900);
 
         reservation.resize(300, "persist", "test").unwrap();
         assert_eq!(budget.0.load(Ordering::SeqCst), 300);

@@ -100,6 +100,11 @@ fn search_results(
 ) -> Vec<SearchResult> {
     let mut query = SemanticQuery::new(table, "vector_text", query_vec(), limit);
     query.sort_key = sort_key.map(str::to_string);
+    // The bench pins the ANN candidate set and rank-policy behaviour, so it asks
+    // for the guaranteed index route. The schema author declares whether vector
+    // search may choose speed or must guarantee a route. AUTO may compare this
+    // small resident partition exactly; that route is outside this bench's scope.
+    query.search_mode = Some(contextdb_core::VectorSearchMode::Indexed);
     db.semantic_search(query).unwrap()
 }
 

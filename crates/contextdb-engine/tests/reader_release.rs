@@ -1,4 +1,7 @@
 #[cfg(unix)]
+#[path = "reader_release/a_paused_reader_belongs_to_the_journey_that_stopped_it.rs"]
+mod a_paused_reader_belongs_to_the_journey_that_stopped_it;
+#[cfg(unix)]
 #[path = "reader_release/the_reader_release_wait_follows_the_real_hold.rs"]
 mod the_reader_release_wait_follows_the_real_hold;
 #[cfg(unix)]

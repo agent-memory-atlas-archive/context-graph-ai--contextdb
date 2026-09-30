@@ -19,6 +19,7 @@ pub fn statement_effect(statement: &Statement) -> StatementEffect {
         | Statement::ShowMemoryLimit
         | Statement::ShowDiskLimit
         | Statement::ShowMaintenancePollInterval
+        | Statement::ShowVectorServingCache
         | Statement::ShowSyncConflictPolicy
         | Statement::ShowVectorIndexes
         | Statement::ShowTenantTablePolicy { .. }
@@ -45,6 +46,7 @@ pub fn statement_effect(statement: &Statement) -> StatementEffect {
         | Statement::SetMemoryLimit(_)
         | Statement::SetDiskLimit(_)
         | Statement::SetMaintenancePollInterval(_)
+        | Statement::SetVectorServingCache(_)
         | Statement::CreateSchedule { .. }
         | Statement::DropSchedule { .. }
         | Statement::CreateTrigger { .. }
@@ -107,6 +109,7 @@ fn expr_contains_vector_subquery(expr: &crate::Expr) -> bool {
         Expr::Like { expr, pattern, .. } => {
             expr_contains_vector_subquery(expr) || expr_contains_vector_subquery(pattern)
         }
+        Expr::Row(elements) => elements.iter().any(expr_contains_vector_subquery),
         Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::RowVectorSource { .. } => {
             false
         }

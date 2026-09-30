@@ -12,9 +12,9 @@ fn durable_generation_workspace_separates_build_and_persistence_owners() {
         VectorIndexRef::new("receipt_items", "embedding"),
         VectorPartitionKey::from_values(&[Value::Int64(3)]).unwrap(),
     );
-    let plan = VectorGenerationWorkspacePlan::new(50_000, &layout, &partition, policy, 0);
+    let plan =
+        VectorGenerationWorkspacePlan::new(50_000, 50_000, &layout, &partition, policy, 0).unwrap();
     let available = LIMIT - RETAINED;
-
     assert_eq!(
         (
             policy.hnsw_m,
@@ -23,21 +23,208 @@ fn durable_generation_workspace_separates_build_and_persistence_owners() {
         ),
         (24, 400, 400)
     );
-    assert_eq!(plan.graph_build_bytes, 681_223_128);
+    let graph_build_bytes =
+        HnswIndex::estimated_build_reservation(50_000, 64, VectorQuantization::F32, policy);
+    assert_eq!(plan.graph_build_bytes, graph_build_bytes);
     assert_eq!(plan.raw_entry_bytes, 25_900_000);
+    assert_eq!(plan.selected_entry_bytes, plan.raw_entry_bytes);
     assert_eq!(plan.durable_metadata_bytes, 4_664);
-    assert_eq!(plan.former_combined_bytes(), 4_872_189_880);
-    assert_eq!(plan.build_phase_bytes(), 1_414_250_920);
-    assert!(plan.former_combined_bytes() > available);
-    assert!(plan.build_phase_bytes() <= available);
-    assert!(plan.build_phase_bytes() < plan.former_combined_bytes());
-    eprintln!(
-        "graph_build_bytes={} raw_entry_bytes={} durable_metadata_bytes={} former_requested_bytes={} build_phase_requested_bytes={} available_bytes={available}",
-        plan.graph_build_bytes,
-        plan.raw_entry_bytes,
-        plan.durable_metadata_bytes,
-        plan.former_combined_bytes(),
+    assert_eq!(
         plan.build_phase_bytes(),
+        graph_build_bytes
+            + plan.raw_entry_bytes
+            + plan.raw_decode_scratch_bytes
+            + plan.selected_entry_bytes
+            + plan.durable_metadata_bytes
+    );
+    let graph_resident_bytes = HnswIndex::estimated_resident_bytes_with_m(
+        50_000,
+        64,
+        VectorQuantization::F32,
+        policy.hnsw_m,
+    );
+    assert_eq!(
+        plan.encoding_phase_bytes(graph_resident_bytes),
+        graph_resident_bytes
+            + plan.raw_entry_bytes
+            + plan.encoded_graph_bound
+            + plan.encoding_scratch_bytes
+            + plan.durable_metadata_bytes
+    );
+    assert!(plan.build_phase_bytes() <= available);
+    assert!(plan.encoding_phase_bytes(graph_resident_bytes) <= available);
+    let history =
+        VectorGenerationWorkspacePlan::new(100_000, 50_000, &layout, &partition, policy, 0)
+            .unwrap();
+    assert_eq!(
+        history.graph_build_bytes, plan.graph_build_bytes,
+        "history never sizes the builder"
+    );
+    assert_eq!(
+        history.encoded_graph_bound, plan.encoded_graph_bound,
+        "history never sizes the codec"
+    );
+    assert_eq!(history.raw_entry_bytes, plan.raw_entry_bytes * 2);
+    let delta =
+        VectorGenerationWorkspacePlan::new(100_000, 32, &layout, &partition, policy, 12_345)
+            .unwrap();
+    assert!(delta.graph_build_bytes < history.graph_build_bytes);
+    assert_eq!(delta.prior_base_bytes, 12_345);
+    assert_eq!(
+        delta.build_phase_bytes(),
+        delta.graph_build_bytes
+            + delta.raw_entry_bytes
+            + delta.raw_decode_scratch_bytes
+            + delta.selected_entry_bytes
+            + delta.durable_metadata_bytes,
+        "prior base is not loaded during construction"
+    );
+    assert_eq!(
+        delta.persistence_phase_bytes(4096),
+        delta.raw_entry_bytes
+            + 4096
+            + delta.prior_base_bytes
+            + delta.durable_metadata_bytes
+            + delta.digest_reference_bytes,
+        "candidate preparation does not retain future serialized copies"
+    );
+    assert_eq!(
+        delta.prepared_phase_bytes(4096),
+        (4096 + delta.prior_base_bytes + delta.durable_metadata_bytes)
+            * VECTOR_GENERATION_PERSISTENCE_COPIES
+            + 64 * 1024,
+        "prepared owners replace the dead raw snapshot atomically"
+    );
+}
+
+#[test]
+fn a_retained_raw_body_has_decode_scratch_even_without_live_graph_points() {
+    let layout = VectorIndexLayout::unpartitioned(262_145, VectorQuantization::F32);
+    let policy = layout.resolve_policy(0, 1);
+    let partition = VectorPartitionRef::new(
+        VectorIndexRef::new("retained_items", "embedding"),
+        VectorPartitionKey::unpartitioned(),
+    );
+    let plan = VectorGenerationWorkspacePlan::new(1, 0, &layout, &partition, policy, 0).unwrap();
+    assert_eq!(plan.selected_entry_bytes, 0);
+    assert_eq!(
+        plan.raw_decode_scratch_bytes,
+        1024 * 1024
+            + 3 * layout.dimension * std::mem::size_of::<f32>()
+            + std::mem::size_of::<VectorEntry>()
+    );
+    let small_layout = VectorIndexLayout::unpartitioned(1, VectorQuantization::F32);
+    let small_plan = VectorGenerationWorkspacePlan::new(
+        1,
+        0,
+        &small_layout,
+        &partition,
+        small_layout.resolve_policy(0, 1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        small_plan.raw_decode_scratch_bytes > 1024 * 1024,
+        "the malformed-prefix allocation cap is additive to declared-body scratch"
+    );
+    assert_eq!(
+        plan.build_phase_bytes(),
+        plan.graph_build_bytes
+            + plan.raw_entry_bytes
+            + plan.raw_decode_scratch_bytes
+            + plan.durable_metadata_bytes
+    );
+    let accountant = MemoryAccountant::with_budget(plan.build_phase_bytes() - 1);
+    assert!(
+        accountant
+            .try_allocate_for(
+                plan.build_phase_bytes(),
+                "vector_index",
+                "prepare_vector_generation",
+                "test"
+            )
+            .is_err()
+    );
+    assert_eq!(
+        accountant.usage().used,
+        0,
+        "decode cannot start with a partial workspace charge"
+    );
+}
+
+#[test]
+fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path().join("state-digest.db")).unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.execute(
+        "CREATE TABLE items (id INT PRIMARY KEY, v VECTOR(3) SEARCH_MODE INDEXED)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    for id in (0..16).rev() {
+        db.execute(
+            "INSERT INTO items VALUES ($id, '[1,0,0]')",
+            &HashMap::from([("id".into(), Value::Int64(id))]),
+        )
+        .unwrap();
+    }
+    let before_updates = SnapshotId(db.tx_mgr.current_tx_max().0);
+    db.execute(
+        "UPDATE items SET v = '[0,1,0]' WHERE id < 4",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute("DELETE FROM items WHERE id >= 14", &HashMap::new())
+        .unwrap();
+    let partition = VectorPartitionRef::new(
+        VectorIndexRef::new("items", "v"),
+        VectorPartitionKey::unpartitioned(),
+    );
+    let past_entries = db
+        .vector_store_for_test()
+        .entries_for_partition_at_snapshot(
+            &partition.index,
+            &partition.partition_key,
+            before_updates,
+        )
+        .unwrap();
+    assert_eq!(past_entries.len(), 16);
+    assert_eq!(
+        past_entries.capacity(),
+        16,
+        "snapshot slots exclude later versions and avoid reallocating old/new arrays"
+    );
+    drop(past_entries);
+    let snapshot = SnapshotId(db.tx_mgr.current_tx_max().0);
+    let entries = db
+        .vector_store_for_test()
+        .entries_for_partition_at_snapshot(&partition.index, &partition.partition_key, snapshot)
+        .unwrap();
+    let mut live = entries
+        .iter()
+        .filter(|entry| entry.deleted_tx.is_none())
+        .collect::<Vec<_>>();
+    live.sort_by_key(|entry| (entry.row_id, entry.created_tx, entry.lsn));
+    let canonical = bincode::serde::encode_to_vec(&live, bincode::config::standard()).unwrap();
+    let expected = *blake3::hash(&canonical).as_bytes();
+    let report = db.run_maintenance_cycle().unwrap();
+    assert_eq!(report.vector.built_partitions, 1, "{report:?}");
+    let persistence = db.persistence.as_ref().unwrap();
+    let catalog = persistence
+        .load_vector_partition_generation_catalog_for(&partition.index, &partition.partition_key)
+        .unwrap()
+        .unwrap();
+    let base = persistence
+        .load_vector_partition_base_generation(
+            &partition.index,
+            &partition.partition_key,
+            catalog.base.generation_id,
+        )
+        .unwrap();
+    assert_eq!(
+        base.state_digest, expected,
+        "streaming must preserve durable digest identity"
     );
 }
 
@@ -667,4 +854,483 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
                 .is_empty()
         );
     }
+}
+
+fn seed_retained_generation_selection(
+    path: &std::path::Path,
+    dimension: usize,
+    quantization: &str,
+    scalar_updates: usize,
+) -> Database {
+    let db = Database::open(path).unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.execute(
+        &format!(
+            "CREATE TABLE selection_items (id INT PRIMARY KEY, selected BOOLEAN NOT NULL, \
+             v VECTOR({dimension}) WITH (quantization = '{quantization}') SEARCH_MODE INDEXED \
+             AUTO_INDEX_AT 1 CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 1))"
+        ),
+        &HashMap::new(),
+    )
+    .unwrap();
+    let mut vector = vec![0.0; dimension];
+    vector[0] = 1.0;
+    vector[1] = -0.0;
+    vector[2] = 0.13;
+    for id in (0..16).rev() {
+        db.execute(
+            "INSERT INTO selection_items VALUES ($id, false, $vector)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("vector".into(), Value::Vector(vector.clone())),
+            ]),
+        )
+        .unwrap();
+    }
+    for _ in 0..scalar_updates {
+        db.execute(
+            "UPDATE selection_items SET selected = true",
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
+    db
+}
+
+fn selection_partition() -> VectorPartitionRef {
+    VectorPartitionRef::new(
+        VectorIndexRef::new("selection_items", "v"),
+        VectorPartitionKey::unpartitioned(),
+    )
+}
+
+fn canonical_retained_selection_digest(
+    db: &Database,
+    partition: &VectorPartitionRef,
+    snapshot: SnapshotId,
+) -> [u8; 32] {
+    let entries = db
+        .vector_store
+        .entries_for_partition_at_snapshot(&partition.index, &partition.partition_key, snapshot)
+        .unwrap();
+    let mut live = entries
+        .iter()
+        .filter(|entry| entry.deleted_tx.is_none())
+        .collect::<Vec<_>>();
+    live.sort_by_key(|entry| (entry.row_id, entry.created_tx, entry.lsn));
+    let canonical = bincode::serde::encode_to_vec(&live, bincode::config::standard()).unwrap();
+    *blake3::hash(&canonical).as_bytes()
+}
+
+#[test]
+fn resident_generation_selection_preserves_retained_canonical_digests() {
+    for quantization in ["F32", "SQ8", "SQ4"] {
+        let directory = tempfile::tempdir().unwrap();
+        let db = seed_retained_generation_selection(
+            &directory.path().join("selection-digest.db"),
+            3,
+            quantization,
+            8,
+        );
+        let partition = selection_partition();
+        let before_change = SnapshotId(db.tx_mgr.current_tx_max().0);
+        db.execute(
+            "UPDATE selection_items SET v = '[0,1,0.26]' WHERE id < 4",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM selection_items WHERE id >= 14",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let snapshot = SnapshotId(db.tx_mgr.current_tx_max().0);
+        let full = db
+            .vector_store
+            .entries_for_partition_at_snapshot(&partition.index, &partition.partition_key, snapshot)
+            .unwrap();
+        assert_eq!(full.len(), 16 * 9 + 4);
+        let selected = db
+            .vector_store
+            .entries_for_partition_generation_at_snapshot(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 14);
+        assert_eq!(selected.capacity(), 14);
+        let expected = canonical_retained_selection_digest(&db, &partition, snapshot);
+        let old_selected = db
+            .vector_store
+            .entries_for_partition_generation_at_snapshot(
+                &partition.index,
+                &partition.partition_key,
+                before_change,
+                None,
+            )
+            .unwrap();
+        assert_eq!(old_selected.len(), 16);
+        assert!(old_selected.iter().all(|entry| entry.deleted_tx.is_none()));
+        drop(full);
+        drop(selected);
+        drop(old_selected);
+        let report = db.run_maintenance_cycle().unwrap();
+        assert_eq!(report.vector.first_failure, None, "{report:?}");
+        assert_eq!(report.vector.built_partitions, 1, "{report:?}");
+        let persistence = db.persistence.as_ref().unwrap();
+        let catalog = persistence
+            .load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )
+            .unwrap()
+            .unwrap();
+        let base = persistence
+            .load_vector_partition_base_generation(
+                &partition.index,
+                &partition.partition_key,
+                catalog.base.generation_id,
+            )
+            .unwrap();
+        assert_eq!(base.state_digest, expected, "{quantization}");
+        assert_eq!(base.base_tx, TxId(snapshot.0));
+        assert_eq!(
+            db.vector_memory_ownership_receipt_for_test()
+                .temporary_workspace,
+            0
+        );
+        assert_eq!(db.accountant.underflow_count_for_test(), 0);
+        assert_eq!(
+            db.vector_store
+                .entries_for_partition_at_snapshot(
+                    &partition.index,
+                    &partition.partition_key,
+                    snapshot,
+                )
+                .unwrap()
+                .len(),
+            16 * 9 + 4
+        );
+    }
+}
+
+#[test]
+fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_writes() {
+    for quantization in ["F32", "SQ8", "SQ4"] {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(seed_retained_generation_selection(
+            &directory.path().join("selection-frontier.db"),
+            3,
+            quantization,
+            4,
+        ));
+        let partition = selection_partition();
+        let snapshot = SnapshotId(db.tx_mgr.current_tx_max().0);
+        let covered_lsn = db.tx_mgr.current_lsn();
+        let expected = canonical_retained_selection_digest(&db, &partition, snapshot);
+        let counts = db
+            .vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+            )
+            .unwrap();
+        assert_eq!(counts, (16 * 5, 16));
+        let pause = db.__arm_one_shot_vector_maintenance_preparation_pause_for_test(
+            &partition,
+            VectorMaintenancePreparationPhaseForTest::LoadAuthoritativeRawVectors,
+        );
+        let maintenance_db = Arc::clone(&db);
+        let worker = std::thread::spawn(move || maintenance_db.run_maintenance_cycle());
+        let reached = pause.wait_until_reached_timeout(Duration::from_secs(10));
+        if reached.is_err() {
+            pause.release();
+            let result = worker.join().unwrap();
+            panic!("generation did not reach extraction pause: {reached:?}; {result:?}");
+        }
+        assert!(db.__try_global_commit_lock_for_test());
+        let writer_db = Arc::clone(&db);
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = (|| {
+                writer_db.execute(
+                    "UPDATE selection_items SET v = '[0,1,0]' WHERE id = 0",
+                    &HashMap::new(),
+                )?;
+                writer_db.execute("DELETE FROM selection_items WHERE id = 1", &HashMap::new())?;
+                writer_db.execute(
+                    "INSERT INTO selection_items VALUES (16, true, '[0,0,1]')",
+                    &HashMap::new(),
+                )?;
+                Ok::<(), Error>(())
+            })();
+            writer_tx.send(result).unwrap();
+        });
+        let writes_before_release = writer_rx.recv_timeout(Duration::from_secs(10));
+        if writes_before_release.is_err() {
+            pause.release();
+            let result = worker.join().unwrap();
+            writer.join().unwrap();
+            panic!(
+                "commits did not finish before extraction: {writes_before_release:?}; {result:?}"
+            );
+        }
+        writes_before_release.unwrap().unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            db.vector_store
+                .partition_generation_entry_counts(
+                    &partition.index,
+                    &partition.partition_key,
+                    snapshot,
+                    None,
+                )
+                .unwrap(),
+            counts
+        );
+        let old = db
+            .vector_store
+            .entries_for_partition_generation_at_snapshot(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+            )
+            .unwrap();
+        assert_eq!(old.len(), 16);
+        assert_eq!(old.capacity(), 16);
+        assert!(old.iter().all(|entry| entry.deleted_tx.is_none()));
+        drop(old);
+        pause.release();
+        let report = worker.join().unwrap().unwrap();
+        assert_eq!(report.vector.first_failure, None, "{report:?}");
+        assert_eq!(report.vector.built_partitions, 1, "{report:?}");
+        let persistence = db.persistence.as_ref().unwrap();
+        let catalog = persistence
+            .load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )
+            .unwrap()
+            .unwrap();
+        let base = persistence
+            .load_vector_partition_base_generation(
+                &partition.index,
+                &partition.partition_key,
+                catalog.base.generation_id,
+            )
+            .unwrap();
+        assert_eq!(base.base_tx, TxId(snapshot.0));
+        assert_eq!(base.base_lsn, covered_lsn);
+        assert_eq!(base.state_digest, expected, "{quantization}");
+        assert_eq!(
+            canonical_retained_selection_digest(&db, &partition, snapshot),
+            expected
+        );
+        let now = SnapshotId(db.tx_mgr.current_tx_max().0);
+        let current = db
+            .vector_store
+            .entries_for_partition_generation_at_snapshot(
+                &partition.index,
+                &partition.partition_key,
+                now,
+                Some(covered_lsn),
+            )
+            .unwrap();
+        assert_eq!(
+            current.len(),
+            2,
+            "later update and insert remain in the suffix"
+        );
+        assert_eq!(
+            db.execute(
+                "SELECT id FROM selection_items ORDER BY v <=> [0,1,0] USE VECTOR INDEXED LIMIT 1",
+                &HashMap::new(),
+            )
+            .unwrap()
+            .rows,
+            vec![vec![Value::Int64(0)]]
+        );
+        assert_eq!(
+            db.vector_memory_ownership_receipt_for_test()
+                .temporary_workspace,
+            0
+        );
+        assert_eq!(db.accountant.underflow_count_for_test(), 0);
+    }
+}
+
+#[test]
+fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_refuses_before_bodies()
+ {
+    const HEADROOM: usize = 2 * 1024 * 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let db = seed_retained_generation_selection(
+        &directory.path().join("selection-admission.db"),
+        768,
+        "F32",
+        64,
+    );
+    let partition = selection_partition();
+    let snapshot = SnapshotId(db.tx_mgr.current_tx_max().0);
+    let (raw_count, graph_count) = db
+        .vector_store
+        .partition_generation_entry_counts(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            None,
+        )
+        .unwrap();
+    assert_eq!((raw_count, graph_count), (16 * 65, 16));
+    let full_entries = db
+        .vector_store
+        .entries_for_partition_at_snapshot(&partition.index, &partition.partition_key, snapshot)
+        .unwrap();
+    let selected_entries = db
+        .vector_store
+        .entries_for_partition_generation_at_snapshot(
+            &partition.index,
+            &partition.partition_key,
+            snapshot,
+            None,
+        )
+        .unwrap();
+    let body_bytes = |entries: &[VectorEntry]| -> usize {
+        entries
+            .iter()
+            .map(|entry| entry.vector.capacity() * 4)
+            .sum()
+    };
+    assert_eq!(full_entries.capacity(), 1040);
+    assert_eq!(selected_entries.capacity(), 16);
+    assert_eq!(body_bytes(&full_entries), 1040 * 768 * 4);
+    assert_eq!(body_bytes(&selected_entries), 16 * 768 * 4);
+    assert_eq!(
+        body_bytes(&full_entries) - body_bytes(&selected_entries),
+        3_145_728
+    );
+    assert_eq!(
+        (full_entries.capacity() - selected_entries.capacity())
+            * std::mem::size_of::<VectorEntry>(),
+        1024 * std::mem::size_of::<VectorEntry>()
+    );
+    drop(full_entries);
+    drop(selected_entries);
+    let layout = db.vector_store.index_layout(&partition.index).unwrap();
+    let policy = layout.resolve_policy(graph_count, 1);
+    let mut full =
+        VectorGenerationWorkspacePlan::new(raw_count, graph_count, &layout, &partition, policy, 0)
+            .unwrap();
+    let mut selected = VectorGenerationWorkspacePlan::new(
+        graph_count,
+        graph_count,
+        &layout,
+        &partition,
+        policy,
+        0,
+    )
+    .unwrap();
+    full.assign_raw_decode_owner(true, false);
+    selected.assign_raw_decode_owner(true, false);
+    assert!(full.build_phase_bytes() > HEADROOM);
+    assert!(selected.build_phase_bytes() < HEADROOM);
+    assert_eq!(
+        full.raw_entry_bytes - selected.raw_entry_bytes,
+        (raw_count - graph_count)
+            * (std::mem::size_of::<VectorEntry>()
+                + 768 * 4
+                + partition.index.table.len()
+                + partition.index.column.len()
+                + 128)
+    );
+    let baseline = db.accountant.usage().used;
+    let snapshot_holds = db.snapshot_registry.state.lock().active.len();
+    // The generation's complete admission is below its requirement by one
+    // byte, while its metadata-only inventory can still be inspected.
+    db.accountant
+        .set_budget(Some(baseline + selected.build_phase_bytes() - 1))
+        .unwrap();
+    let error = db
+        .maintenance_context()
+        .persist_built_vector_partition(&partition)
+        .unwrap_err();
+    assert!(matches!(error, Error::MemoryBudgetExceeded {
+        subsystem, operation, requested_bytes, available_bytes, ..
+    } if subsystem == "vector_index" && operation == "prepare_vector_generation"
+        && requested_bytes == available_bytes + 1));
+    assert_eq!(db.accountant.usage().used, baseline);
+    assert_eq!(
+        db.snapshot_registry.state.lock().active.len(),
+        snapshot_holds
+    );
+    assert_eq!(
+        db.vector_memory_ownership_receipt_for_test()
+            .temporary_workspace,
+        0
+    );
+    assert!(
+        db.persistence
+            .as_ref()
+            .unwrap()
+            .load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+            )
+            .unwrap(),
+        (raw_count, graph_count)
+    );
+    db.accountant.set_budget(Some(baseline + HEADROOM)).unwrap();
+    let report = db.run_maintenance_cycle().unwrap();
+    assert_eq!(report.vector.first_failure, None, "{report:?}");
+    assert_eq!(report.vector.built_partitions, 1, "{report:?}");
+    assert!(
+        db.persistence
+            .as_ref()
+            .unwrap()
+            .load_vector_partition_generation_catalog_for(
+                &partition.index,
+                &partition.partition_key,
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.vector_memory_ownership_receipt_for_test()
+            .temporary_workspace,
+        0
+    );
+    assert_eq!(
+        db.vector_store
+            .partition_generation_entry_counts(
+                &partition.index,
+                &partition.partition_key,
+                snapshot,
+                None,
+            )
+            .unwrap(),
+        (raw_count, graph_count)
+    );
+    assert_eq!(db.accountant.underflow_count_for_test(), 0);
+    eprintln!(
+        "resident_selection full_build_bytes={} selected_build_bytes={} raw_snapshot_savings={} fixed_headroom={HEADROOM}",
+        full.build_phase_bytes(),
+        selected.build_phase_bytes(),
+        full.raw_entry_bytes - selected.raw_entry_bytes
+    );
 }

@@ -81,7 +81,7 @@ pub fn install_global_subscriber() {
                     let mut visitor = EventBusPanicFieldVisitor::default();
                     event.record(&mut visitor);
                     if visitor.has_sink
-                        && visitor.has_entry_id
+                        && visitor.has_action_id
                         && visitor.has_panic_message
                         && visitor
                             .rendered
@@ -106,7 +106,7 @@ pub fn install_global_subscriber() {
         struct EventBusPanicFieldVisitor {
             rendered: String,
             has_sink: bool,
-            has_entry_id: bool,
+            has_action_id: bool,
             has_panic_message: bool,
         }
 
@@ -114,7 +114,7 @@ pub fn install_global_subscriber() {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 match field.name() {
                     "sink" => self.has_sink = true,
-                    "entry_id" => self.has_entry_id = true,
+                    "action_id" => self.has_action_id = true,
                     "panic_message" => self.has_panic_message = true,
                     _ => {}
                 }

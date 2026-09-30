@@ -31,8 +31,8 @@
 //!   identity the caller owns; this module never mints one.
 //! - **The `work_` table-name prefix is reserved** for this ledger.
 
-use crate::Database;
 use crate::sync_types::{ConflictPolicies, ConflictPolicy};
+use crate::{Database, ReadSession};
 use contextdb_core::{Error, Result, TxId, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -141,6 +141,23 @@ pub(crate) const CREATE_WORK_CLAIMS_JOB_ID_INDEX: &str =
     "CREATE INDEX work_claims_job_id ON work_claims (job_id)";
 pub(crate) const CREATE_WORK_FAILURES_JOB_ID_INDEX: &str =
     "CREATE INDEX work_failures_job_id ON work_failures (job_id)";
+
+/// The complete schema declaration set installed for a new work ledger.
+///
+/// A read-only consumer declares these same tables before it opens a
+/// [`ReadSession`], so this stays public and includes the keyed history
+/// indexes that keep a job-state answer proportional to the jobs it names.
+pub const LEDGER_TABLE_DECLARATIONS: [&str; 9] = [
+    CREATE_WORK_JOBS,
+    CREATE_WORK_CLAIMS,
+    CREATE_WORK_RESULTS,
+    CREATE_WORK_FAILURES,
+    CREATE_WORK_CANCELLATIONS,
+    CREATE_WORK_INPUTS,
+    CREATE_WORK_CAPABILITIES,
+    CREATE_WORK_CLAIMS_JOB_ID_INDEX,
+    CREATE_WORK_FAILURES_JOB_ID_INDEX,
+];
 
 /// The secondary indexes above, paired with the table and index name that
 /// decide whether a store already carries them.
@@ -773,13 +790,13 @@ fn input_refs_to_json(refs: &[InputRef]) -> serde_json::Value {
 pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
     let existing = db.table_names();
     let ddl: [(&str, &str); 7] = [
-        ("work_jobs", CREATE_WORK_JOBS),
-        ("work_claims", CREATE_WORK_CLAIMS),
-        ("work_results", CREATE_WORK_RESULTS),
-        ("work_failures", CREATE_WORK_FAILURES),
-        ("work_cancellations", CREATE_WORK_CANCELLATIONS),
-        ("work_inputs", CREATE_WORK_INPUTS),
-        ("work_capabilities", CREATE_WORK_CAPABILITIES),
+        ("work_jobs", LEDGER_TABLE_DECLARATIONS[0]),
+        ("work_claims", LEDGER_TABLE_DECLARATIONS[1]),
+        ("work_results", LEDGER_TABLE_DECLARATIONS[2]),
+        ("work_failures", LEDGER_TABLE_DECLARATIONS[3]),
+        ("work_cancellations", LEDGER_TABLE_DECLARATIONS[4]),
+        ("work_inputs", LEDGER_TABLE_DECLARATIONS[5]),
+        ("work_capabilities", LEDGER_TABLE_DECLARATIONS[6]),
     ];
     for (table, create) in ddl {
         if existing.iter().any(|name| name == table) {
@@ -788,11 +805,9 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
         db.execute(create, &HashMap::new())?;
     }
     // The two tables that keep several rows per job need `job_id` reachable
-    // without a walk. A store created before these indexes existed gains them
-    // the first time its ledger is opened -- an upgraded root must not go on
-    // paying the size of the whole ledger to answer a question about a handful
-    // of jobs. Keyed off the index the store already carries, so this stays
-    // idempotent exactly like the table creation above.
+    // without a walk. Install any missing index so a query about a handful
+    // of jobs does not scan the whole ledger. Checking the declared indexes
+    // keeps installation idempotent, like the table creation above.
     for (table, index, create) in WORK_LEDGER_JOB_ID_INDEXES {
         let Some(meta) = db.table_meta(table) else {
             continue;
@@ -802,15 +817,11 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
         }
         db.execute(create, &HashMap::new())?;
     }
-    // A root created BEFORE `work_capabilities` declared its own HISTORY /
-    // SYNC CONFLICT clauses (this installer is idempotent-by-absence, so an
-    // existing table is never re-created) would otherwise silently lose
-    // version-cleanup eligibility the moment the hardcoded table-name list
-    // it used to ride is gone. Reconcile via the SAME `ALTER TABLE` an
-    // operator would type -- no bespoke migration -- so an upgraded root
-    // keeps cleaning itself. Order matters: KEEP LATEST first, so the table
-    // is never observed keep-first while HISTORY CURRENT ONLY is declared
-    // (the combination `refuse_reclaimed_history_under_keep_first` refuses).
+    // Existing tables are not re-created. Reconcile work_capabilities through
+    // ordinary ALTER TABLE so its declared policy permits version cleanup.
+    // Order matters: KEEP LATEST first, so the table is never observed as
+    // keep-first with HISTORY CURRENT ONLY, a combination refused by
+    // `refuse_reclaimed_history_under_keep_first`.
     if existing.iter().any(|name| name == "work_capabilities")
         && let Some(meta) = db.table_meta("work_capabilities")
     {
@@ -827,13 +838,8 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
             )?;
         }
     }
-    // A root created BEFORE `work_inputs` declared its own `RETAIN 7 DAYS`
-    // (this installer is idempotent-by-absence, so an existing table is
-    // never re-created) would otherwise keep every input copy forever --
-    // the exact unbounded-debris class this installer exists to bound, just
-    // on the one table an upgraded operator never got the chance to
-    // opt out of. Reconcile via the same `ALTER TABLE` an operator would
-    // type, mirroring the `work_capabilities` reconcile above.
+    // Declare RETAIN 7 DAYS on an existing work_inputs table without a
+    // retention policy, through ordinary ALTER TABLE as above.
     if existing.iter().any(|name| name == "work_inputs")
         && let Some(meta) = db.table_meta("work_inputs")
         && meta.default_ttl_seconds.is_none()
@@ -1290,6 +1296,84 @@ impl JobStateRows for LedgerJobRows<'_> {
     }
 }
 
+/// The one-job state rows fetched through an established bounded reader.
+///
+/// This is deliberately the same [`JobStateRows`] input the writable path
+/// uses: changing a result, cancellation, failure, or lease rule changes both
+/// doors together. Each query goes through [`ReadSession::execute`], so this
+/// never opens a writable database or reaches around the selected read route.
+struct ReadSessionJobRows<'a> {
+    session: &'a ReadSession,
+    job_id: &'a str,
+}
+
+impl ReadSessionJobRows<'_> {
+    fn select_rows(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        let result = self.session.execute(sql, params)?;
+        Ok((result.columns, result.rows))
+    }
+}
+
+impl JobStateRows for ReadSessionJobRows<'_> {
+    fn result_recorded(&mut self) -> Result<bool> {
+        let mut params = HashMap::new();
+        params.insert("job_id".to_string(), text(self.job_id));
+        let (_, rows) = self.select_rows(
+            "SELECT job_id FROM work_results WHERE job_id = $job_id",
+            &params,
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn cancellation_recorded(&mut self) -> Result<bool> {
+        let mut params = HashMap::new();
+        params.insert("job_id".to_string(), text(self.job_id));
+        let (_, rows) = self.select_rows(
+            "SELECT job_id FROM work_cancellations WHERE job_id = $job_id",
+            &params,
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    fn failed_attempts(&mut self) -> Result<Vec<i64>> {
+        let mut params = HashMap::new();
+        params.insert("job_id".to_string(), text(self.job_id));
+        let (columns, rows) = self.select_rows(
+            "SELECT attempt FROM work_failures WHERE job_id = $job_id",
+            &params,
+        )?;
+        let attempt_idx = column_index(&columns, "attempt")?;
+        rows.iter()
+            .map(|row| int_at(row, attempt_idx, "attempt"))
+            .collect()
+    }
+
+    fn claims(&mut self) -> Result<Vec<ClaimRow>> {
+        let mut params = HashMap::new();
+        params.insert("job_id".to_string(), text(self.job_id));
+        let (columns, rows) = self.select_rows(
+            "SELECT attempt, node_id, lease_deadline FROM work_claims WHERE job_id = $job_id",
+            &params,
+        )?;
+        let attempt_idx = column_index(&columns, "attempt")?;
+        let node_idx = column_index(&columns, "node_id")?;
+        let lease_idx = column_index(&columns, "lease_deadline")?;
+        rows.iter()
+            .map(|row| {
+                Ok(ClaimRow {
+                    attempt: int_at(row, attempt_idx, "attempt")?,
+                    node_id: text_at(row, node_idx, "node_id")?,
+                    lease_deadline_ms: int_at(row, lease_idx, "lease_deadline")?,
+                })
+            })
+            .collect()
+    }
+}
+
 /// One job's rows, picked out of a batch that was read table by table.
 struct BatchedJobRows<'a> {
     job_id: &'a str,
@@ -1512,6 +1596,85 @@ pub fn job_state_counts_with_work(
         }
     }
     Ok((counts, work))
+}
+
+/// Read-only work-ledger answers through an established [`ReadSession`].
+///
+/// These calls use the session's selected file or owner route. They never
+/// open a writable database, select an alternate owner, or merge a shadow
+/// result with the reader's answer.
+pub mod read {
+    use super::*;
+
+    fn job_row(session: &ReadSession, job_id: &str) -> Result<Option<JobSnapshot>> {
+        let mut params = HashMap::new();
+        params.insert("job_id".to_string(), text(job_id));
+        let result = session.execute("SELECT * FROM work_jobs WHERE job_id = $job_id", &params)?;
+        let Some(row) = result.rows.first() else {
+            return Ok(None);
+        };
+        Ok(Some(job_snapshot_from_row(&result.columns, row)?))
+    }
+
+    /// Compute one job's state through the supplied read session.
+    pub fn job_state(session: &ReadSession, job_id: &str, now_ms: i64) -> Result<JobState> {
+        let Some(job) = job_row(session, job_id)? else {
+            return Err(Error::NotFound(format!("work ledger job {job_id}")));
+        };
+        let mut rows = ReadSessionJobRows { session, job_id };
+        state_of_job(&job, &mut rows, now_ms)
+    }
+
+    /// Count supplied jobs by their current states through the read session.
+    ///
+    /// Unknown ids remain part of the answer, as on the writable surface, so
+    /// a missing job cannot hide the state of the rest of the requested set.
+    pub fn job_state_counts(
+        session: &ReadSession,
+        job_ids: &[impl AsRef<str>],
+        now_ms: i64,
+    ) -> Result<JobStateCounts> {
+        let mut counts = JobStateCounts::default();
+        for job_id in job_ids {
+            match job_state(session, job_id.as_ref(), now_ms) {
+                Ok(state) => counts.record(&state),
+                Err(Error::NotFound(_)) => counts.unknown += 1,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Read a job's completed result through the supplied read session.
+    pub fn job_result(session: &ReadSession, job_id: &str) -> Result<Option<JobResult>> {
+        let mut params = HashMap::new();
+        params.insert("job_id".to_string(), text(job_id));
+        let result =
+            session.execute("SELECT * FROM work_results WHERE job_id = $job_id", &params)?;
+        let Some(row) = result.rows.first() else {
+            return Ok(None);
+        };
+        Ok(Some(JobResult {
+            job_id: text_at(row, column_index(&result.columns, "job_id")?, "job_id")?,
+            attempt: int_at(row, column_index(&result.columns, "attempt")?, "attempt")?,
+            executor_node_id: text_at(
+                row,
+                column_index(&result.columns, "executor_node_id")?,
+                "executor_node_id",
+            )?,
+            output: decode_payload(&text_at(
+                row,
+                column_index(&result.columns, "output")?,
+                "output",
+            )?)?,
+            receipt: json_at(row, column_index(&result.columns, "receipt")?, "receipt")?,
+            completed_at_ms: int_at(
+                row,
+                column_index(&result.columns, "completed_at")?,
+                "completed_at",
+            )?,
+        }))
+    }
 }
 
 /// The jobs `node_id` may claim right now: state pending, every requirement

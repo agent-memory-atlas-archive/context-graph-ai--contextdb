@@ -79,8 +79,10 @@ fn local_schema_authoring_persists_one_projected_ddl_batch_before_memory_publish
     let database = include_str!("../../src/database.rs");
 
     assert!(
-        executor.contains("RETRY_LOCAL_SCHEMA_PROJECTION")
-            && executor.contains("match execute_plan_once(db, plan, params, tx)"),
+        executor.contains("match execute_plan_once(")
+            && executor.contains(
+                "Err(Error::Other(message)) if message == RETRY_LOCAL_SCHEMA_PROJECTION => continue"
+            ),
         "a concurrent schema edit must transparently rerun validation, not expose an operator retry"
     );
     assert!(
@@ -265,7 +267,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .map(|offset| client_enter + offset)
         .expect("push extracts under lease");
     let client_provenance = client[client_extract..]
-        .find("outbound_ddl_provenance(&batch, &ddl_provenance_source)?")
+        .find("self.db.outbound_ddl_provenance(\n                    &batch,")
         .map(|offset| client_extract + offset)
         .expect("push prepares DDL provenance under lease");
     let client_drop = client[client_provenance..]
@@ -292,7 +294,7 @@ fn outbound_wire_evidence_is_prepared_before_the_schema_lease_is_released() {
         .map(|offset| server_enter + offset)
         .expect("pull extracts under lease");
     let server_provenance = server[server_extract..]
-        .find("db.outbound_ddl_provenance(&unit, &ddl_provenance_source)?")
+        .find("db.outbound_ddl_provenance(\n                    &unit,")
         .map(|offset| server_extract + offset)
         .expect("pull prepares every dependency-unit provenance under lease");
     let server_drop = server[server_provenance..]

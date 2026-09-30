@@ -1760,6 +1760,13 @@ fn t5_25_event_bus_ddl_rollback_does_not_leak_sink() {
 
 #[test]
 fn t5_26_event_bus_ddl_in_tx_routes_rows_from_same_commit() {
+    // A local authored schema transaction may declare the complete sequence,
+    // but may not mix row DML with schema DDL, uniformly for table/index
+    // declarations and for event types, triggers, sinks and routes. The
+    // event-declaration/row mix this test used to pin succeeding in one
+    // commit is intentionally withdrawn: the declaration commits on its own,
+    // and a row written in a later transaction still routes; mixing the two
+    // in one transaction is now the established typed refusal.
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
@@ -1777,7 +1784,6 @@ fn t5_26_event_bus_ddl_in_tx_routes_rows_from_same_commit() {
         .unwrap();
     db.execute("CREATE ROUTE tx_route EVENT inv_match TO tx_sink", &empty())
         .unwrap();
-    insert_inv(&db, "warning", "same-commit");
     db.execute("COMMIT", &empty()).unwrap();
 
     let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1787,6 +1793,10 @@ fn t5_26_event_bus_ddl_in_tx_routes_rows_from_same_commit() {
         Ok(())
     })
     .unwrap();
+
+    // The declaration already committed on its own; a row written afterward, in a
+    // separate transaction, still routes to the sink.
+    insert_inv(&db, "warning", "later-commit");
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline && log.lock().unwrap().is_empty() {
         std::thread::sleep(Duration::from_millis(20));
@@ -1794,8 +1804,39 @@ fn t5_26_event_bus_ddl_in_tx_routes_rows_from_same_commit() {
     assert_eq!(
         log.lock().unwrap().len(),
         1,
-        "EventBus DDL committed with rows must route those same-commit row events"
+        "a sink/route declared in its own transaction must still deliver rows written afterward"
     );
+
+    // Mixing a row write into the same transaction as a schema declaration is the
+    // withdrawn behavior: it is refused with the established typed message, and the
+    // uncommitted declaration rolls back with it.
+    db.execute("BEGIN", &empty()).unwrap();
+    db.execute("CREATE SINK tx_sink_2 TYPE callback", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE ROUTE tx_route_2 EVENT inv_match TO tx_sink_2",
+        &empty(),
+    )
+    .unwrap();
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::new_v4()));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("rsn".into(), Value::Text("same-commit-mix".into()));
+    let error = db
+        .execute(
+            "INSERT INTO invalidations (id, severity, reason) VALUES ($id, $sev, $rsn)",
+            &p,
+        )
+        .expect_err(
+            "mixing a row write into the same transaction as a sink/route declaration must be refused",
+        );
+    assert!(
+        error
+            .to_string()
+            .contains("mixed DML and transactional local schema DDL"),
+        "must keep the established mixed-write refusal, got {error}"
+    );
+    db.execute("ROLLBACK", &empty()).unwrap();
 }
 
 #[test]
@@ -2588,17 +2629,16 @@ fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
         .unwrap();
     }
 
-    // The durable ack removes queue entries before the dispatcher publishes
-    // their delivery/failure counters. Wait on the whole observable batch
-    // outcome so parallel load cannot expose the ack-to-metrics gap as a
-    // false failure.
+    // The panicked action remains pending and retries with the same identity.
+    // Wait until its retry and the second event have both been acknowledged.
     wait_for_bus("slack panic batch outcome", || {
         let metrics = db.sink_metrics_for_test("slack");
         metrics.queued == 0
-            && metrics.delivered == 1
-            && metrics.permanent_failures == 1
-            && metrics.examined >= 2
-            && invocations.load(Ordering::SeqCst) == 2
+            && metrics.delivered == 2
+            && metrics.uncertain >= 1
+            && metrics.permanent_failures == 0
+            && metrics.examined >= 3
+            && invocations.load(Ordering::SeqCst) == 3
     });
     wait_for_bus("slack structured panic event", || {
         T5_EVENT_BUS_PANIC_COUNT.load(Ordering::SeqCst) == 1
@@ -2608,13 +2648,13 @@ fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
     });
     assert_eq!(
         invocations.load(Ordering::SeqCst),
-        2,
-        "scoped-handle callback must be invoked for both events: panicking on the first does not stop the second"
+        3,
+        "the panicked first action retries before the second action is delivered"
     );
     let metrics = db.sink_metrics_for_test("slack");
     assert_eq!(
-        metrics.permanent_failures, 1,
-        "panic on a scoped-handle callback must be recorded as a permanent failure"
+        metrics.uncertain, 1,
+        "panic on a scoped-handle callback must be recorded as uncertain"
     );
     let panic_log_count = T5_EVENT_BUS_PANIC_COUNT.load(Ordering::SeqCst);
     T5_EVENT_BUS_COUNT_ENABLED.store(false, Ordering::SeqCst);
@@ -2635,16 +2675,16 @@ fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
         "panic tracing fields must include a structured sink field; got {fields:?}"
     );
     assert!(
-        fields.contains("entry_id="),
-        "panic tracing fields must include a structured entry_id field; got {fields:?}"
+        fields.contains("action_id="),
+        "panic tracing fields must include a structured action_id field; got {fields:?}"
     );
     assert!(
         fields.contains("panic_message="),
         "panic tracing fields must include a structured panic_message field; got {fields:?}"
     );
     assert_eq!(
-        metrics.delivered, 1,
-        "the post-panic event must be recorded as delivered exactly once"
+        metrics.delivered, 2,
+        "the retried action and later event must each be delivered once"
     );
     assert_eq!(metrics.queued, 0, "durable ack must drain both entries");
 }

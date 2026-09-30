@@ -415,6 +415,7 @@ pub(crate) fn apply(
             incarnation: request.incarnation,
             source_lsn,
             dependency_complete: true,
+            hub_contact_ms: None,
         })?;
     }
     Ok((result, outcomes))
@@ -806,7 +807,7 @@ fn apply_remainder(
             .map(|i| wire.ddl_provenance[*i].clone())
             .collect();
         received_ddl_context(&wire, tenant, edge, request.incarnation)
-            .map_err(|e| Error::SyncError(e.to_string()))?
+            .map_err(crate::protocol::received_ddl_error)?
     };
     if let Some(ddl) = &ddl {
         db.validate_incoming_push_lineages_with_received_ddl(

@@ -3,29 +3,54 @@
 use std::{cell::RefCell, io, sync::Arc};
 use std::{marker::PhantomData, rc::Rc};
 type Admission = Arc<dyn Fn(usize) -> io::Result<()> + Send + Sync>;
-thread_local! { static ACTIVE: RefCell<Vec<Admission>> = const { RefCell::new(Vec::new()) }; }
+
+/// A charge a caller's admission hands back for one page. The page the read
+/// cache does not keep carries it and drops it when its last holder drops the
+/// page, so the caller's charge lasts exactly as long as the page does.
+pub type ReadPageCharge = Box<dyn Send + Sync>;
+type ChargingAdmission = Arc<dyn Fn(usize) -> io::Result<ReadPageCharge> + Send + Sync>;
+
+enum ActiveAdmission {
+    Scoped(Admission),
+    Charging(ChargingAdmission),
+}
+
+thread_local! { static ACTIVE: RefCell<Vec<ActiveAdmission>> = const { RefCell::new(Vec::new()) }; }
+
+struct ResetAdmission;
+impl Drop for ResetAdmission {
+    fn drop(&mut self) {
+        ACTIVE.with(|active| {
+            active.borrow_mut().pop();
+        });
+    }
+}
 
 /// Execute synchronous source reads with admission before each cache-miss
 /// allocation. Nested operations restore the enclosing admission on unwind.
 #[doc(hidden)]
 pub fn with_read_memory_admission<R>(admit: Admission, operation: impl FnOnce() -> R) -> R {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            ACTIVE.with(|active| {
-                active.borrow_mut().pop();
-            });
-        }
-    }
-    ACTIVE.with(|active| active.borrow_mut().push(admit));
-    let _reset = Reset;
+    ACTIVE.with(|active| active.borrow_mut().push(ActiveAdmission::Scoped(admit)));
+    let _reset = ResetAdmission;
     operation()
 }
 
-pub(crate) fn admit_read_memory(bytes: usize) -> io::Result<()> {
+/// Like [`with_read_memory_admission`], but the admission returns a charge
+/// for each page. A page the read cache keeps is released from its charge at
+/// once, because the cache's own budget holds it; a page the cache does not
+/// keep carries the charge until its last holder drops it.
+#[doc(hidden)]
+pub fn with_read_page_charge<R>(admit: ChargingAdmission, operation: impl FnOnce() -> R) -> R {
+    ACTIVE.with(|active| active.borrow_mut().push(ActiveAdmission::Charging(admit)));
+    let _reset = ResetAdmission;
+    operation()
+}
+
+pub(crate) fn admit_read_memory(bytes: usize) -> io::Result<Option<ReadPageCharge>> {
     ACTIVE.with(|active| match active.borrow().last() {
-        Some(admit) => admit(bytes),
-        None => Ok(()),
+        Some(ActiveAdmission::Scoped(admit)) => admit(bytes).map(|()| None),
+        Some(ActiveAdmission::Charging(admit)) => admit(bytes).map(Some),
+        None => Ok(None),
     })
 }
 

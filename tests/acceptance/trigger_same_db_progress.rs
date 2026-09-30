@@ -588,11 +588,10 @@ fn t30_02_apply_changes_same_db_b2_waits_then_proceeds() {
         entered.wait(); // callback parked
         let mut done_guard = BarrierReleaseGuard::armed(done.clone());
 
-        // Thread B: apply_changes() must wait and proceed under same-DB B2.
-        // The same-DB B2 gate (assert_public_tx_control_callbacks_allowed) is
-        // walked regardless of changeset payload — an empty ChangeSet
-        // exercises the gate the same as a populated one (mirrors t30_09's
-        // Class A reentry probe shape).
+        // apply_changes() from another thread must wait for the active
+        // callback on this database and then proceed. Callback admission
+        // (assert_public_tx_control_callbacks_allowed) checks every changeset,
+        // including an empty ChangeSet, before applying its payload.
         let changes = ChangeSet::default();
         let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
         let db_b = db.clone();

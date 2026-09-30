@@ -8,6 +8,7 @@ pub(crate) struct StatusProbe {
     pub incarnation: Incarnation,
     #[serde(default)]
     pub checkpoint: Option<checkpoint::Checkpoint>,
+    pub refused_schema_unit_digests: Vec<[u8; 32]>,
 }
 
 pub(crate) fn probe(
@@ -42,6 +43,7 @@ pub(crate) fn probe(
     Ok(StatusProbe {
         incarnation,
         checkpoint,
+        refused_schema_unit_digests: Vec::new(),
     })
 }
 
@@ -83,6 +85,7 @@ impl StatusProbe {
                 MessageType::StatusRequest,
                 &crate::protocol::SyncStatusRequest {
                     incarnation: self.incarnation,
+                    refused_schema_unit_digests: self.refused_schema_unit_digests,
                 },
             )
         } else {

@@ -10,7 +10,12 @@ use std::hash::BuildHasherDefault;
 use std::hash::{Hash, Hasher};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Values larger than this are row bodies, not directory material.  A
+/// file-backed writer keeps their canonical bytes in Redb and retains only
+/// the columns needed to identify, authorize, index, and place the row.
+const MAX_INLINE_COMMITTED_VALUE_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
@@ -18,6 +23,13 @@ pub struct IndexEntry {
     pub created_tx: TxId,
     pub deleted_tx: Option<TxId>,
 }
+
+/// The charge model in `contextdb-core` sizes one posting list from this, and
+/// core cannot see this type. A change here that the charge does not follow
+/// would under-charge every index in the store, so it fails the build instead.
+const _: () = assert!(
+    std::mem::size_of::<IndexEntry>() * 4 + 114 <= contextdb_core::INDEX_POSTING_SLOT_BYTES
+);
 
 impl IndexEntry {
     pub fn visible_at(&self, snapshot: contextdb_core::SnapshotId) -> bool {
@@ -124,6 +136,11 @@ type RowPositionMaps = (
 );
 
 const EXACT_FILTER_WORDS: usize = 8192;
+/// The charge model in `contextdb-core` charges this filter with the table's
+/// schema and cannot see its size from here.
+const _: () = assert!(
+    EXACT_FILTER_WORDS * std::mem::size_of::<u64>() == contextdb_core::EXACT_PROBE_FILTER_BYTES
+);
 const EXACT_FILTER_BITS: u64 = (EXACT_FILTER_WORDS as u64) * 64;
 const EXACT_FILTER_MASK: u64 = EXACT_FILTER_BITS - 1;
 
@@ -260,10 +277,28 @@ pub struct IndexStorage {
     /// is maintained at insert time (I18).
     pub tree: BTreeMap<IndexKey, Vec<IndexEntry>>,
     exact: ExactMap,
-    exact_filter: Box<[u64; EXACT_FILTER_WORDS]>,
+    /// Present only on an index that files EXACT postings. Only such an index
+    /// ever marks or probes it, and an ordered index that allocated one anyway
+    /// held 64 KiB it could never read -- six of the ten indexes on one
+    /// cg-shaped `events` table, 393,216 B of it. Removing a retention is
+    /// better than charging it. What remains is allocated with the index and
+    /// charged with the index's declaration
+    /// (`IndexDecl::estimated_bytes`), so the charge and the allocation
+    /// happen at the same moment and a DROP gives back exactly what a CREATE
+    /// took.
+    exact_filter: Option<Box<[u64; EXACT_FILTER_WORDS]>>,
     exact_only: bool,
+    /// Automatic constraint indexes with identical declared keys share one
+    /// physical store. Keep that provenance separate from representation so
+    /// an ordered user index with the same columns is never mistaken for the
+    /// shared automatic store.
+    automatic: bool,
     current: MembershipImage,
     maintain_current: bool,
+    /// Whether `current` contains the complete live ordered membership.
+    /// Loaded automatic composites start tree-only until an accountant is
+    /// available, so opening them never creates an uncharged duplicate tree.
+    current_complete: bool,
 }
 
 /// A complete, already-indexed replacement for one table.  Received-schema
@@ -326,22 +361,36 @@ impl Default for IndexStorage {
 
 impl IndexStorage {
     pub fn new(columns: Vec<(String, SortDirection)>) -> Self {
-        Self::new_with_exact_only(columns, false)
+        Self::new_with_kind(columns, false, false)
     }
 
     pub fn new_exact_only(columns: Vec<(String, SortDirection)>) -> Self {
-        Self::new_with_exact_only(columns, true)
+        Self::new_with_kind(columns, true, true)
     }
 
-    fn new_with_exact_only(columns: Vec<(String, SortDirection)>, exact_only: bool) -> Self {
+    /// An automatic constraint index over a single column files EXACT
+    /// postings; `IndexDecl::is_exact_only` decides the same thing from the
+    /// declaration, and the charge model relies on the two agreeing.
+    fn new_automatic(columns: Vec<(String, SortDirection)>) -> Self {
+        let exact_only = columns.len() == 1;
+        Self::new_with_kind(columns, exact_only, true)
+    }
+
+    fn new_with_kind(
+        columns: Vec<(String, SortDirection)>,
+        exact_only: bool,
+        automatic: bool,
+    ) -> Self {
         Self {
             columns,
             tree: BTreeMap::new(),
             exact: ExactMap::default(),
-            exact_filter: Box::new([0; EXACT_FILTER_WORDS]),
+            exact_filter: exact_only.then(|| Box::new([0; EXACT_FILTER_WORDS])),
             exact_only,
+            automatic,
             current: MembershipImage::default(),
             maintain_current: true,
+            current_complete: true,
         }
     }
 
@@ -480,7 +529,8 @@ impl IndexStorage {
     }
 
     pub fn current_image(&self, snapshot: contextdb_core::SnapshotId) -> Option<&MembershipImage> {
-        (!self.exact_only && self.current.visible_at(snapshot)).then_some(&self.current)
+        (!self.exact_only && self.current_complete && self.current.visible_at(snapshot))
+            .then_some(&self.current)
     }
 
     pub fn admit_current(
@@ -488,9 +538,41 @@ impl IndexStorage {
         budget: Arc<dyn ReadMemoryBudget>,
     ) -> contextdb_core::Result<()> {
         if !self.exact_only {
-            self.current.admit(budget)?;
+            if self.current_complete {
+                self.current.admit(budget)?;
+            } else {
+                self.current = self.reconstruct_current(budget)?;
+                self.current_complete = true;
+                self.maintain_current = true;
+            }
         }
         Ok(())
+    }
+
+    fn current_for_preparation(
+        &self,
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) -> contextdb_core::Result<MembershipImage> {
+        if self.current_complete {
+            let mut current = self.current.clone();
+            current.admit(budget)?;
+            Ok(current)
+        } else {
+            self.reconstruct_current(budget)
+        }
+    }
+
+    fn reconstruct_current(
+        &self,
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) -> contextdb_core::Result<MembershipImage> {
+        let mut current = MembershipImage::with_budget(budget);
+        for (key, entries) in &self.tree {
+            for entry in entries {
+                current.insert(key, entry.clone())?;
+            }
+        }
+        Ok(current)
     }
 
     /// Both ordinary and bounded readers select the same physical image.
@@ -520,13 +602,21 @@ impl IndexStorage {
 
     fn mark_exact_filter(&mut self, hash: u64) {
         let ((word_a, bit_a), (word_b, bit_b)) = exact_filter_slots(hash);
-        self.exact_filter[word_a] |= bit_a;
-        self.exact_filter[word_b] |= bit_b;
+        let filter = self
+            .exact_filter
+            .get_or_insert_with(|| Box::new([0; EXACT_FILTER_WORDS]));
+        filter[word_a] |= bit_a;
+        filter[word_b] |= bit_b;
     }
 
     fn exact_filter_may_contain(&self, hash: u64) -> bool {
+        // No filter means no exact posting has ever been stored here, so
+        // nothing can be found; the probe is answered without touching the map.
+        let Some(filter) = self.exact_filter.as_ref() else {
+            return false;
+        };
         let ((word_a, bit_a), (word_b, bit_b)) = exact_filter_slots(hash);
-        (self.exact_filter[word_a] & bit_a) != 0 && (self.exact_filter[word_b] & bit_b) != 0
+        (filter[word_a] & bit_a) != 0 && (filter[word_b] & bit_b) != 0
     }
 }
 
@@ -628,13 +718,145 @@ pub struct RelationalStore {
     pub index_entries_touched: AtomicU64,
     retention_expiries: RwLock<HashMap<RetentionExpiryKey, RetentionExpiryOwner>>,
     next_row_id: AtomicU64,
+    disk_backed_committed_bodies: AtomicBool,
+}
+
+/// What an open store is holding, structure by structure, counted from the
+/// structures themselves -- lengths times element sizes, plus the heap each
+/// owned `String`/`Vec` allocated -- and never from the process's resident
+/// set. An allocator keeps a freed heap mapped and rounds every request up to
+/// a size class, so resident bytes over-state what is live and the slack is
+/// not something a charge model can be asked to predict. This is the bill a
+/// declared `MEMORY_LIMIT` has to cover.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedStructureBytes {
+    /// Every row version in `tables`, values and all.
+    pub row_versions: usize,
+    /// `row_positions`: one entry per live row, owning a copy of the table name.
+    pub row_positions: usize,
+    /// `row_version_positions`: one entry per row id, owning a copy of the
+    /// table name and a heap `Vec` of that row's version positions.
+    pub row_version_positions: usize,
+    /// `sync_source_lsns` and `sync_source_kinds` together.
+    pub sync_provenance: usize,
+    /// Every ordered index's `tree`, keys and postings.
+    pub index_trees: usize,
+    /// Every exact-only index's `exact` map, keys and postings.
+    pub index_exact: usize,
+    /// The fixed exact-probe filter each index allocates, whether or not the
+    /// index is one that ever reads it.
+    pub index_exact_filters: usize,
+    /// Every index's current membership image.
+    pub index_membership: usize,
+}
+
+impl RetainedStructureBytes {
+    pub fn total(&self) -> usize {
+        self.row_versions
+            .saturating_add(self.row_positions)
+            .saturating_add(self.row_version_positions)
+            .saturating_add(self.sync_provenance)
+            .saturating_add(self.index_trees)
+            .saturating_add(self.index_exact)
+            .saturating_add(self.index_exact_filters)
+            .saturating_add(self.index_membership)
+    }
+}
+
+/// The allocation a `HashMap` of `len` entries holds: hashbrown rounds the
+/// bucket count up to a power of two and keeps one control byte per bucket.
+fn hash_table_bytes<K, V>(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let buckets = len.saturating_mul(8).div_ceil(7).next_power_of_two().max(8);
+    buckets.saturating_mul(std::mem::size_of::<(K, V)>() + 1)
+}
+
+/// What a `BTreeMap` entry occupies: its key and value slots, plus the share
+/// of the node header and child-pointer array the slot carries. A node holds
+/// up to eleven pairs and splits at half full, so the header is spread over
+/// six slots rather than eleven.
+fn btree_entry_bytes<K, V>() -> usize {
+    std::mem::size_of::<K>() + std::mem::size_of::<V>() + 16
+}
+
+fn index_key_heap_bytes(key: &IndexKey) -> usize {
+    key.iter().fold(
+        key.capacity()
+            .saturating_mul(std::mem::size_of::<DirectedValue>()),
+        |bytes, value| {
+            let value = match value {
+                DirectedValue::Asc(v) => &v.0,
+                DirectedValue::Desc(v) => &v.0,
+            };
+            bytes.saturating_add(value.estimated_bytes())
+        },
+    )
+}
+
+fn postings_heap_bytes(postings: &[IndexEntry]) -> usize {
+    postings
+        .len()
+        .max(4)
+        .saturating_mul(std::mem::size_of::<IndexEntry>())
+}
+
+fn row_version_heap_bytes(row: &VersionedRow) -> usize {
+    row.values.iter().fold(
+        hash_table_bytes::<contextdb_core::ColName, Value>(row.values.len()),
+        |bytes, (column, value)| {
+            bytes
+                .saturating_add(column.len())
+                .saturating_add(value.estimated_bytes())
+        },
+    )
+}
+
+impl IndexStorage {
+    /// What this index is holding, counted from its own structures.
+    fn retained_structure_bytes(&self, into: &mut RetainedStructureBytes) {
+        into.index_exact_filters = into.index_exact_filters.saturating_add(
+            self.exact_filter
+                .as_ref()
+                .map_or(0, |filter| std::mem::size_of_val(filter.as_ref())),
+        );
+        for (key, postings) in &self.tree {
+            into.index_trees = into
+                .index_trees
+                .saturating_add(btree_entry_bytes::<IndexKey, Vec<IndexEntry>>())
+                .saturating_add(index_key_heap_bytes(key))
+                .saturating_add(postings_heap_bytes(postings));
+        }
+        into.index_exact = into
+            .index_exact
+            .saturating_add(hash_table_bytes::<u64, Vec<ExactBucket>>(self.exact.len()));
+        for buckets in self.exact.values() {
+            into.index_exact = into.index_exact.saturating_add(
+                buckets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ExactBucket>()),
+            );
+            for bucket in buckets {
+                into.index_exact = into
+                    .index_exact
+                    .saturating_add(index_key_heap_bytes(&bucket.key))
+                    .saturating_add(postings_heap_bytes(&bucket.postings));
+            }
+        }
+        into.index_membership = into
+            .index_membership
+            .saturating_add(self.current.counted_bytes());
+    }
 }
 
 /// Prepared current roots. The engine owns the commit gate between preparation
 /// and publication, alongside its prepared vector and durable row changes.
 pub struct PreparedMembershipBatch {
     _capture_preparation: MembershipCapturePreparation,
-    roots: Vec<(TableName, String, MembershipImage)>,
+    /// New root plus the complete predecessor retained for readers that
+    /// registered while preparation was in flight.
+    roots: Vec<(TableName, String, MembershipImage, MembershipImage)>,
     _credit: ReadCredit,
 }
 
@@ -662,7 +884,175 @@ impl RelationalStore {
             retention_expiries: RwLock::new(HashMap::new()),
             membership_captures: Arc::new(Mutex::new(MembershipCaptures::default())),
             next_row_id: AtomicU64::new(1),
+            disk_backed_committed_bodies: AtomicBool::new(false),
         }
+    }
+
+    /// File-backed stores call this before loading or publishing rows.  It is
+    /// deliberately an internal storage choice: SQL values remain canonical
+    /// in Redb and callers must hydrate bodies through the engine.
+    pub fn enable_disk_backed_committed_bodies(&self) {
+        self.disk_backed_committed_bodies
+            .store(true, Ordering::Release);
+    }
+
+    pub fn uses_disk_backed_committed_bodies(&self) -> bool {
+        self.disk_backed_committed_bodies.load(Ordering::Acquire)
+    }
+
+    fn committed_directory_row_for_meta(
+        disk_backed: bool,
+        meta: Option<&TableMeta>,
+        row: &VersionedRow,
+    ) -> VersionedRow {
+        if !disk_backed {
+            return row.clone();
+        }
+        let required = Self::resident_required_columns(meta);
+        let values = row
+            .values
+            .iter()
+            .filter(|(column, value)| {
+                required.contains(*column)
+                    || match value {
+                        Value::Vector(_) => false,
+                        Value::Text(value) => value.len() <= MAX_INLINE_COMMITTED_VALUE_BYTES,
+                        Value::Json(value) => {
+                            value.to_string().len() <= MAX_INLINE_COMMITTED_VALUE_BYTES
+                        }
+                        _ => true,
+                    }
+            })
+            .map(|(column, value)| (column.clone(), value.clone()))
+            .collect();
+        VersionedRow {
+            row_id: row.row_id,
+            values,
+            created_tx: row.created_tx,
+            deleted_tx: row.deleted_tx,
+            lsn: row.lsn,
+            created_at: row.created_at,
+        }
+    }
+
+    /// Columns a disk-backed store keeps resident whatever their size: the
+    /// ones keys, indexes, constraints and read policy consult without a
+    /// Redb read.
+    fn resident_required_columns(meta: Option<&TableMeta>) -> HashSet<String> {
+        let mut required = HashSet::<String>::new();
+        if let Some(meta) = meta {
+            for index in &meta.indexes {
+                required.extend(index.columns.iter().map(|(column, _)| column.clone()));
+            }
+            required.extend(meta.primary_key_columns.iter().cloned());
+            required.extend(meta.unique_constraints.iter().flatten().cloned());
+            required.extend(meta.natural_key_column.iter().cloned());
+            required.extend(meta.expires_column.iter().cloned());
+            if let Some(state_machine) = &meta.state_machine {
+                required.insert(state_machine.column.clone());
+            }
+            for column in &meta.columns {
+                if column.primary_key
+                    || column.unique
+                    || column.context_id
+                    || column.scope_label.is_some()
+                    || column.acl_ref.is_some()
+                    || column.expires
+                    || column.references.is_some()
+                {
+                    required.insert(column.name.clone());
+                }
+                if let Some(columns) = &column.partition_key_columns {
+                    required.extend(columns.iter().cloned());
+                }
+            }
+            for foreign_key in &meta.composite_foreign_keys {
+                required.extend(foreign_key.child_columns.iter().cloned());
+            }
+        }
+        required
+    }
+
+    /// Whether a resident committed row may be missing a column its durable
+    /// Redb body carries. A disk-backed store sheds large text/JSON values and
+    /// vectors from the resident directory; a caller that must hand on every
+    /// committed column (sync changesets, custody digests) reads the durable
+    /// version when this answers `true`. A declared column absent from the
+    /// resident row and not kept resident by [`Self::resident_required_columns`]
+    /// is the only sign: the shed value's size is no longer known here.
+    pub fn committed_row_may_omit_columns(&self, meta: &TableMeta, row: &VersionedRow) -> bool {
+        if !self.uses_disk_backed_committed_bodies() {
+            return false;
+        }
+        let required = Self::resident_required_columns(Some(meta));
+        meta.columns.iter().any(|column| {
+            !row.values.contains_key(&column.name) && !required.contains(&column.name)
+        })
+    }
+
+    fn committed_directory_row(&self, table: &str, row: &VersionedRow) -> VersionedRow {
+        let meta = self.table_meta.read().get(table).cloned();
+        Self::committed_directory_row_for_meta(
+            self.uses_disk_backed_committed_bodies(),
+            meta.as_ref(),
+            row,
+        )
+    }
+
+    fn compact_projection_rows(
+        disk_backed: bool,
+        meta: &TableMeta,
+        rows: Vec<VersionedRow>,
+    ) -> Vec<VersionedRow> {
+        if !disk_backed {
+            return rows;
+        }
+        rows.into_iter()
+            .map(|row| Self::committed_directory_row_for_meta(true, Some(meta), &row))
+            .collect()
+    }
+
+    /// Bytes retained after a durable commit, used by the engine to return
+    /// the admitted body allocation once Redb owns the canonical row.
+    pub fn committed_directory_estimated_bytes(&self, table: &str, row: &VersionedRow) -> usize {
+        self.committed_directory_row(table, row).estimated_bytes()
+    }
+
+    /// Resident bytes for a row published with projected metadata. This is
+    /// used before that metadata becomes visible, so it cannot consult the
+    /// store's current table declaration.
+    pub fn committed_projection_estimated_bytes(
+        &self,
+        meta: &TableMeta,
+        row: &VersionedRow,
+    ) -> usize {
+        Self::committed_directory_row_for_meta(
+            self.uses_disk_backed_committed_bodies(),
+            Some(meta),
+            row,
+        )
+        .estimated_bytes()
+    }
+
+    pub fn committed_projection_values(
+        &self,
+        meta: &TableMeta,
+        row: &VersionedRow,
+    ) -> HashMap<String, Value> {
+        Self::committed_directory_row_for_meta(
+            self.uses_disk_backed_committed_bodies(),
+            Some(meta),
+            row,
+        )
+        .values
+    }
+
+    pub fn committed_directory_values(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+    ) -> HashMap<String, Value> {
+        self.committed_directory_row(table, row).values
     }
 
     pub fn begin_membership_capture(&self) -> MembershipCaptureGuard {
@@ -756,9 +1146,12 @@ impl RelationalStore {
                     if !storage.exact_only {
                         root_count += 1;
                         root_bytes = root_bytes
-                            .saturating_add(
-                                std::mem::size_of::<(TableName, String, MembershipImage)>(),
-                            )
+                            .saturating_add(std::mem::size_of::<(
+                                TableName,
+                                String,
+                                MembershipImage,
+                                MembershipImage,
+                            )>())
                             .saturating_add(table.len())
                             .saturating_add(name.len());
                     }
@@ -775,8 +1168,8 @@ impl RelationalStore {
                 if storage.exact_only {
                     continue;
                 }
-                let mut image = storage.current.clone();
-                image.admit(budget.clone())?;
+                let old = storage.current_for_preparation(budget.clone())?;
+                let mut image = old.clone();
                 for (deleted_table, row_id, tx) in deletes {
                     if deleted_table != table {
                         continue;
@@ -805,7 +1198,7 @@ impl RelationalStore {
                         },
                     )?;
                 }
-                roots.push((table.to_owned(), name.clone(), image));
+                roots.push((table.to_owned(), name.clone(), image, old));
             }
         }
         // Retain before durability even if no reader has started yet: one
@@ -814,8 +1207,7 @@ impl RelationalStore {
         let capture_preparation = MembershipCapturePreparation(self.membership_captures.clone());
         {
             let mut captures = self.membership_captures.lock();
-            for (table, name, _) in &roots {
-                let old = &indexes[table][name].current;
+            for (table, name, _, old) in &roots {
                 // New maps allocate spare buckets and a full B-tree node.
                 // Reserve that capacity before retaining the first root too.
                 let credit = membership_credit(
@@ -857,7 +1249,7 @@ impl RelationalStore {
     ) {
         {
             let mut indexes = self.indexes.write();
-            for (table, name, _) in &prepared.roots {
+            for (table, name, _, _) in &prepared.roots {
                 indexes
                     .get_mut(table)
                     .and_then(|indexes| indexes.get_mut(name))
@@ -871,13 +1263,14 @@ impl RelationalStore {
 
     pub fn publish_memberships(&self, prepared: PreparedMembershipBatch) {
         let mut indexes = self.indexes.write();
-        for (table, name, image) in prepared.roots {
+        for (table, name, image, _) in prepared.roots {
             let storage = indexes
                 .get_mut(&table)
                 .and_then(|indexes| indexes.get_mut(&name))
                 .expect("prepared index remains under commit gate");
             storage.current = image;
             storage.maintain_current = true;
+            storage.current_complete = true;
         }
     }
 
@@ -1255,6 +1648,32 @@ impl RelationalStore {
             .collect()
     }
 
+    /// Copy provenance only for tables in a received-schema replacement.
+    /// Selection happens while the source maps are borrowed, so an unrelated
+    /// table's sidecars never enter the temporary image.
+    pub fn sync_source_sidecars_for_tables(
+        &self,
+        tables: &HashSet<TableName>,
+    ) -> HashMap<(TableName, RowId), (Lsn, SyncSourceKind)> {
+        let lsns = self.sync_source_lsns.read();
+        let kinds = self.sync_source_kinds.read();
+        tables
+            .iter()
+            .filter_map(|table| {
+                lsns.get(table)
+                    .map(|by_row| (table, by_row, kinds.get(table)))
+            })
+            .flat_map(|(table, by_row, kinds)| {
+                by_row.iter().filter_map(move |(row_id, lsn)| {
+                    kinds
+                        .and_then(|by_row| by_row.get(row_id))
+                        .copied()
+                        .map(|kind| ((table.clone(), *row_id), (*lsn, kind)))
+                })
+            })
+            .collect()
+    }
+
     pub fn set_sync_source_lsns(&self, entries: impl IntoIterator<Item = (TableName, RowId, Lsn)>) {
         let mut source_lsns = self.sync_source_lsns.write();
         for (table, row_id, lsn) in entries {
@@ -1385,7 +1804,7 @@ impl RelationalStore {
                 .entry((table_name.clone(), row_id))
                 .or_default()
                 .push(row_position);
-            rows.push(row);
+            rows.push(self.committed_directory_row(&table_name, &row));
         }
         if visits > 0 {
             self.bump_index_maintenance_visits(visits);
@@ -1505,7 +1924,7 @@ impl RelationalStore {
             .entry((name.to_string(), row.row_id))
             .or_default()
             .push(row_position);
-        rows.push(row);
+        rows.push(self.committed_directory_row(name, &row));
         Ok(())
     }
 
@@ -1593,6 +2012,34 @@ impl RelationalStore {
         let position = *positions.get(candidate_count.checked_sub(1)?)?;
         rows.get(position)
             .filter(|row| row.row_id == row_id && row.visible_at(snapshot))
+            .cloned()
+    }
+
+    /// Resolve one change-log row without walking the table. Prefer the exact
+    /// local LSN and retain the historical latest-version fallback used when
+    /// compacted logs outlive their exact row version.
+    pub fn row_by_id_at_lsn_or_latest(
+        &self,
+        table: &str,
+        row_id: RowId,
+        lsn: Lsn,
+    ) -> Option<VersionedRow> {
+        let tables = self.tables.read();
+        let rows = tables.get(table)?;
+        let version_positions = self.row_version_positions.read();
+        let positions = version_positions.get(&(table.to_string(), row_id))?;
+        positions
+            .iter()
+            .rev()
+            .filter_map(|position| rows.get(*position))
+            .find(|row| row.row_id == row_id && row.lsn == lsn)
+            .or_else(|| {
+                positions
+                    .iter()
+                    .rev()
+                    .filter_map(|position| rows.get(*position))
+                    .find(|row| row.row_id == row_id)
+            })
             .cloned()
     }
 
@@ -1916,26 +2363,63 @@ impl RelationalStore {
             .insert(name.to_owned(), storage);
     }
 
+    /// Register storage for an automatically generated constraint index.
+    /// Single-column constraints retain the exact hash representation;
+    /// composite PK/FK/unique constraints retain an ordered tree so their
+    /// contiguous prefixes are seekable.
     pub fn create_exact_index_storage(
         &self,
         table: &str,
         name: &str,
         columns: Vec<(String, SortDirection)>,
     ) {
+        self.create_auto_index_storage_inner(table, name, columns, None);
+    }
+
+    pub fn create_auto_index_storage_with_budget(
+        &self,
+        table: &str,
+        name: &str,
+        columns: Vec<(String, SortDirection)>,
+        budget: Arc<dyn ReadMemoryBudget>,
+    ) {
+        self.create_auto_index_storage_inner(table, name, columns, Some(budget));
+    }
+
+    fn create_auto_index_storage_inner(
+        &self,
+        table: &str,
+        name: &str,
+        columns: Vec<(String, SortDirection)>,
+        budget: Option<Arc<dyn ReadMemoryBudget>>,
+    ) {
+        let exact_only = columns.len() == 1;
         let mut indexes = self.indexes.write();
         let table_indexes = indexes.entry(table.to_string()).or_default();
         if table_indexes.iter().any(|(existing_name, storage)| {
-            existing_name != name && storage.exact_only() && storage.columns == columns
+            existing_name != name && storage.automatic && storage.columns == columns
         }) {
             return;
         }
         if let Some(existing) = table_indexes.get(name) {
-            if existing.exact_only() && existing.columns == columns {
+            if existing.exact_only() == exact_only && existing.columns == columns {
                 return;
             }
             return;
         }
-        table_indexes.insert(name.to_string(), IndexStorage::new_exact_only(columns));
+        let mut storage = IndexStorage::new_automatic(columns);
+        if !exact_only {
+            if let Some(budget) = budget {
+                storage.current = MembershipImage::with_budget(budget);
+            } else {
+                // Database loading has no accountant at this API boundary.
+                // Keep only the row-charged ordered tree; a bounded reader or
+                // the first publication reconstructs a charged current root.
+                storage.maintain_current = false;
+                storage.current_complete = false;
+            }
+        }
+        table_indexes.insert(name.to_string(), storage);
     }
 
     /// Remove an index storage. Called from DROP INDEX / CASCADE.
@@ -1967,14 +2451,15 @@ impl RelationalStore {
             return;
         };
         let columns = existing.columns.clone();
-        let mut rebuilt = if existing.exact_only() {
-            IndexStorage::new_exact_only(columns.clone())
-        } else {
-            IndexStorage::new(columns.clone())
-        };
+        let mut rebuilt =
+            IndexStorage::new_with_kind(columns.clone(), existing.exact_only, existing.automatic);
         if preserve_current {
             rebuilt.current = existing.current.clone();
             rebuilt.maintain_current = false;
+            rebuilt.current_complete = existing.current_complete;
+        } else if !existing.current_complete {
+            rebuilt.maintain_current = false;
+            rebuilt.current_complete = false;
         }
         let tables = self.tables.read();
         if let Some(rows) = tables.get(table) {
@@ -1992,7 +2477,7 @@ impl RelationalStore {
                 );
             }
         }
-        rebuilt.maintain_current = true;
+        rebuilt.maintain_current = rebuilt.current_complete;
         table_indexes.insert(name.to_string(), rebuilt);
     }
 
@@ -2021,21 +2506,25 @@ impl RelationalStore {
         budget: Option<Arc<dyn ReadMemoryBudget>>,
     ) -> contextdb_core::Result<HashMap<String, IndexStorage>> {
         let mut indexes = HashMap::new();
+        let mut automatic_columns = Vec::<Vec<(String, SortDirection)>>::new();
         for decl in &meta.indexes {
             // Match create_exact_index_storage: duplicate auto constraint
             // indexes with identical keys deliberately share no second
             // physical store.
             if decl.kind == IndexKind::Auto
-                && indexes.values().any(|storage: &IndexStorage| {
-                    storage.exact_only() && storage.columns == decl.columns
-                })
+                && automatic_columns
+                    .iter()
+                    .any(|columns| columns == &decl.columns)
             {
                 continue;
             }
             let mut storage = match decl.kind {
-                IndexKind::Auto => IndexStorage::new_exact_only(decl.columns.clone()),
+                IndexKind::Auto => IndexStorage::new_automatic(decl.columns.clone()),
                 IndexKind::UserDeclared => IndexStorage::new(decl.columns.clone()),
             };
+            if decl.kind == IndexKind::Auto {
+                automatic_columns.push(decl.columns.clone());
+            }
             if let Some(budget) = &budget {
                 storage.current = MembershipImage::with_budget(budget.clone());
             }
@@ -2143,6 +2632,14 @@ impl RelationalStore {
                 (table.clone(), Self::projected_index_storage(meta, rows))
             })
             .collect();
+        if self.uses_disk_backed_committed_bodies() {
+            for (table, rows) in &mut tables {
+                if let Some(meta) = table_meta.get(table) {
+                    let full_rows = std::mem::take(rows);
+                    *rows = Self::compact_projection_rows(true, meta, full_rows);
+                }
+            }
+        }
         let (row_positions, row_version_positions) = Self::position_maps_for_tables(&tables);
         PreparedRelationalPublication {
             tables,
@@ -2202,7 +2699,12 @@ impl RelationalStore {
         let mut version_positions = self.row_version_positions.write();
         for projection in projections {
             let table = projection.table;
-            tables.insert(table.clone(), projection.rows);
+            let rows = Self::compact_projection_rows(
+                self.uses_disk_backed_committed_bodies(),
+                &projection.meta,
+                projection.rows,
+            );
+            tables.insert(table.clone(), rows);
             table_meta.insert(table.clone(), projection.meta);
             all_indexes.insert(table.clone(), projection.indexes);
             positions.retain(|(entry_table, _), _| entry_table != &table);
@@ -2216,6 +2718,79 @@ impl RelationalStore {
                 );
             }
         }
+    }
+
+    /// Publish one received-schema dependency closure under the same lock
+    /// order as the complete-image path. Sync provenance belongs to each
+    /// selected table, and dropped members disappear in this same memory
+    /// publication after their durable transaction has committed.
+    pub fn publish_received_table_projections(
+        &self,
+        projections: Vec<TableProjection>,
+        dropped: &std::collections::HashSet<String>,
+    ) {
+        if projections.is_empty() && dropped.is_empty() {
+            return;
+        }
+        let mut all_indexes = self.indexes.write();
+        let mut tables = self.tables.write();
+        let mut table_meta = self.table_meta.write();
+        let mut positions = self.row_positions.write();
+        let mut version_positions = self.row_version_positions.write();
+        let mut source_lsns = self.sync_source_lsns.write();
+        let mut source_kinds = self.sync_source_kinds.write();
+        for table in dropped {
+            all_indexes.remove(table);
+            tables.remove(table);
+            table_meta.remove(table);
+            positions.retain(|(entry_table, _), _| entry_table != table);
+            version_positions.retain(|(entry_table, _), _| entry_table != table);
+            source_lsns.remove(table);
+            source_kinds.remove(table);
+        }
+        for projection in projections {
+            let table = projection.table;
+            let rows = Self::compact_projection_rows(
+                self.uses_disk_backed_committed_bodies(),
+                &projection.meta,
+                projection.rows,
+            );
+            tables.insert(table.clone(), rows);
+            table_meta.insert(table.clone(), projection.meta);
+            all_indexes.insert(table.clone(), projection.indexes);
+            positions.retain(|(entry_table, _), _| entry_table != &table);
+            version_positions.retain(|(entry_table, _), _| entry_table != &table);
+            Self::rebuild_position_maps_for_table(
+                &table,
+                tables.get(&table).expect("published table exists"),
+                &mut positions,
+                &mut version_positions,
+            );
+            source_lsns.insert(
+                table.clone(),
+                projection
+                    .sync_sources
+                    .iter()
+                    .map(|(row, lsn, _)| (*row, *lsn))
+                    .collect(),
+            );
+            source_kinds.insert(
+                table,
+                projection
+                    .sync_sources
+                    .into_iter()
+                    .map(|(row, _, kind)| (row, kind))
+                    .collect(),
+            );
+        }
+        self.retention_expiries
+            .write()
+            .retain(|(table, row, created), _| {
+                tables.get(table).is_some_and(|rows| {
+                    rows.iter()
+                        .any(|entry| entry.row_id == *row && entry.created_tx == *created)
+                })
+            });
     }
 
     /// Replace one table's rows, metadata and physical indexes as one
@@ -2239,6 +2814,8 @@ impl RelationalStore {
         if !table_meta.contains_key(table) {
             return false;
         }
+        let rows =
+            Self::compact_projection_rows(self.uses_disk_backed_committed_bodies(), &meta, rows);
         tables.insert(table.to_string(), rows);
         table_meta.insert(table.to_string(), meta);
         all_indexes.insert(table.to_string(), indexes);
@@ -2452,6 +3029,154 @@ impl RelationalStore {
         names
     }
 
+    /// What the indexes of ONE table are holding right now, counted from their
+    /// own structures and WITHOUT the fixed exact-probe bitmap, and how many
+    /// indexes that is.
+    ///
+    /// `retained_structure_bytes` answers for the whole store, which cannot say
+    /// what one more index on one table would cost. A consumer pricing a shape
+    /// change before it happens needs exactly that: an index's postings are only
+    /// part of it -- its tree's owned keys and its current membership image are
+    /// admitted by this store when the index is built, outside whatever the
+    /// caller reserved for the postings.
+    ///
+    /// The exact-probe bitmap is left out on purpose, and `TableMeta` owns it
+    /// instead through `exact_probe_filter_bytes`. The two are multiplied by
+    /// different things: an exact-only index allocates exactly one bitmap and a
+    /// user-declared index allocates none, so averaging the bitmap over a
+    /// table's existing indexes charges an arriving user-declared index 64 KiB
+    /// it will never hold, and charges an arriving exact-only one a second copy
+    /// of the bitmap its own metadata already carries.
+    pub fn table_index_structure_bytes(&self, table: &str) -> (usize, usize) {
+        let indexes = self.indexes.read();
+        let Some(table_indexes) = indexes.get(table) else {
+            return (0, 0);
+        };
+        let mut bytes = RetainedStructureBytes::default();
+        for index in table_indexes.values() {
+            index.retained_structure_bytes(&mut bytes);
+        }
+        (
+            bytes
+                .index_trees
+                .saturating_add(bytes.index_exact)
+                .saturating_add(bytes.index_membership),
+            table_indexes.len(),
+        )
+    }
+
+    /// What this store is holding right now, counted from its own structures.
+    /// A declared `MEMORY_LIMIT` is kept only if the accountant's total covers
+    /// this number, so a retention audit reads it back instead of trusting the
+    /// ledger.
+    pub fn retained_structure_bytes(&self) -> RetainedStructureBytes {
+        let mut bytes = RetainedStructureBytes::default();
+        {
+            let tables = self.tables.read();
+            bytes.row_versions = tables.iter().fold(
+                hash_table_bytes::<TableName, Vec<VersionedRow>>(tables.len()),
+                |total, (name, rows)| {
+                    rows.iter().fold(
+                        total.saturating_add(name.len()).saturating_add(
+                            rows.capacity()
+                                .saturating_mul(std::mem::size_of::<VersionedRow>()),
+                        ),
+                        |total, row| total.saturating_add(row_version_heap_bytes(row)),
+                    )
+                },
+            );
+        }
+        {
+            let positions = self.row_positions.read();
+            bytes.row_positions = positions.keys().fold(
+                hash_table_bytes::<(TableName, RowId), usize>(positions.len()),
+                |total, (table, _)| total.saturating_add(table.len()),
+            );
+        }
+        {
+            let versions = self.row_version_positions.read();
+            bytes.row_version_positions = versions.iter().fold(
+                hash_table_bytes::<(TableName, RowId), Vec<usize>>(versions.len()),
+                |total, ((table, _), positions)| {
+                    total.saturating_add(table.len()).saturating_add(
+                        positions
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<usize>()),
+                    )
+                },
+            );
+        }
+        {
+            let lsns = self.sync_source_lsns.read();
+            let kinds = self.sync_source_kinds.read();
+            bytes.sync_provenance = lsns
+                .iter()
+                .fold(
+                    hash_table_bytes::<TableName, HashMap<RowId, Lsn>>(lsns.len()),
+                    |total, (table, rows)| {
+                        total
+                            .saturating_add(table.len())
+                            .saturating_add(hash_table_bytes::<RowId, Lsn>(rows.len()))
+                    },
+                )
+                .saturating_add(kinds.iter().fold(
+                    hash_table_bytes::<TableName, HashMap<RowId, SyncSourceKind>>(kinds.len()),
+                    |total, (table, rows)| {
+                        total
+                            .saturating_add(table.len())
+                            .saturating_add(hash_table_bytes::<RowId, SyncSourceKind>(rows.len()))
+                    },
+                ));
+        }
+        for indexes in self.indexes.read().values() {
+            for index in indexes.values() {
+                index.retained_structure_bytes(&mut bytes);
+            }
+        }
+        bytes
+    }
+
+    /// Actual credits held by current and captured membership owners. This
+    /// differs from the physical inventory when an image has no budget.
+    #[doc(hidden)]
+    pub fn membership_held_charge_bytes_for_test(&self) -> (usize, usize) {
+        let mut seen = std::collections::HashSet::new();
+        let current = self.indexes.read().values().fold(0usize, |bytes, indexes| {
+            indexes.values().fold(bytes, |bytes, index| {
+                bytes.saturating_add(index.current.held_charge_bytes_for_test(&mut seen))
+            })
+        });
+        let captures = self.membership_captures.lock();
+        let captured = captures.roots.values().fold(0usize, |bytes, indexes| {
+            indexes.values().fold(bytes, |bytes, roots| {
+                roots.values().fold(bytes, |bytes, root| {
+                    bytes
+                        .saturating_add(root._credit.bytes_for_test())
+                        .saturating_add(root.image.held_charge_bytes_for_test(&mut seen))
+                })
+            })
+        });
+        (current, captured)
+    }
+
+    /// Attribute current membership credits to their owning table.
+    #[doc(hidden)]
+    pub fn membership_held_charge_by_table_for_test(
+        &self,
+    ) -> std::collections::BTreeMap<String, usize> {
+        let mut seen = std::collections::HashSet::new();
+        self.indexes
+            .read()
+            .iter()
+            .map(|(table, indexes)| {
+                let bytes = indexes.values().fold(0usize, |bytes, index| {
+                    bytes.saturating_add(index.current.held_charge_bytes_for_test(&mut seen))
+                });
+                (table.clone(), bytes)
+            })
+            .collect()
+    }
+
     pub fn table_meta(&self, name: &str) -> Option<TableMeta> {
         self.table_meta.read().get(name).cloned()
     }
@@ -2576,6 +3301,22 @@ mod tests {
             .expect("latest-row map must point at the live version");
         assert_eq!(
             current.values.get("label"),
+            Some(&Value::Text("live".to_string()))
+        );
+
+        let exact = store
+            .row_by_id_at_lsn_or_latest("items", RowId(1), Lsn(2))
+            .expect("change-log lookup must resolve the exact retained version");
+        assert_eq!(
+            exact.values.get("label"),
+            Some(&Value::Text("old".to_string()))
+        );
+
+        let fallback = store
+            .row_by_id_at_lsn_or_latest("items", RowId(1), Lsn(99))
+            .expect("a compacted exact version must fall back to the latest retained version");
+        assert_eq!(
+            fallback.values.get("label"),
             Some(&Value::Text("live".to_string()))
         );
     }

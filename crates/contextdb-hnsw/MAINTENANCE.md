@@ -13,7 +13,7 @@ metadata outside the source-only upstream diff below.
 
 ## Why the fork exists
 
-ContextDB needs four things upstream does not provide:
+ContextDB needs five things upstream does not provide:
 
 - **Deterministic builds.** Rebuilding a graph from the same points must produce the same topology,
   which needs a caller-provided seed for the level-assignment RNG.
@@ -23,14 +23,20 @@ ContextDB needs four things upstream does not provide:
   it as a read-only graph, without the file-oriented dump format and without re-inserting vectors.
 - **Bounded filtered search.** A search over an allowed-id set must charge work only for admitted
   nodes and stop at hard visit/distance limits, so a sparse filter cannot turn into a walk of the
-  whole bottom layer.
+  whole bottom layer. Navigation through an excluded point happens only where the
+  filter actually broke the graph: a second hop is taken through a neighbour the filter refused,
+  never through one it admitted. A layer whose frontier dies before it has spent that
+  breadth, while admitted points it never reached remain, reports itself incomplete rather than
+  publishing the points it happened to enter through.
+- **Source-driven saved-graph search.** An immutable graph reader needs one neighbour's identity
+  without copying an adjacency list, so resident and paged F32 graphs use the same bounded walk.
 
 [upstream-0.3.4.patch](upstream-0.3.4.patch) is the complete source-only delta against that exact
 package:
 
 | Changed source | Reason |
 |---|---|
-| `src/hnsw.rs` | Seeded `new_with_seed` constructors on `LayerGenerator`, `PointIndexation`, and `Hnsw`; empty-graph point iteration; `with_point_data` and read-only getters; the owned read-only `LoadedHnsw`; `search_with_bounded_control` and `search_allowed_with_bounded_control` with `HnswAllowedSearchLimits` and their typed status/result/error types; `insert_slice_with_point_id` returning the physical point identity. |
+| `src/hnsw.rs` | Seeded `new_with_seed` constructors on `LayerGenerator`, `PointIndexation`, and `Hnsw`; empty-graph point iteration; `with_point_data`, `neighbour_identity`, and read-only getters; the owned read-only `LoadedHnsw`; `search_with_bounded_control` and `search_allowed_with_bounded_control` with `HnswAllowedSearchLimits` and their typed status/result/error types, where the bounded search scores its entry point once during descent and carries that distance into its level-zero walk; `insert_slice_with_point_id` returning the physical point identity. |
 | `src/hnswio.rs` | `encode_owned_graph`, `encode_owned_graph_into`, and `decode_owned_graph` for the owned graph representation, which validates every edge and returns an error for malformed bytes; `load_hnsw_owned` and `load_hnsw_owned_with_dist`; loaded points own shared handles to their memory mapping. |
 | `src/lib.rs` | Allow four upstream clippy lints so the workspace's strict lint gate passes on unchanged upstream code. |
 | `src/api.rs`, `src/datamap.rs`, `src/filter.rs`, `src/flatten.rs`, `src/libext.rs` | Trailing whitespace removed from doc comments; no code change. |
@@ -51,7 +57,7 @@ paths = sorted({p.relative_to(upstream) for p in (upstream / 'src').rglob('*') i
 for path in paths:
     before = (upstream / path).read_text().splitlines(True) if (upstream / path).exists() else []
     after = (fork / path).read_text().splitlines(True) if (fork / path).exists() else []
-    sys.stdout.writelines(difflib.unified_diff(before, after,
+    sys.stdout.writelines(difflib.unified_diff(before, after, n=0,
         fromfile=f'a/{path}' if (upstream / path).exists() else '/dev/null',
         tofile=f'b/{path}' if (fork / path).exists() else '/dev/null'))
 PY
@@ -74,6 +80,7 @@ once an upstream release carries it:
 2. Non-panicking iteration over a graph with no points.
 3. An owned, validated graph encoding with a read-only loaded graph.
 4. Allowed-set search with hard visit/distance limits and typed incomplete results.
+5. Read-only access to one neighbour identity for a shared saved-graph walk.
 
-The fork can be retired only when upstream carries all four; until then, deleting it breaks vector
+The fork can be retired only when upstream carries all five; until then, deleting it breaks vector
 search. None of these proposals has been submitted upstream.

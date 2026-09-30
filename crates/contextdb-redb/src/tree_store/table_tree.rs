@@ -34,6 +34,18 @@ impl PageListMut {
             .copy_from_slice(&value.to_le_bytes());
     }
 
+    pub(crate) fn pop_back(&mut self) -> Option<PageNumber> {
+        let len = u16::from_le_bytes(self.data[..size_of::<u16>()].try_into().unwrap());
+        let remaining = len.checked_sub(1)?;
+        self.data[..size_of::<u16>()].copy_from_slice(&remaining.to_le_bytes());
+        let start = size_of::<u16>() + PageNumber::serialized_size() * usize::from(remaining);
+        Some(PageNumber::from_le_bytes(
+            self.data[start..start + PageNumber::serialized_size()]
+                .try_into()
+                .unwrap(),
+        ))
+    }
+
     pub(crate) fn clear(&mut self) {
         self.data[..size_of::<u16>()].fill(0);
     }
@@ -70,6 +82,14 @@ pub(crate) struct TableTree {
 }
 
 impl TableTree {
+    pub(crate) fn root(&self) -> Option<BtreeHeader> {
+        self.tree.get_root()
+    }
+
+    pub(crate) fn hint(&self) -> PageHint {
+        self.tree.hint()
+    }
+
     pub(crate) fn stats(&self) -> Result<DatabaseStats> {
         let view = TableTreeMut::new(
             self.tree.get_root(),
@@ -146,6 +166,10 @@ impl TableTree {
         Ok(true)
     }
 
+    pub(crate) fn verify_root_checksum(&self) -> Result<bool> {
+        self.tree.verify_root_checksum()
+    }
+
     // root_page: the root of the master table
     pub(crate) fn list_tables(&self, table_type: TableType) -> Result<Vec<String>> {
         let iter = self.tree.range::<RangeFull, &str>(&(..))?;
@@ -220,6 +244,8 @@ impl TableTree {
 }
 
 pub(crate) struct TableTreeMut<'txn> {
+    #[cfg(feature = "test-seams")]
+    pub(crate) table_write_observer: crate::table_write_observer::ObserverSlot,
     tree: BtreeMut<'txn, &'static str, InternalTableDefinition>,
     guard: Arc<TransactionGuard>,
     mem: Arc<TransactionalMemory>,
@@ -249,6 +275,8 @@ impl TableTreeMut<'_> {
             guard,
             mem,
             pending_table_updates: Default::default(),
+            #[cfg(feature = "test-seams")]
+            table_write_observer: Default::default(),
             freed_pages,
             allocated_pages,
         }
@@ -382,6 +410,14 @@ impl TableTreeMut<'_> {
                 }
             }
             self.tree.insert(&name.as_str(), &definition)?;
+            #[cfg(feature = "test-seams")]
+            crate::table_write_observer::record(
+                &self.table_write_observer,
+                "__redb_user_table_directory",
+                crate::TableWriteOperationForTest::DirectoryInsert,
+                name.as_bytes(),
+                InternalTableDefinition::as_bytes(&definition).len(),
+            );
         }
         Ok(self)
     }
@@ -554,7 +590,23 @@ impl TableTreeMut<'_> {
                     .insert(new_name.to_string(), update);
             }
             assert!(self.tree.remove(&name)?.is_some());
+            #[cfg(feature = "test-seams")]
+            crate::table_write_observer::record(
+                &self.table_write_observer,
+                "__redb_user_table_directory",
+                crate::TableWriteOperationForTest::DirectoryRemove,
+                name.as_bytes(),
+                InternalTableDefinition::as_bytes(&definition).len(),
+            );
             assert!(self.tree.insert(&new_name, &definition)?.is_none());
+            #[cfg(feature = "test-seams")]
+            crate::table_write_observer::record(
+                &self.table_write_observer,
+                "__redb_user_table_directory",
+                crate::TableWriteOperationForTest::DirectoryInsert,
+                new_name.as_bytes(),
+                InternalTableDefinition::as_bytes(&definition).len(),
+            );
         } else {
             return Err(TableError::TableDoesNotExist(name.to_string()));
         }
@@ -580,6 +632,8 @@ impl TableTreeMut<'_> {
             for page in pages {
                 if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                     freed_pages.push(page);
+                    #[cfg(feature = "test-seams")]
+                    crate::commit_work::note_freed_page();
                 }
             }
             drop(allocated_pages);
@@ -588,6 +642,14 @@ impl TableTreeMut<'_> {
             self.pending_table_updates.remove(name);
 
             let found = self.tree.remove(&name)?.is_some();
+            #[cfg(feature = "test-seams")]
+            crate::table_write_observer::record(
+                &self.table_write_observer,
+                "__redb_user_table_directory",
+                crate::TableWriteOperationForTest::DirectoryRemove,
+                name.as_bytes(),
+                InternalTableDefinition::as_bytes(&definition).len(),
+            );
             return Ok(found);
         }
 
@@ -604,6 +666,14 @@ impl TableTreeMut<'_> {
         } else {
             let table = InternalTableDefinition::new::<K, V>(table_type, None, 0);
             self.tree.insert(&name, &table)?;
+            #[cfg(feature = "test-seams")]
+            crate::table_write_observer::record(
+                &self.table_write_observer,
+                "__redb_user_table_directory",
+                crate::TableWriteOperationForTest::DirectoryInsert,
+                name.as_bytes(),
+                InternalTableDefinition::as_bytes(&table).len(),
+            );
             table
         };
 

@@ -11,7 +11,7 @@ use uuid::Uuid;
 const FEWER: &str = "fewer predicate columns matched than chosen index";
 const FIRST: &str = "first column not in WHERE";
 const LOWER: &str = "lower selectivity than chosen index";
-const TIED: &str = "tied with chosen index; lost by creation order";
+const MORE_COLUMNS: &str = "more indexed columns than chosen index";
 
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
@@ -611,7 +611,7 @@ fn in11_suffix_range_terminates_prefix() {
 }
 
 #[test]
-fn in12_leading_collision_pushes_col_once() {
+fn in12_contradictory_leading_constraints_return_empty_without_work() {
     let db = Database::open_memory();
     create_two_col_int(&db);
     let mut n = 0;
@@ -629,7 +629,11 @@ fn in12_leading_collision_pushes_col_once() {
         )
         .unwrap();
     assert_eq!(pushed(&r), vec!["col"]);
-    assert_eq!(db.__rows_examined(), 4);
+    assert_eq!(
+        db.__rows_examined(),
+        0,
+        "a provably empty equality/IN intersection must not touch the index"
+    );
     assert!(r.rows.is_empty());
     db.__reset_rows_examined();
     let tier = db
@@ -644,7 +648,7 @@ fn in12_leading_collision_pushes_col_once() {
 }
 
 #[test]
-fn in13_equal_matchcount_tie_creation_order() {
+fn in13_fewer_key_columns_win_before_creation_order() {
     let db = Database::open_memory();
     seed_is13_fixture(&db, false);
     db.__reset_rows_examined();
@@ -654,15 +658,15 @@ fn in13_equal_matchcount_tie_creation_order() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_long"));
+    assert_eq!(r.trace.index_used.as_deref(), Some("idx_short"));
     assert_eq!(pushed(&r), vec!["col"]);
-    assert_eq!(reason(&r, "idx_short"), Some(TIED));
+    assert_eq!(reason(&r, "idx_long"), Some(MORE_COLUMNS));
     assert_eq!(db.__rows_examined(), 3);
     assert_eq!(r.rows, vec![vec![Value::Int64(2)], vec![Value::Int64(2)]]);
 }
 
 #[test]
-fn in13b_shorter_index_created_first_wins_tie() {
+fn in13b_fewer_key_columns_also_win_when_created_first() {
     let db = Database::open_memory();
     seed_is13_fixture(&db, true);
     db.__reset_rows_examined();
@@ -674,7 +678,7 @@ fn in13b_shorter_index_created_first_wins_tie() {
         .unwrap();
     assert_eq!(r.trace.index_used.as_deref(), Some("idx_short"));
     assert_eq!(pushed(&r), vec!["col"]);
-    assert_eq!(reason(&r, "idx_long"), Some(TIED));
+    assert_eq!(reason(&r, "idx_long"), Some(MORE_COLUMNS));
     assert_eq!(db.__rows_examined(), 3);
     assert_eq!(r.rows.len(), 2);
 }
@@ -1490,7 +1494,7 @@ fn rsn_lower_selectivity_exact_string() {
 }
 
 #[test]
-fn rsn_tied_creation_order_exact_string() {
+fn rsn_more_indexed_columns_exact_string() {
     let db = Database::open_memory();
     seed_is13_fixture(&db, false);
     let r = db
@@ -1499,7 +1503,7 @@ fn rsn_tied_creation_order_exact_string() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(reason(&r, "idx_short"), Some(TIED));
+    assert_eq!(reason(&r, "idx_long"), Some(MORE_COLUMNS));
 }
 
 #[test]
@@ -1612,7 +1616,7 @@ fn pers1_reopen_winner_and_reasons_stable() {
     let after = (trace_capture(&first), trace_capture(&second));
     assert_eq!(before, after);
     assert_eq!(after.0.0.as_deref(), Some("idx_c"));
-    assert_eq!(after.1.0.as_deref(), Some("idx_long"));
+    assert_eq!(after.1.0.as_deref(), Some("idx_short"));
 }
 
 #[test]

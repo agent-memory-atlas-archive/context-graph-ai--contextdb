@@ -633,6 +633,44 @@ fn corrupt_lazy_base_becomes_typed_unavailable_then_repairs_from_raw_vectors() {
 }
 
 #[test]
+fn corrupt_physical_graph_page_never_falls_back_to_the_complete_generation() {
+    let root = TempDir::new().expect("temporary durable store directory");
+    let path = root.path().join("physical-graph-page-corruption.redb");
+    let alpha = Uuid::from_u128(0xA118);
+    let bravo = Uuid::from_u128(0xB118);
+    seed_durable_two_route_fixture(&path, alpha, bravo);
+    Database::__corrupt_vector_partition_graph_page_for_test(&path, &route(alpha))
+        .expect("damage alpha's first independently keyed graph page");
+
+    let reader = ReadSession::open(&path)
+        .expect("lazy page corruption does not reject the retained reader at open");
+    let query = |scope, vector| {
+        reader.execute(
+            "SELECT id FROM generation_items WHERE scope_id = $scope \
+             ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 32",
+            &params([
+                ("scope", Value::Uuid(scope)),
+                ("query", Value::Vector(vector)),
+            ]),
+        )
+    };
+    let damaged = query(alpha, axis(0));
+    assert!(
+        matches!(
+            &damaged,
+            Err(Error::StoreCorrupted { reason, .. })
+                if reason == "vector partition graph physical page is corrupt"
+        ),
+        "damaged physical page returned {damaged:?}"
+    );
+    assert_eq!(
+        ids(&query(bravo, axis(1))
+            .expect("the independently keyed neighbouring route remains indexed")),
+        route_ids(0xB000)
+    );
+}
+
+#[test]
 fn repair_preserves_a_dormant_generation_selected_by_a_held_old_snapshot() {
     let root = TempDir::new().expect("temporary durable repair-retention directory");
     let path = root.path().join("repair-retains-old-snapshot.redb");

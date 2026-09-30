@@ -44,7 +44,7 @@ const CANONICAL_QUERY_RESULT_BYTES: &[u8] = &[
     1, 10, 0, 1, 1, 2, 13, 3, 0, 0, 0, 0, 0, 0, 0x0c, 0x40, 4, 1, b'v', 5, 16, 0x55, 0x55, 0x55,
     0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 6, 3, 7, 7, b'{',
     b'"', b'a', b'"', b':', b'1', b'}', 8, 2, 0, 0, 0x80, 0x3f, 0, 0, 0, 0xc0, 9, 42, 2, 1, b'P',
-    1, 1, b'I', 1, 1, b'p', 1, 1, b'i', 1, b'r', 1, 1, 1, b't', 1, b'v', 0, 3, 1, 1, 1, b'd',
+    1, 1, b'I', 1, 1, b'p', 1, 1, b'i', 1, b'r', 1, 1, 1, b't', 1, b'v', 0, 3, 0, 1, 1, 1, b'd',
 ];
 
 const HELD_BY_READERS_FAILURE: &[u8] = &[9, 2, 1, 2, 1, 7, 1, b'r', 9];
@@ -68,8 +68,8 @@ const CURSOR_LIFETIME_FAILURE: &[u8] = &[9, 13, 3, 1];
 
 const CURSOR_PAGE_BYTES: &[u8] = &[2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1];
 const CURSOR_OPENED_RESPONSE: &[u8] = &[
-    2, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
-    0x44, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1,
+    2, 0, 0, 0, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+    0x44, 0x44, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1,
 ];
 const CURSOR_PAGE_RESPONSE: &[u8] = &[3, 12, 2, 1, b'i', 1, b't', 1, 2, 2, 2, 9, 42, 1];
 const TABLE_METADATA_BYTES: &[u8] = &[0, 1, 0, 1, b't', 1, 1, 1, b'n'];
@@ -235,6 +235,7 @@ fn query_result() -> QueryResult {
             query_vector_source: Some(VectorIndexRef::new("t", "v")),
             vector_search: None,
             rows_examined: 3,
+            maintained_count: None,
         },
         cascade: Some(CascadeReport {
             dropped_indexes: vec!["d".to_owned()],
@@ -262,6 +263,7 @@ fn canonical_query_result() -> CanonicalQueryResult {
             query_vector_source: Some(VectorIndexRef::new("t", "v")),
             vector_search: None,
             rows_examined: 3,
+            maintained_count: None,
         },
         cascade: Some(CanonicalCascadeReport {
             dropped_indexes: vec!["d".to_owned()],
@@ -328,7 +330,7 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
             .expect("decode independent canonical query bytes"),
         expected
     );
-    let mut terminal_fixture = vec![1, 107];
+    let mut terminal_fixture = vec![1, 108];
     terminal_fixture.extend_from_slice(CANONICAL_QUERY_RESULT_BYTES);
     assert_response_codec(
         LocalResponse::TerminalSuccess {
@@ -478,7 +480,7 @@ fn canonical_query_result_has_one_independent_literal_and_field_mutation_matrix(
         .as_mut()
         .expect("canonical cascade")
         .dropped_indexes[0] = "e".to_owned();
-    assert_query_mutation(result, canonical, 106, b'e');
+    assert_query_mutation(result, canonical, 107, b'e');
 
     assert!(matches!(
         decode_query_result(
@@ -516,6 +518,7 @@ fn every_failure_kind_and_specialized_detail_has_literal_bytes() {
         (ReadFailureKind::CursorTransactionActive, &[9, 19, 0][..]),
         (ReadFailureKind::CursorInvalidStatement, &[9, 20, 0][..]),
         (ReadFailureKind::OperationAlreadyCompleted, &[9, 21, 0][..]),
+        (ReadFailureKind::AuthoritativeErasure, &[9, 25, 0][..]),
     ];
     for (kind, fixture) in empty_details {
         assert_response_codec(
@@ -893,6 +896,9 @@ fn canonical_cursor_and_metadata_payloads_keep_their_literal_bytes_inside_respon
     assert_response_codec(
         LocalResponse::CursorOpened {
             opened: CursorOpenedResponse {
+                effective_limits: None,
+                storage_snapshot: None,
+                physical_identity: None,
                 cursor_id: [0x44; 16],
                 payload: CURSOR_PAGE_BYTES.to_vec(),
             },

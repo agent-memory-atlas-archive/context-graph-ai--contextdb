@@ -1,4 +1,8 @@
 // Canonical authenticated-sync implementation, re-exported by contextdb-server.
+#[cfg(feature = "test-seams")]
+use crate::composite_store::ApplyPhasePause;
+#[cfg(feature = "test-seams")]
+use crate::database::ApplyPhasePauseGuard;
 use crate::protocol::{
     DependencyCompletePullResponse, MessageType, PullRequest, PullResponse, PushRequest,
     PushResponse, SchemaRecoveryPage, SchemaRecoveryRequest, SyncStatusResponse, WirePurgeChange,
@@ -202,6 +206,9 @@ struct PushApplyWork {
     changeset: ChangeSet,
     received_ddl: Option<crate::protocol::ReceivedDdlContext>,
     terminal_conflicts: Option<Vec<Conflict>>,
+    /// Data held behind a transaction this hub refused, taken out of the
+    /// request before it was checked; answered with the result.
+    held_conflicts: Vec<Conflict>,
     lineages: Vec<(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)>,
     arrivals: HashMap<Lsn, Option<Lsn>>,
     tenant_id: TenantId,
@@ -211,6 +218,9 @@ struct PushApplyWork {
     in_flight_push_applies: InFlightPushApplies,
     apply_permits: Arc<Semaphore>,
     protocol_version: u8,
+    hub_contact_ms: Option<i64>,
+    #[cfg(feature = "test-seams")]
+    completed_apply_before_reply_pause: Arc<ApplyPhasePause>,
 }
 
 struct PushHandlerState {
@@ -223,6 +233,8 @@ struct PushHandlerState {
     apply_tasks: ApplyTasks,
     in_flight_push_applies: InFlightPushApplies,
     apply_permits: Arc<Semaphore>,
+    #[cfg(feature = "test-seams")]
+    completed_apply_before_reply_pause: Arc<ApplyPhasePause>,
 }
 
 async fn maybe_wait_for_test_push_barrier(row_count: usize) {
@@ -273,6 +285,8 @@ pub struct SyncServer {
     /// state: the older parser is never handed vocabulary it cannot read.
     schema_sync_holdbacks: SchemaSyncHoldbackStates,
     peer_schema_capabilities: PeerSchemaCapabilities,
+    #[cfg(feature = "test-seams")]
+    completed_apply_before_reply_pause: Arc<ApplyPhasePause>,
 }
 
 impl SyncServer {
@@ -357,6 +371,8 @@ impl SyncServer {
             receipts: Arc::new(TransferLedger::new()),
             schema_sync_holdbacks: Arc::new(std::sync::Mutex::new(schema_sync_holdbacks)),
             peer_schema_capabilities: PeerSchemaCapabilities::default(),
+            #[cfg(feature = "test-seams")]
+            completed_apply_before_reply_pause: Arc::new(ApplyPhasePause::new()),
         }
     }
 
@@ -435,6 +451,15 @@ impl SyncServer {
         self.peer_schema_capabilities.set_for_test(peer, supported);
     }
 
+    /// Stop a successful push after its database apply has returned (and thus
+    /// after received-schema memory publication), immediately before the
+    /// server sends the response to every waiting transport responder.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn pause_after_completed_apply_before_reply_for_test(&self) -> ApplyPhasePauseGuard {
+        ApplyPhasePauseGuard::arm_for_test(self.completed_apply_before_reply_pause.clone())
+    }
+
     pub async fn run(&self) {
         self.run_until(Arc::new(AtomicBool::new(false))).await;
     }
@@ -471,6 +496,8 @@ impl SyncServer {
                 apply_tasks: apply_tasks.clone(),
                 in_flight_push_applies: in_flight_push_applies.clone(),
                 apply_permits: apply_permits.clone(),
+                #[cfg(feature = "test-seams")]
+                completed_apply_before_reply_pause: self.completed_apply_before_reply_pause.clone(),
             });
             Arc::new(move |req: IncomingRequest| {
                 let state = Arc::clone(&state);
@@ -513,6 +540,7 @@ impl SyncServer {
         };
 
         let status_handler = {
+            let local_node_id = self.local_node_id.clone();
             let db = self.db.clone();
             let tenant_id = self.tenant_id.clone();
             let applied_push_watermark = self.applied_push_watermark.clone();
@@ -522,9 +550,11 @@ impl SyncServer {
                 let tenant_id = tenant_id.clone();
                 let applied_push_watermark = applied_push_watermark.clone();
                 let per_edge_watermarks = per_edge_watermarks.clone();
+                let local_node_id = local_node_id.clone();
                 Box::pin(async move {
                     handle_status(
                         db,
+                        local_node_id,
                         tenant_id,
                         applied_push_watermark,
                         per_edge_watermarks,
@@ -907,6 +937,7 @@ fn to_transport_error(err: contextdb_core::Error) -> TransportError {
 /// the per-tenant record, which is what it has always been answered with.
 async fn handle_status(
     db: Arc<Database>,
+    local_node_id: Option<String>,
     tenant_id: TenantId,
     applied_push_watermark: Arc<AtomicLsn>,
     per_edge_watermarks: Arc<PerEdgeAppliedPushWatermarks>,
@@ -927,23 +958,101 @@ async fn handle_status(
         Some(node_id) => per_edge_watermarks.load(&db, &tenant_id, node_id, request.incarnation),
         None => applied_push_watermark.load(Ordering::SeqCst),
     };
-    let hub_incarnation =
-        if let (Some(runtime), Some(edge)) = (db.custody_runtime(), req.node_id.as_deref()) {
-            crate::custody::incarnation::check(&db, &tenant_id, &runtime.node, edge, &request)?
-        } else {
-            db.existing_sync_incarnation(&tenant_id)?
-        };
+    if let (Some(runtime), Some(edge)) = (db.custody_runtime(), req.node_id.as_deref()) {
+        crate::custody::incarnation::check(&db, &tenant_id, &runtime.node, edge, &request)?;
+    }
+    let (edge, hub) = match (req.node_id.as_deref(), local_node_id.as_deref()) {
+        (Some(edge), Some(hub)) => (edge, hub),
+        _ => {
+            return Err(contextdb_core::Error::SyncError(
+                "exact refused schema lookup requires authenticated identities".into(),
+            ));
+        }
+    };
+    let (refused_schema_units, refusal_lease) = db.refused_schema_unit_outcomes_for_digests(
+        &tenant_id,
+        edge,
+        request.incarnation,
+        hub,
+        &request.refused_schema_unit_digests,
+    )?;
+    // An empty exact lookup initializes a fresh hub's life as well. Observe it
+    // after the lookup so the acknowledgment and its scope describe one image.
+    let hub_incarnation = db.existing_sync_incarnation(&tenant_id)?;
     let response = SyncStatusResponse {
         applied_push_watermark: Some(applied),
         server_current_lsn: Some(db.current_lsn()),
         hub_incarnation,
+        refused_schema_units,
+        refused_schema_unit_digests_ack: Some(request.refused_schema_unit_digests),
     };
     let payload = encode_for_version(protocol_version, MessageType::StatusResponse, &response)
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+    drop(refusal_lease);
     (req.responder)(payload)
         .await
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
     Ok(())
+}
+
+/// Select only exact signed units from this request, in this authenticated
+/// pushing peer's tenant and store lives. Historical refusals never describe
+/// a later correction, even if it touches the same table.
+fn refused_outcomes_for_request(
+    db: &Database,
+    tenant: &TenantId,
+    peer: &str,
+    incarnation: Incarnation,
+    hub: &str,
+    context: Option<&crate::protocol::ReceivedDdlContext>,
+) -> contextdb_core::Result<(
+    Vec<crate::protocol::RefusedSchemaUnitOutcome>,
+    Vec<Arc<crate::read_image_memory::ImageMemory>>,
+)> {
+    let Some(context) = context else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut groups = BTreeMap::new();
+    for entry in &context.entries {
+        let author = context.author_of(entry);
+        groups
+            .entry((
+                author.node_id.clone(),
+                author.incarnation,
+                author.source_ddl_lsn,
+            ))
+            .or_insert_with(Vec::new)
+            .push(author);
+    }
+    let mut digests = HashSet::new();
+    for (identity, authors) in groups {
+        let authors = authors.iter().collect::<Vec<_>>();
+        let digest = crate::protocol::authored_schema_unit_digest(&authors)
+            .map_err(|error| contextdb_core::Error::SyncError(error.to_string()))?;
+        digests.insert((identity, digest));
+    }
+    let mut outcomes = Vec::new();
+    let mut leases = Vec::new();
+    let requested = digests
+        .iter()
+        .map(|(_, digest)| *digest)
+        .collect::<Vec<_>>();
+    for batch in requested.chunks(128) {
+        let (page, lease) =
+            db.refused_schema_unit_outcomes_for_digests(tenant, peer, incarnation, hub, batch)?;
+        outcomes.extend(page.into_iter().filter(|outcome| {
+            digests.contains(&(
+                (
+                    outcome.author_node_id.clone(),
+                    outcome.author_incarnation,
+                    outcome.source_ddl_lsn,
+                ),
+                outcome.unit_digest,
+            ))
+        }));
+        leases.push(lease);
+    }
+    Ok((outcomes, leases))
 }
 
 async fn handle_push(
@@ -1015,10 +1124,20 @@ async fn handle_push(
     )
     .await?;
 
-    // This authenticated push has reached an admission decision. Recording
-    // contact afterward cannot delay a duplicate joining the in-flight fanout.
-    if let Err(err) =
-        crate::sync_system_tables::record_node_contact(&state.db, &authenticated_peer, hub_now_ms())
+    // A leader carrying authenticated schema can fold this required liveness
+    // row into the matching receipt transaction. Followers, custody, and
+    // data-only pushes keep the ordinary standalone contact commit.
+    let contact_ms = hub_now_ms();
+    let mut fused_contact_ms = None;
+    if matches!(admission, PushAdmission::Leader) && !custody && !request.changeset.ddl.is_empty() {
+        match crate::sync_system_tables::ensure_node_contacts_schema(&state.db) {
+            Ok(()) => fused_contact_ms = Some(contact_ms),
+            Err(err) => {
+                tracing::warn!(%authenticated_peer, error = %err, "failed to prepare node last-contact");
+            }
+        }
+    } else if let Err(err) =
+        crate::sync_system_tables::record_node_contact(&state.db, &authenticated_peer, contact_ms)
     {
         tracing::warn!(%authenticated_peer, error = %err, "failed to record node last-contact");
     }
@@ -1061,6 +1180,7 @@ async fn handle_push(
             changeset,
             received_ddl: None,
             terminal_conflicts: None,
+            held_conflicts: Vec::new(),
             lineages,
             arrivals,
             tenant_id: state.tenant_id.clone(),
@@ -1070,6 +1190,9 @@ async fn handle_push(
             in_flight_push_applies: state.in_flight_push_applies.clone(),
             apply_permits: state.apply_permits.clone(),
             protocol_version,
+            hub_contact_ms: None,
+            #[cfg(feature = "test-seams")]
+            completed_apply_before_reply_pause: state.completed_apply_before_reply_pause.clone(),
         })
         .await;
     }
@@ -1077,8 +1200,45 @@ async fn handle_push(
     // Ordinary pushes retain an exact durable apply result. Manifested units
     // use their signed custody journal so a retry can return the same per-unit
     // outcome packets instead of dropping them from the response.
-    match state.db.replay_sync_push_outcome(&outcome_key) {
-        Ok(Some(result)) => {
+    match state
+        .db
+        .replay_released_policy_data(&state.tenant_id, &authenticated_peer, incarnation)
+        .and_then(|_| state.db.replay_sync_push_outcome(&outcome_key))
+        .and_then(|result| {
+            result
+                .map(|result| {
+                    let context = crate::protocol::received_ddl_context(
+                        &request.changeset,
+                        &state.tenant_id,
+                        &authenticated_peer,
+                        incarnation,
+                    )
+                    .map_err(crate::protocol::received_ddl_error)?;
+                    let refused = match state.local_node_id.as_deref() {
+                        Some(hub) => refused_outcomes_for_request(
+                            &state.db,
+                            &state.tenant_id,
+                            &authenticated_peer,
+                            incarnation,
+                            hub,
+                            context.as_ref(),
+                        )?,
+                        None => (Vec::new(), Vec::new()),
+                    };
+                    Ok((result, refused))
+                })
+                .transpose()
+        }) {
+        Ok(Some((result, (refused_schema_units, refusal_leases)))) => {
+            if let Some(contact_ms) = fused_contact_ms.take()
+                && let Err(err) = crate::sync_system_tables::record_node_contact(
+                    &state.db,
+                    &authenticated_peer,
+                    contact_ms,
+                )
+            {
+                tracing::warn!(%authenticated_peer, error = %err, "failed to record replay node last-contact");
+            }
             publish_in_flight_push_response(
                 state.in_flight_push_applies.clone(),
                 request_key,
@@ -1086,14 +1246,26 @@ async fn handle_push(
                     result: Some(result.into()),
                     error: None,
                     application_error: None,
+                    refused_schema_units,
+                    hub_incarnation: state.db.existing_sync_incarnation(&state.tenant_id)?,
                     ..Default::default()
                 },
                 protocol_version,
             )
             .await;
+            drop(refusal_leases);
             return Ok(());
         }
         Err(err) => {
+            if let Some(contact_ms) = fused_contact_ms.take()
+                && let Err(contact_err) = crate::sync_system_tables::record_node_contact(
+                    &state.db,
+                    &authenticated_peer,
+                    contact_ms,
+                )
+            {
+                tracing::warn!(%authenticated_peer, error = %contact_err, "failed to record rejected replay node last-contact");
+            }
             publish_in_flight_push_response(
                 state.in_flight_push_applies.clone(),
                 request_key,
@@ -1119,9 +1291,45 @@ async fn handle_push(
             &authenticated_peer,
             incarnation,
         )
-        .map_err(|err| contextdb_core::Error::SyncError(err.to_string()))?;
+        .map_err(crate::protocol::received_ddl_error)?;
         let changeset = ChangeSet::try_from(request.changeset)
             .map_err(|err| contextdb_core::Error::SyncError(err.to_string()))?;
+        if let Some(source_lsn) = changeset.max_lsn() {
+            let hub = state.local_node_id.as_deref().ok_or_else(|| {
+                contextdb_core::Error::SyncError(
+                    "policy hold requires authenticated hub identity".into(),
+                )
+            })?;
+            state.db.stage_policy_held_received_data(
+                &changeset,
+                &arrivals,
+                &contextdb_engine::database::SyncApplyReceipt {
+                    tenant_id: state.tenant_id.clone(),
+                    node_id: authenticated_peer.clone(),
+                    incarnation,
+                    source_lsn,
+                    dependency_complete,
+                    hub_contact_ms: fused_contact_ms,
+                },
+                hub,
+                &lineages,
+                ddl_context.as_ref(),
+            )?;
+        }
+        // Data held behind a transaction this hub refused names a table it
+        // either does not have or holds at a schema the author never had
+        // accepted here: its provenance is not checked against that table and
+        // it never installs. The typed holds are answered with the result.
+        let (changeset, held_conflicts) = state.db.split_data_held_behind_refused_units(
+            changeset,
+            &state.tenant_id,
+            &authenticated_peer,
+            Some(incarnation),
+            dependency_complete,
+        )?;
+        if changeset.is_empty() && !held_conflicts.is_empty() {
+            return Ok::<_, contextdb_core::Error>((changeset, ddl_context, None, held_conflicts));
+        }
         if ddl_context.is_none() {
             let conflicts = state.db.retired_generation_refusals(
                 &state.tenant_id,
@@ -1131,7 +1339,12 @@ async fn handle_push(
                 incarnation,
             )?;
             if !changeset.rows.is_empty() && conflicts.len() == changeset.rows.len() {
-                return Ok::<_, contextdb_core::Error>((changeset, ddl_context, Some(conflicts)));
+                return Ok::<_, contextdb_core::Error>((
+                    changeset,
+                    ddl_context,
+                    Some(conflicts),
+                    held_conflicts,
+                ));
             }
         }
         let original_changes = changeset.clone();
@@ -1163,18 +1376,33 @@ async fn handle_push(
                 .reject_accepted_lineage_replays(&state.tenant_id, changeset, &lineages)
         };
         match checked {
-            Ok(changeset) => Ok((changeset, ddl_context, None)),
+            Ok(changeset) => Ok((changeset, ddl_context, None, held_conflicts)),
             Err(contextdb_core::Error::SyncReplayOfAcceptedDelete { table, key }) => {
                 let conflicts =
                     state
                         .db
                         .accepted_delete_replay_conflicts(&original_changes, &table, &key);
-                Ok((original_changes, ddl_context, Some(conflicts)))
+                Ok((
+                    original_changes,
+                    ddl_context,
+                    Some(conflicts),
+                    held_conflicts,
+                ))
             }
             Err(error) => Err(error),
         }
     })() {
-        Ok((changeset, received_ddl, terminal_conflicts)) => {
+        Ok((changeset, received_ddl, terminal_conflicts, held_conflicts)) => {
+            if received_ddl.is_none()
+                && let Some(contact_ms) = fused_contact_ms.take()
+                && let Err(err) = crate::sync_system_tables::record_node_contact(
+                    &state.db,
+                    &authenticated_peer,
+                    contact_ms,
+                )
+            {
+                tracing::warn!(%authenticated_peer, error = %err, "failed to record non-schema node last-contact");
+            }
             spawn_apply_and_reply(PushApplyWork {
                 db: state.db.clone(),
                 local_node_id: state.local_node_id.clone(),
@@ -1188,6 +1416,7 @@ async fn handle_push(
                 changeset,
                 received_ddl,
                 terminal_conflicts,
+                held_conflicts,
                 lineages,
                 arrivals,
                 tenant_id: state.tenant_id.clone(),
@@ -1197,10 +1426,24 @@ async fn handle_push(
                 in_flight_push_applies: state.in_flight_push_applies.clone(),
                 apply_permits: state.apply_permits.clone(),
                 protocol_version,
+                hub_contact_ms: fused_contact_ms,
+                #[cfg(feature = "test-seams")]
+                completed_apply_before_reply_pause: state
+                    .completed_apply_before_reply_pause
+                    .clone(),
             })
             .await?;
         }
         Err(err) => {
+            if let Some(contact_ms) = fused_contact_ms.take()
+                && let Err(contact_err) = crate::sync_system_tables::record_node_contact(
+                    &state.db,
+                    &authenticated_peer,
+                    contact_ms,
+                )
+            {
+                tracing::warn!(%authenticated_peer, error = %contact_err, "failed to record rejected schema node last-contact");
+            }
             let response =
                 if let contextdb_core::Error::SyncReplayOfAcceptedDelete { table, key } = &err {
                     PushResponse {
@@ -1330,6 +1573,9 @@ async fn handle_pull(
                     capabilities: remaining.capabilities.clone(),
                     through: remaining.compatible_through,
                     held_through: remaining.held_through,
+                    // A capability holdback is SENDER state and lives under its
+                    // own key; a receiver's memory hold is never written here.
+                    memory_held_tables: Default::default(),
                 });
             db.persist_inbound_schema_sync_holdback(&tenant_id, peer, durable.as_ref())?;
             let mut states = schema_sync_holdbacks
@@ -1440,14 +1686,17 @@ async fn handle_pull(
         }
     }
 
-    if let Some(tables) = recovering_tables.as_ref() {
+    if let Some(anchor_tables) = recovering_tables.as_ref() {
         let target = recovery_target.expect("recovery target accompanies held tables");
         let compatible_through = prior_holdback
             .as_ref()
             .expect("recovery tables come from a schema holdback")
             .compatible_through;
+        let held_groups = changes.ddl_lsn_groups_for_tables(anchor_tables);
+        let mut tables = changes.tables_in_ddl_lsn_groups(&held_groups);
+        tables.extend(anchor_tables.iter().cloned());
         changes = changes
-            .for_schema_recovery(tables, compatible_through)
+            .for_schema_recovery_with_ddl_groups(&tables, &held_groups, compatible_through)
             .through_lsn(target);
         purge_items.retain(|item| tables.contains(&item.table) && item.frontier <= target);
     }
@@ -1464,11 +1713,14 @@ async fn handle_pull(
                 next_holdback.capabilities.insert(table, capabilities);
             }
         }
-        let held_tables = next_holdback
+        let capability_tables = next_holdback
             .capabilities
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
+        let held_groups = changes.ddl_lsn_groups_for_tables(&capability_tables);
+        let mut held_tables = changes.tables_in_ddl_lsn_groups(&held_groups);
+        held_tables.extend(capability_tables);
         if !held_tables.is_empty() {
             // Freeze the complete held image before removing it from the old
             // receiver's page. Pagination and purge ordering below then see
@@ -1482,10 +1734,23 @@ async fn handle_pull(
             {
                 next_holdback.held_through = next_holdback.held_through.max(frontier);
             }
-            changes = changes.without_tables(&held_tables);
+            changes = changes
+                .without_lsn_groups(&held_groups)
+                .without_tables(&held_tables);
             purge_items.retain(|item| !held_tables.contains(&item.table));
         }
     }
+
+    // Hub contacts never belong in a peer's application history, so they must
+    // not consume the page budget. Keep their trailing source frontier apart
+    // from the deliverable groups; consume it only after those groups finish.
+    let source_frontier = changes.max_lsn();
+    changes = without_hub_local_bookkeeping(changes);
+    let consumed_bookkeeping_frontier = source_frontier.filter(|frontier| {
+        changes
+            .max_lsn()
+            .is_none_or(|deliverable| *frontier > deliverable)
+    });
 
     let mut has_more = false;
     if let Some(max_entries) = request.max_entries {
@@ -1620,10 +1885,15 @@ async fn handle_pull(
                 Some(db.current_lsn())
             }
         });
+    let consumed_bookkeeping_frontier = consumed_bookkeeping_frontier.filter(|_| !has_more);
     if !has_more {
         let bounded_hidden_frontier = consumed_hidden_frontier
             .map(|frontier| recovery_target.map_or(frontier, |target| frontier.min(target)));
-        cursor = cursor.into_iter().chain(bounded_hidden_frontier).max();
+        cursor = cursor
+            .into_iter()
+            .chain(bounded_hidden_frontier)
+            .chain(consumed_bookkeeping_frontier)
+            .max();
     }
 
     let recovery_page = recovery_target.map(|target_lsn| SchemaRecoveryPage {
@@ -1673,6 +1943,7 @@ async fn handle_pull(
             .max_lsn()
             .into_iter()
             .chain(purge_items.iter().map(|item| item.frontier))
+            .chain(consumed_bookkeeping_frontier)
             .max()
             .or(cursor.filter(|_| changes.is_empty() && purge_items.is_empty()));
     }
@@ -1742,7 +2013,34 @@ async fn handle_pull(
         })
         .transpose()?
         .unwrap_or_default();
-    let ordinary_ddl_provenance = db.outbound_ddl_provenance(&ordinary, &ddl_provenance_source)?;
+    // Schema is signed by whoever authored it, so serving any schema at all
+    // requires this node's own authenticated identity -- a schema-only page
+    // carries no rows to make that identity optional.
+    let authored_schema_node = |unit: &ChangeSet| -> contextdb_core::Result<Option<&str>> {
+        if unit.ddl.is_empty() {
+            return Ok(None);
+        }
+        local_node_id
+            .as_deref()
+            .ok_or_else(|| {
+                contextdb_core::Error::SyncError(
+                    "serving authenticated schema requires the hub's authenticated identity"
+                        .to_string(),
+                )
+            })
+            .map(Some)
+    };
+    let ordinary_ddl_provenance = match authored_schema_node(&ordinary)? {
+        None => Vec::new(),
+        Some(node_id) => db.outbound_ddl_provenance(
+            &ordinary,
+            &ddl_provenance_source,
+            &tenant_id,
+            node_id,
+            local_incarnation,
+            signer.as_ref(),
+        )?,
+    };
     let mut ordinary_changeset =
         crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
             ordinary,
@@ -1783,7 +2081,17 @@ async fn handle_pull(
                 })
                 .transpose()?
                 .unwrap_or_default();
-            let ddl_provenance = db.outbound_ddl_provenance(&unit, &ddl_provenance_source)?;
+            let ddl_provenance = match authored_schema_node(&unit)? {
+                None => Vec::new(),
+                Some(node_id) => db.outbound_ddl_provenance(
+                    &unit,
+                    &ddl_provenance_source,
+                    &tenant_id,
+                    node_id,
+                    local_incarnation,
+                    signer.as_ref(),
+                )?,
+            };
             let wire = crate::protocol::wire_changeset_with_arrivals_lineages_and_ddl_provenance(
                 unit,
                 &arrivals,
@@ -1833,6 +2141,7 @@ async fn handle_pull(
                     capabilities: next_holdback.capabilities.clone(),
                     through: next_holdback.compatible_through,
                     held_through: next_holdback.held_through,
+                    memory_held_tables: Default::default(),
                 };
                 db.persist_inbound_schema_sync_holdback(&tenant_id, peer, Some(&durable))?;
                 states.insert(peer.to_string(), next_holdback);
@@ -1875,6 +2184,7 @@ impl SchemaCapabilities {
             SchemaSyncCapability::VectorSearchMode,
             SchemaSyncCapability::VectorAutoIndexAt,
             SchemaSyncCapability::VectorHnswPolicy,
+            SchemaSyncCapability::MaintainedIndexCounts,
         ]
         .into_iter()
         .all(|capability| self.supports(capability))
@@ -1988,7 +2298,14 @@ fn holdback_for_capabilities(
 }
 
 fn schema_capabilities_in_meta(meta: &TableMeta) -> BTreeSet<SchemaSyncCapability> {
-    schema_capabilities_in_columns(&meta.columns)
+    let mut capabilities = schema_capabilities_in_columns(&meta.columns);
+    // `MAINTAIN COUNT` is protocol-7 vocabulary. A peer that cannot read the
+    // word is told this table and this capability and keeps syncing every
+    // other table, rather than meeting a parse error it would read as damage.
+    if meta.maintained_counts.is_some() {
+        capabilities.insert(SchemaSyncCapability::MaintainedIndexCounts);
+    }
+    capabilities
 }
 
 pub(crate) fn schema_capabilities_in_columns(
@@ -2068,6 +2385,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         changeset,
         received_ddl,
         terminal_conflicts,
+        held_conflicts,
         lineages,
         arrivals,
         tenant_id,
@@ -2077,6 +2395,9 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         in_flight_push_applies,
         apply_permits,
         protocol_version,
+        hub_contact_ms,
+        #[cfg(feature = "test-seams")]
+        completed_apply_before_reply_pause,
     } = work;
 
     let row_count = changeset.rows.len();
@@ -2091,7 +2412,9 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         let _guard = guard;
         maybe_wait_for_test_push_barrier(row_count).await;
         let applying_node_id = peer_node_id.clone();
-        let (response, committed_checkpoint) = match apply_permits.acquire_owned().await {
+        let contact_fallback_db = db.clone();
+        let contact_fallback_node = peer_node_id.clone();
+        let (response, committed, leases) = match apply_permits.acquire_owned().await {
             Ok(_permit) => {
                 match tokio::task::spawn_blocking(move || {
                     // A push has no cursor to re-adopt against — a hub never
@@ -2101,8 +2424,26 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                     if dependency_complete && custody.is_none() {
                         db.validate_dependency_complete_unit(&changeset)?;
                     }
+                    if changeset.is_empty() && !held_conflicts.is_empty() {
+                        // Everything in the request is held behind a refused
+                        // transaction: nothing is applied, so nothing is
+                        // receipted and no progress is published for it.
+                        return Ok::<_, contextdb_core::Error>((
+                            crate::sync_types::ApplyResult {
+                                applied_rows: 0,
+                                skipped_rows: 0,
+                                conflicts: held_conflicts,
+                                new_lsn: db.current_lsn(),
+                            },
+                            Vec::new(),
+                            db.existing_sync_incarnation(&tenant_id)?,
+                            (Vec::new(), Vec::new()),
+                        ));
+                    }
+                    let refused_context = received_ddl.clone();
                     let mut outcomes = Vec::new();
-                    let result = if let Some(request) = custody {
+                    let mut receipted = false;
+                    let mut result = if let Some(request) = custody {
                         let (result, committed) = crate::custody::delivery::apply(
                             &db,
                             crate::custody::delivery::DeliveryRoute {
@@ -2137,6 +2478,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                                 incarnation,
                                 source_lsn: max_lsn,
                                 dependency_complete,
+                                hub_contact_ms,
                             },
                             row_count,
                             conflicts,
@@ -2145,6 +2487,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                     } else if let (Some(node_id), Some(max_lsn)) =
                         (applying_node_id.as_deref(), push_max_lsn)
                     {
+                        receipted = true;
                         db.apply_authenticated_received_changes_with_outcome(
                             changeset,
                             &arrivals,
@@ -2155,6 +2498,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                                 incarnation,
                                 source_lsn: max_lsn,
                                 dependency_complete,
+                                hub_contact_ms,
                             },
                             local_node_id.as_deref(),
                             &lineages,
@@ -2173,34 +2517,73 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             dependency_complete,
                         )?
                     };
+                    result.conflicts.extend(held_conflicts);
+                    if let Some(node) = applying_node_id.as_deref() {
+                        // The correction and its release fact have committed. Replay
+                        // retained authenticated payloads outside the schema apply locks.
+                        let replayed =
+                            db.replay_released_policy_data(&tenant_id, node, incarnation)?;
+                        // A concurrently re-established hold is still pending;
+                        // the author must not clear that table's diagnostic.
+                        result
+                            .conflicts
+                            .extend(replayed.conflicts.into_iter().filter(|conflict| {
+                                conflict
+                                    .reason
+                                    .as_deref()
+                                    .is_some_and(|reason| reason.contains("held back"))
+                            }));
+                    }
+                    let refused_schema_units =
+                        match (applying_node_id.as_deref(), local_node_id.as_deref()) {
+                            (Some(node), Some(hub)) => refused_outcomes_for_request(
+                                &db,
+                                &tenant_id,
+                                node,
+                                incarnation,
+                                hub,
+                                refused_context.as_ref(),
+                            )?,
+                            _ => (Vec::new(), Vec::new()),
+                        };
                     if let Some(max_lsn) = push_max_lsn {
                         // What this hub now holds FROM THIS EDGE. Raised only
                         // after the apply committed, so the number the status
                         // exchange answers with never runs ahead of the data.
+                        // A receipted request is published only as far as its
+                        // durable receipt reaches: a request refused whole by
+                        // this hub's declared table policy commits no receipt,
+                        // and status must not claim it was applied either.
+                        let held = match (receipted, applying_node_id.as_deref()) {
+                            (true, Some(node_id)) => db
+                                .persisted_sync_applied_push_watermark_for_node_incarnation(
+                                    &tenant_id,
+                                    node_id,
+                                    incarnation,
+                                )?
+                                .map_or(Lsn(0), |durable| durable.min(max_lsn)),
+                            _ => max_lsn,
+                        };
                         if let Some(node_id) = applying_node_id.as_deref() {
-                            per_edge_watermarks.publish_committed(node_id, incarnation, max_lsn);
+                            per_edge_watermarks.publish_committed(node_id, incarnation, held);
                         }
-                        applied_push_watermark.fetch_max(max_lsn, Ordering::SeqCst);
-                        let watermark = applied_push_watermark.load(Ordering::SeqCst);
-                        if let Err(err) =
-                            db.persist_sync_applied_push_watermark(&tenant_id, watermark)
-                        {
-                            tracing::warn!(
-                                %tenant_id,
-                                error = %err,
-                                "failed to persist applied-push watermark"
-                            );
-                        }
+                        applied_push_watermark.fetch_max(held, Ordering::SeqCst);
                     }
                     Ok::<_, contextdb_core::Error>((
                         result,
                         outcomes,
                         db.existing_sync_incarnation(&tenant_id)?,
+                        refused_schema_units,
                     ))
                 })
                 .await
                 {
-                    Ok(Ok((result, outcomes, hub_incarnation))) => {
+                    Ok(Ok((
+                        result,
+                        outcomes,
+                        hub_incarnation,
+                        (refused_schema_units, refusal_leases),
+                    ))) => {
                         // The rows that CROSSED THE WIRE, against the peer the
                         // transport authenticated. Counted from the transmitted
                         // set, not from the apply result: a row the conflict
@@ -2235,8 +2618,10 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                                 application_error: None,
                                 outcomes,
                                 hub_incarnation,
+                                refused_schema_units,
                             },
                             checkpoint,
+                            refusal_leases,
                         )
                     }
                     Ok(Err(err)) => (
@@ -2248,6 +2633,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             ..Default::default()
                         },
                         None,
+                        Vec::new(),
                     ),
                     Err(err) => (
                         PushResponse {
@@ -2258,6 +2644,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             ..Default::default()
                         },
                         None,
+                        Vec::new(),
                     ),
                 }
             }
@@ -2270,13 +2657,35 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                     ..Default::default()
                 },
                 None,
+                Vec::new(),
             ),
         };
 
-        #[cfg(feature = "production-smoke-driver")]
-        if let Some((request_digest, authenticated_node_id, source_lsn, hub_lsn)) =
-            committed_checkpoint
+        if response.result.is_none()
+            && let (Some(contact_ms), Some(node_id)) = (hub_contact_ms, contact_fallback_node)
         {
+            let fallback_node_id = node_id.clone();
+            let fallback = tokio::task::spawn_blocking(move || {
+                crate::sync_system_tables::record_node_contact(
+                    &contact_fallback_db,
+                    &fallback_node_id,
+                    contact_ms,
+                )
+            })
+            .await;
+            match fallback {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(%node_id, error = %err, "failed to record failed schema node last-contact");
+                }
+                Err(err) => {
+                    tracing::warn!(%node_id, error = %err, "failed schema node last-contact task failed");
+                }
+            }
+        }
+
+        #[cfg(feature = "production-smoke-driver")]
+        if let Some((request_digest, authenticated_node_id, source_lsn, hub_lsn)) = committed {
             crate::transport::production_smoke_completed_apply_before_reply(
                 request_digest,
                 authenticated_node_id,
@@ -2286,7 +2695,12 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
             );
         }
         #[cfg(not(feature = "production-smoke-driver"))]
-        let _ = committed_checkpoint;
+        let _ = committed;
+
+        #[cfg(feature = "test-seams")]
+        if response.result.is_some() {
+            completed_apply_before_reply_pause.maybe_pause();
+        }
 
         publish_in_flight_push_response(
             in_flight_push_applies,
@@ -2295,6 +2709,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
             protocol_version,
         )
         .await;
+        drop(leases);
     });
     Ok(())
 }
@@ -2385,6 +2800,12 @@ async fn publish_push_response(
     Ok(())
 }
 
+pub(crate) fn without_hub_local_bookkeeping(changes: ChangeSet) -> ChangeSet {
+    changes.without_tables(&HashSet::from([
+        crate::sync_system_tables::WORK_NODE_CONTACTS_TABLE.to_string(),
+    ]))
+}
+
 fn merge_changeset_groups(groups: Vec<ChangeSet>) -> ChangeSet {
     let mut merged = ChangeSet::default();
     for group in groups {
@@ -2414,6 +2835,8 @@ mod tests {
             apply_tasks: tasks.clone(),
             in_flight_push_applies: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             apply_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PUSH_APPLIES)),
+            #[cfg(feature = "test-seams")]
+            completed_apply_before_reply_pause: Arc::new(ApplyPhasePause::new()),
         });
         let bytes = crate::protocol::encode(MessageType::PushRequest, &PushRequest::default())
             .expect("encode empty ordinary push");

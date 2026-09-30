@@ -128,8 +128,8 @@ fn operator_guidance_shows_ordinary_results_in_the_namespaced_document() {
         let contents = read(&path);
         for (line_number, line) in code_block_lines(&contents) {
             let trimmed = line.trim();
-            // A JSON line that opens with a row array is the pre-freeze
-            // ordinary-result shape.
+            // Ordinary results must place their row array inside the namespaced
+            // JSON document rather than at the document root.
             let bare_array_result = trimmed.starts_with("[{\"") && trimmed.ends_with(']');
             // `jq` reaching into the row array at the document root.
             let bare_array_consumer = trimmed.contains("jq") && trimmed.contains("'.[]");

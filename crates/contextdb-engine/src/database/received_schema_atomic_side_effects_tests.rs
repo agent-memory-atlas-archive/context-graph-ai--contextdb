@@ -53,6 +53,7 @@ fn migration() -> ReceivedSchemaFixture {
                 table: Database::ddl_affected_table(change).map(str::to_string),
                 table_generation: Some(3),
                 digest: vec![ordinal as u8],
+                author: None,
             })
             .collect(),
     };
@@ -248,6 +249,7 @@ fn acl_received_migration() -> ReceivedSchemaFixture {
                 table: Database::ddl_affected_table(change).map(str::to_string),
                 table_generation: Some(7),
                 digest: vec![ordinal as u8],
+                author: None,
             })
             .collect(),
     };
@@ -782,7 +784,6 @@ fn received_schema_publish_does_not_resurrect_a_worker_acknowledged_queue_entry(
         let applying_received = received.clone();
         let applying_lineages = lineages.clone();
         let stage = scope.spawn(move || {
-            applying.mark_this_thread_for_received_schema_pre_publish_pause_for_test();
             applying.commit_received_schema_stage_for_test(
                 &applying_changes,
                 &applying_received,

@@ -141,6 +141,10 @@ pub enum Error {
     ReadSessionNotImplemented,
     #[error("owner reads did not drain before shutdown deadline")]
     OwnerReadDrainTimeout,
+    #[error(
+        "event-bus queue write refused after owner quiescence; queued event remains available after reopen"
+    )]
+    EventBusQueueQuiescent,
     #[error("read operation was cancelled")]
     ReadCancelled,
     #[error("{0}")]
@@ -299,7 +303,7 @@ pub enum Error {
         sort_key: Box<str>,
     },
     #[error(
-        "legacy vector store detected (format marker {found_format_marker:?}); current release is {expected_release}. Run `contextdb migrate <path>` to migrate it in place (writes a `.bak` backup first, before anything is changed) — or sync from a 1.0+ peer, or recreate the schema on a fresh root and reimport the data"
+        "This store was written by an earlier build and is not read. Move it aside and create the store again."
     )]
     LegacyVectorStoreDetected {
         found_format_marker: String,
@@ -315,6 +319,12 @@ pub enum Error {
         "the store's identity could not be proven, so its fingerprint identifies nothing: more than one name resolves to the file at {path}"
     )]
     StoreIdentityUnprovable { path: String },
+    #[error("{operation} cannot safely coordinate readers through {path}: {reason}")]
+    ReaderCoordinationUnavailable {
+        operation: String,
+        path: String,
+        reason: String,
+    },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("transaction not found: {0}")]
@@ -363,8 +373,29 @@ pub enum Error {
     TenantPolicyBound { table: String },
     #[error("table {table} differs from its authenticated binding at {clause}")]
     TableBindingMismatch { table: String, clause: String },
-    #[error("the explicit local policy for {table} is preserved at {clause}")]
-    DeclaredPolicyPreserved { table: String, clause: String },
+    /// An authenticated authored transaction restates a table this node
+    /// declared for itself, with a policy that differs from the declaration.
+    /// The declaration cannot change from here and the transaction cannot be
+    /// installed in part, so the whole transaction is refused; only its
+    /// author can correct it.
+    #[error(
+        "the explicit local policy for '{table}' conflicts with the arriving declaration at \
+         {clause}: local policy {local_policy}; arriving policy {arriving_policy}; the local \
+         declaration is immutable once bound, so the whole authored transaction is refused and \
+         must be corrected by its author, not retried"
+    )]
+    DeclaredPolicyPreserved {
+        table: String,
+        clause: String,
+        local_policy: String,
+        arriving_policy: String,
+    },
+    /// A later unit touches a table that an earlier authored transaction in
+    /// the same stream was refused for, so it waits behind that refusal
+    /// instead of installing out of the author's order or failing the rest
+    /// of the stream.
+    #[error("table '{table}' is held back behind a refused authored transaction: {refusal}")]
+    TableHeldBehindRefusedUnit { table: String, refusal: String },
     #[error("delivery manifest required for root table {table}")]
     ManifestRequired { table: String },
     #[error("delivery manifest is incomplete for root table {table}")]
@@ -404,6 +435,13 @@ pub enum Error {
         table: String,
         key: Vec<(String, Value)>,
     },
+    /// A peer was asked to serve schema it received from another author, but
+    /// it no longer holds that author's exact signed declarations for `table`.
+    /// Received schema only ever leaves a peer as its author wrote it -- the
+    /// author's statements, order and signatures -- so the peer refuses
+    /// rather than restating the migration under its own name.
+    #[error("received schema for table {table} cannot be served as its author wrote it: {reason}")]
+    ReceivedSchemaAuthorshipUnavailable { table: String, reason: String },
     #[error("PURGE must run as a standalone authoritative statement")]
     PurgeRequiresStandaloneExecution,
     #[error(
@@ -637,6 +675,17 @@ pub enum Error {
         "store handle recycle failed for {path}: {reason} (on-disk file is intact; reopen fresh)"
     )]
     StoreHandleRecycleFailed { path: String, reason: String },
+    /// A commit reached durable storage, but moving its prepared image into
+    /// memory was interrupted by an unwind. The in-memory state of this
+    /// handle no longer matches what is durable, and there is no correct
+    /// partial publication to patch it back to, so the handle refuses every
+    /// later read and write. Reopening the database recovers the complete
+    /// committed state from the durable image.
+    #[error(
+        "a commit reached durable storage but its in-memory publication was interrupted; \
+         this database refuses service until it is reopened, which recovers the committed state"
+    )]
+    PublicationInterrupted,
     #[error("{0}")]
     Other(String),
 }

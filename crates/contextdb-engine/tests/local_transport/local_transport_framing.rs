@@ -1,12 +1,14 @@
 use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
 use contextdb_engine::local_transport::{
-    FrameBufferAllocator, FrameReader, FrameViolation, LocalOutboundMessage, LocalProtocolBoundary,
-    LocalResponse, LocalResponseExpectation, LocalTransportError, MAX_FRAME_BYTES,
-    OrdinaryResultReceiver, ResultChunk, ResultReceiveOutcome, ResultReceiveState, TerminalSuccess,
-    decode_frame_exact, encode_message, encode_payload_frame, frame_length_prefix,
-    read_payload_with_admission, split_canonical_result,
+    FrameBufferAllocator, FrameReader, FrameViolation, LocalInboundKind, LocalOutboundMessage,
+    LocalProtocolBoundary, LocalResponse, LocalResponseExpectation, LocalTransportError,
+    MAX_FRAME_BYTES, OrdinaryResultReceiver, PayloadViolation, ResultChunk, ResultReceiveOutcome,
+    ResultReceiveState, TerminalSuccess, decode_frame_exact, encode_message, encode_payload_frame,
+    frame_length_prefix, read_payload_with_admission, split_canonical_result,
 };
+#[cfg(unix)]
+use contextdb_engine::local_transport::{ManualDeadlineClock, UnixLocalCarrier};
 use contextdb_engine::read_contract::{
     CanonicalIndexCandidate, CanonicalQueryResult, decode_query_result, encode_query_result,
 };
@@ -87,6 +89,112 @@ fn local_frame_fixture_encodes_and_decodes_exactly() {
         decode_frame_exact(&fixture).expect("decode fixed frame fixture"),
         payload
     );
+}
+
+#[test]
+fn a_response_over_the_read_memory_ceiling_keeps_its_budget_class() {
+    let canonical = encode_query_result(&QueryResult {
+        columns: vec!["value".into()],
+        rows: vec![vec![Value::Text("a real answer".into())]],
+        rows_affected: 0,
+        trace: QueryTrace::scan(),
+        cascade: None,
+    })
+    .expect("encode a valid query result");
+    let frame = frame_for_ordinary_response(&LocalResponse::TerminalSuccess {
+        success: TerminalSuccess {
+            final_bytes: canonical,
+        },
+    });
+    let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits {
+        memory: 1,
+        ..ReadLimits::default()
+    });
+    let mut allocation = AllocationLimit {
+        maximum: MAX_FRAME_BYTES,
+        calls: 0,
+    };
+    let budget_error = boundary
+        .receive_frame(
+            LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult),
+            &mut SliceReader::new(frame),
+            &mut allocation,
+        )
+        .expect_err("a valid answer exceeds the caller's one-byte memory ceiling");
+    assert_eq!(
+        budget_error,
+        LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { ceiling: 1 })
+    );
+
+    let malformed = encode_payload_frame(&[0xff]).expect("frame invalid response bytes");
+    let corrupt_error = boundary
+        .receive_frame(
+            LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult),
+            &mut SliceReader::new(malformed),
+            &mut allocation,
+        )
+        .expect_err("unreadable response bytes are invalid channel data");
+    assert_eq!(
+        corrupt_error,
+        LocalTransportError::Refusal(
+            ReadFailure::new(ReadFailureKind::InvalidChannelData, ReadFailureDetail::None)
+                .expect("invalid channel data has empty detail")
+        )
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_response_decode_keeps_memory_refusals_separate_from_corrupt_bytes() {
+    use std::io::Write;
+
+    let canonical = encode_query_result(&QueryResult {
+        columns: vec!["value".into()],
+        rows: vec![vec![Value::Text("a real answer".into())]],
+        rows_affected: 0,
+        trace: QueryTrace::scan(),
+        cascade: None,
+    })
+    .expect("encode a valid query result");
+    let valid_frame = frame_for_ordinary_response(&LocalResponse::TerminalSuccess {
+        success: TerminalSuccess {
+            final_bytes: canonical,
+        },
+    });
+    let malformed_frame = encode_payload_frame(&[0xff]).expect("frame invalid response bytes");
+    let boundary = LocalProtocolBoundary::with_effective_limits(ReadLimits {
+        memory: 1,
+        ..ReadLimits::default()
+    });
+    let clock = ManualDeadlineClock::at(0);
+
+    for (frame, expected) in [
+        (
+            valid_frame,
+            LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded { ceiling: 1 }),
+        ),
+        (
+            malformed_frame,
+            LocalTransportError::Refusal(
+                ReadFailure::new(ReadFailureKind::InvalidChannelData, ReadFailureDetail::None)
+                    .expect("invalid channel data has empty detail"),
+            ),
+        ),
+    ] {
+        let (mut sender, mut receiver) =
+            std::os::unix::net::UnixStream::pair().expect("create task-scoped channel pair");
+        sender.write_all(&frame).expect("send one response frame");
+        let result = UnixLocalCarrier
+            .receive_response(
+                &mut receiver,
+                &boundary,
+                LocalResponseExpectation::OrdinaryResult,
+                &clock,
+                1_000,
+            )
+            .await;
+        assert_eq!(result, Err(expected));
+    }
 }
 
 #[test]
@@ -891,10 +999,9 @@ fn assert_compact_canonical_container_is_preflighted(container: CompactCanonical
         cursor_lifetime_ms: 1,
     });
     let mut receiver = OrdinaryResultReceiver::new();
-    let expected_error = LocalTransportError::Refusal(
-        ReadFailure::new(ReadFailureKind::InvalidChannelData, ReadFailureDetail::None)
-            .expect("invalid channel data accepts an empty detail"),
-    );
+    let expected_error = LocalTransportError::Payload(PayloadViolation::MemoryCeilingExceeded {
+        ceiling: EFFECTIVE_MEMORY_CEILING,
+    });
     OrdinaryResultReceiver::reset_canonical_receive_trace_for_test();
     assert!(
         OrdinaryResultReceiver::preflight_canonical_result_for_test(

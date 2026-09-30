@@ -490,6 +490,7 @@ fn read_failure_message(
         // writer reads as, and there is no flag here to point at.
         ReadFailureKind::DeclaredPrincipalRefused => None,
         ReadFailureKind::ConstrainedHandleInspectionRefused => None,
+        ReadFailureKind::AuthoritativeErasure => None,
     };
     match recovery {
         Some(recovery) => format!("{failure}; {recovery}"),
@@ -2117,7 +2118,6 @@ fn command_gloss(spelling: &str) -> &'static str {
         "\\d" => "Alias for .schema.",
         "\\q" => "Alias for .quit.",
         "\\?" => "Alias for .help.",
-        "migrate" => "Bring a legacy-format store forward in place.",
         "reset" => "Recreate a wedged or corrupt store. Needs --force.",
         "diagnose" => "Report a store's format and layout, read-only.",
         "snapshot" => "Publish a purge-fenced backup artifact.",
@@ -2757,7 +2757,7 @@ fn print_direct_events_status(status: &contextdb_engine::DirectEventsStatus) {
     }
     for sink in &status.sinks {
         println!(
-            "  {} TYPE {} registered={} delivered={} queued={} retried={} \
+            "  {} TYPE {} registered={} delivered={} queued={} retried={} uncertain={} \
              permanent_failures={} examined={}",
             sink.name,
             sink.sink_type,
@@ -2765,6 +2765,7 @@ fn print_direct_events_status(status: &contextdb_engine::DirectEventsStatus) {
             sink.delivered,
             sink.queued,
             sink.retried,
+            sink.uncertain,
             sink.permanent_failures,
             sink.examined,
         );

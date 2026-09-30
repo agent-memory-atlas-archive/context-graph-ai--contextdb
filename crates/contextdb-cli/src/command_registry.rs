@@ -28,7 +28,6 @@ pub(crate) struct CommandAlias {
 /// The canonical dispatch identity for a top-level store operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperationalCommandKind {
-    Migrate,
     Reset,
     Diagnose,
     Snapshot,
@@ -229,10 +228,6 @@ pub(crate) static CONVENTIONAL_ALIASES: &[CommandAlias] = &[
 
 /// The typed operational rows a later one-tree dispatch can consume.
 pub(crate) static OPERATIONAL_COMMANDS: &[OperationalCommand] = &[
-    OperationalCommand {
-        kind: OperationalCommandKind::Migrate,
-        spelling: "migrate",
-    },
     OperationalCommand {
         kind: OperationalCommandKind::Reset,
         spelling: "reset",
@@ -591,10 +586,6 @@ mod contract_tests {
     ];
 
     const EXPECTED_OPERATIONAL_COMMANDS: &[OperationalCommand] = &[
-        OperationalCommand {
-            kind: OperationalCommandKind::Migrate,
-            spelling: "migrate",
-        },
         OperationalCommand {
             kind: OperationalCommandKind::Reset,
             spelling: "reset",

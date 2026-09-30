@@ -10,14 +10,15 @@ use contextdb_core::read_contract::{
 };
 use contextdb_core::{Error, RowId, Value, VectorIndexRef, VectorPartitionKey, VectorSearchMode};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
-use contextdb_engine::{Database, MaintenancePolicy, QueryResult, SemanticQuery};
+use contextdb_engine::{
+    Database, MaintenancePolicy, QueryResult, SemanticQuery, VectorSearchRoute,
+    VectorSearchRouteEvidence,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
 use uuid::Uuid;
-
-const QUERY: &str = "SELECT id FROM vector_docs ORDER BY embedding <=> $query LIMIT 3";
 
 #[derive(Clone, Copy)]
 struct FrozenClock;
@@ -170,6 +171,31 @@ fn trace_candidates_in(
         .iter()
         .copied()
         .filter(|row_id| partition_rows.contains(row_id))
+        .collect()
+}
+
+fn disclosed_partition_routes(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<&str>)> {
+    let disclosure = result
+        .trace
+        .vector_search
+        .as_ref()
+        .expect("the executed query publishes its vector route receipt");
+    assert_eq!(
+        disclosure.route_evidence,
+        VectorSearchRouteEvidence::Executed,
+        "a query result must label actual execution separately from passive planning"
+    );
+    disclosure
+        .partition_hnsw
+        .iter()
+        .map(|partition| {
+            (
+                partition
+                    .route
+                    .expect("an executed partition has a resolved route"),
+                partition.reason.as_deref(),
+            )
+        })
         .collect()
 }
 
@@ -387,8 +413,13 @@ fn explain_reports_the_route_forced_exact_mode_the_query_actually_took() {
 }
 
 #[test]
-fn auto_uses_the_aggregate_selected_scope_not_each_partition() {
+fn auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition() {
     let db = partitioned_fixture("AUTO");
+    db.execute(
+        "ALTER TABLE vector_docs ALTER COLUMN embedding SET HNSW (EF_SEARCH = 500)",
+        &empty(),
+    )
+    .expect("declare the breadth whose per-partition exact choice this contract proves");
     // The `kind` predicate is part of candidate selection, so give this route
     // proof the relational index needed to make the maintained vector route
     // eligible. Without it the engine correctly takes the exact residual
@@ -398,9 +429,9 @@ fn auto_uses_the_aggregate_selected_scope_not_each_partition() {
         &empty(),
     )
     .expect("index the candidate-selection predicate");
-    // Each state has only 500 F32 vectors, below the automatic graph boundary.
-    // Together the selected scope has exactly 1,000, where AUTO must require
-    // the indexed route for this one answer.
+    // Each state has 500 F32 vectors and resolves the declared EF_SEARCH to 500. Together
+    // the selected scope has exactly 1,000, so aggregate AUTO admission must
+    // happen before each selected partition chooses its cheaper exact work.
     for partition in 0..2_i64 {
         for ordinal in 0..500_u128 {
             insert(
@@ -419,28 +450,105 @@ fn auto_uses_the_aggregate_selected_scope_not_each_partition() {
         ("query", query_vector()),
     ]);
 
-    // AUTO is allowed to use exact work while no graph is ready and the
-    // active budget can pay. The route-choice proof therefore starts only
-    // after both partitions have complete maintained graphs: a per-partition
-    // threshold implementation would still choose two exact scans here,
-    // whereas the approved whole-query count chooses the indexed route.
+    // Start after both maintained graphs are ready so an exact result proves
+    // the per-partition cost choice, rather than graph unavailability.
     drive_maintenance(&db);
+    let passive = db
+        .explain_output(
+            "SELECT id FROM vector_docs WHERE kind = 'eligible' \
+             ORDER BY embedding <=> [1.0, 0.0, 0.0] LIMIT 3",
+        )
+        .expect("passive explain resolves both selected small partitions");
+    let passive_disclosure = passive
+        .vector_search
+        .expect("passive explain publishes the vector route");
+    assert_eq!(
+        passive_disclosure.route_evidence,
+        VectorSearchRouteEvidence::PassivePrediction,
+        "passive explain must not present its route prediction as an execution receipt"
+    );
+    assert_eq!(passive_disclosure.resolved_mode, VectorSearchMode::Indexed);
+    assert_eq!(passive_disclosure.partition_hnsw.len(), 2);
+    assert_eq!(
+        format!("{passive_disclosure}")
+            .matches(" route=exact ")
+            .count(),
+        3,
+        "passive explain must predict the global and two local exact routes: {passive_disclosure}"
+    );
+    assert!(passive.physical_plan.contains("BruteForce"));
+
     let eager = db
         .execute(sql, &bound)
         .expect("AUTO serves the aggregate boundary after maintenance");
     assert_eq!(eager.rows.len(), 3);
+    let disclosure = eager
+        .trace
+        .vector_search
+        .as_ref()
+        .expect("AUTO publishes its aggregate and per-partition route receipt");
+    assert_eq!(disclosure.resolved_mode, VectorSearchMode::Indexed);
+    assert_eq!(disclosure.aggregate_allowed_vectors, Some(1_000));
+    assert_eq!(disclosure.partition_hnsw.len(), 2);
+    // AUTO decides once for the statement: comparing the 1,000 admitted rows
+    // costs less than the one walk the declared breadth would buy, so both
+    // partitions are compared, for the statement's reason, not their own.
+    assert_eq!(
+        disclosure.fallback.as_deref(),
+        Some("statement_exhaustive_cheaper_than_walk"),
+        "ready small partitions must not be described as a missing maintained index"
+    );
     assert!(
-        db.__debug_last_query_vector_used_hnsw_for_test(),
-        "two selected 500-row states form one 1,000-row F32 answer and must use the maintained route"
+        !db.__debug_last_query_vector_used_hnsw_for_test(),
+        "the statement-wide crossover compares the admitted rows exhaustively"
+    );
+    assert_eq!(
+        disclosed_partition_routes(&eager),
+        vec![
+            (
+                VectorSearchRoute::Exact,
+                Some("statement_exhaustive_cheaper_than_walk")
+            ),
+            (
+                VectorSearchRoute::Exact,
+                Some("statement_exhaustive_cheaper_than_walk")
+            ),
+        ]
+    );
+    assert_eq!(
+        format!("{disclosure}").matches(" route=exact ").count(),
+        3,
+        "the global receipt and both redacted partition receipts must say that exact comparison happened: {disclosure}"
     );
 
-    let bounded = bounded::execute(&db, &bounded_request(sql, bound))
-        .expect("the bounded door serves the same maintained aggregate route");
+    let bounded = bounded::execute(&db, &bounded_request(sql, bound.clone()))
+        .expect("the bounded door serves the same aggregate-admitted exact route");
     assert_eq!(bounded.result.rows, eager.rows);
-    assert!(
-        db.__debug_last_query_vector_used_hnsw_for_test(),
-        "the bounded door must not reinterpret the aggregate boundary per partition"
+    assert_eq!(
+        bounded
+            .result
+            .trace
+            .vector_search
+            .as_ref()
+            .expect("bounded execution publishes its route receipt")
+            .resolved_mode,
+        VectorSearchMode::Indexed,
     );
+    assert!(
+        !db.__debug_last_query_vector_used_hnsw_for_test(),
+        "the bounded door must make the same statement-wide exact decision"
+    );
+
+    let indexed_sql = "SELECT id FROM vector_docs WHERE kind = $kind \
+                       ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
+    let indexed = db
+        .execute(indexed_sql, &bound)
+        .expect("explicit INDEXED traverses the ready graphs even for small partitions");
+    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
+    let bounded_indexed = bounded::execute(&db, &bounded_request(indexed_sql, bound))
+        .expect("the bounded door preserves explicit INDEXED");
+    assert_eq!(bounded_indexed.result.rows, indexed.rows);
+    assert!(db.__debug_last_query_vector_used_hnsw_for_test());
 }
 
 #[test]
@@ -568,6 +676,8 @@ fn indexed_broad_filter_refuses_before_scan_and_becomes_eligible_with_a_relation
 #[test]
 fn old_snapshot_keeps_each_partition_graph_after_a_later_write() {
     let (_root, db) = durable_partitioned_fixture("AUTO");
+    let old_snapshot_query =
+        "SELECT id FROM vector_docs ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 3";
     for partition in 0..2_i64 {
         for ordinal in 0..1_001_u128 {
             insert(
@@ -602,7 +712,7 @@ fn old_snapshot_keeps_each_partition_graph_after_a_later_write() {
 
     db.__reset_last_query_vector_trace_for_test();
     let ordinary_before = db
-        .execute_at_snapshot(QUERY, &bound, old_snapshot)
+        .execute_at_snapshot(old_snapshot_query, &bound, old_snapshot)
         .expect("the ordinary old-snapshot route is initially maintained");
     let ordinary_trace_before = take_trace(&db);
     assert!(ordinary_trace_before.used_hnsw);
@@ -612,7 +722,7 @@ fn old_snapshot_keeps_each_partition_graph_after_a_later_write() {
     assert!(!unaffected_candidates_before.is_empty());
 
     let bounded_before_probe = Arc::new(HnswCandidateCounter::default());
-    let mut bounded_before_request = bounded_request(QUERY, bound.clone());
+    let mut bounded_before_request = bounded_request(old_snapshot_query, bound.clone());
     bounded_before_request.probe =
         Some(Arc::clone(&bounded_before_probe) as Arc<dyn bounded::ExecutionProbe>);
     db.__reset_last_query_vector_trace_for_test();
@@ -639,7 +749,7 @@ fn old_snapshot_keeps_each_partition_graph_after_a_later_write() {
 
     db.__reset_last_query_vector_trace_for_test();
     let ordinary_after = db
-        .execute_at_snapshot(QUERY, &bound, old_snapshot)
+        .execute_at_snapshot(old_snapshot_query, &bound, old_snapshot)
         .expect("the ordinary reader selects both snapshot-compatible graphs");
     let ordinary_trace_after = take_trace(&db);
     assert_eq!(ordinary_after.rows, ordinary_before.rows);
@@ -656,7 +766,7 @@ fn old_snapshot_keeps_each_partition_graph_after_a_later_write() {
     );
 
     let bounded_after_probe = Arc::new(HnswCandidateCounter::default());
-    let mut bounded_after_request = bounded_request(QUERY, bound);
+    let mut bounded_after_request = bounded_request(old_snapshot_query, bound);
     bounded_after_request.probe =
         Some(Arc::clone(&bounded_after_probe) as Arc<dyn bounded::ExecutionProbe>);
     db.__reset_last_query_vector_trace_for_test();
@@ -679,10 +789,21 @@ fn old_snapshot_keeps_each_partition_graph_after_a_later_write() {
         "the bounded reader visits the same unaffected-partition graph candidates"
     );
     assert_eq!(
-        bounded_after_probe.0.load(Ordering::SeqCst),
-        bounded_before_probe.0.load(Ordering::SeqCst),
-        "the bounded old-snapshot route does not add graph work after another partition writes"
+        bounded_trace_after.hnsw_candidate_row_ids, bounded_trace_before.hnsw_candidate_row_ids,
+        "the retained snapshot graphs publish the same raw candidates after the later write"
     );
+    for (phase, probe, trace) in [
+        ("before", &bounded_before_probe, &bounded_trace_before),
+        ("after", &bounded_after_probe, &bounded_trace_after),
+    ] {
+        let charged = probe.0.load(Ordering::SeqCst);
+        let traced = u64::try_from(trace.hnsw_candidate_count)
+            .expect("the graph candidate count fits the work counter");
+        assert!(
+            charged >= traced,
+            "the {phase} snapshot query must charge at least every graph candidate it publishes: charged={charged}, traced={traced}"
+        );
+    }
     drop(old_pin);
 }
 
@@ -740,6 +861,11 @@ fn filtered_many_partition_search_reuses_partition_local_candidates() {
 fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() {
     let db = partitioned_fixture("AUTO");
     db.execute(
+        "ALTER TABLE vector_docs ALTER COLUMN embedding SET HNSW (EF_SEARCH = 200)",
+        &empty(),
+    )
+    .expect("keep each healthy fixture partition wider than its graph search breadth");
+    db.execute(
         "CREATE INDEX vector_docs_kind_idx ON vector_docs(kind)",
         &empty(),
     )
@@ -761,6 +887,16 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
     insert(&db, id(22_000), 2, "eligible", vec![1.0, 0.0, 0.0]);
     insert(&db, id(22_001), 2, "excluded", vec![1.0, 0.0, 0.0]);
     let third_rows = partition_row_ids(&db, 2);
+    for ordinal in 0..500_u128 {
+        insert(
+            &db,
+            id(23_000 + ordinal),
+            3,
+            "eligible",
+            vec![1.0, ordinal as f32 * 0.002 + 0.003, 0.0],
+        );
+    }
+    let fourth_rows = partition_row_ids(&db, 3);
     let auto_sql = "SELECT id FROM vector_docs WHERE kind = $kind \
                     ORDER BY embedding <=> $query LIMIT 3";
     let auto_bound = params([
@@ -778,19 +914,42 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
     db.__reset_last_query_vector_trace_for_test();
     let ordinary_preflight = db
         .execute(auto_sql, &auto_bound)
-        .expect("AUTO exact-compares only the not-yet-built partition");
+        .expect("AUTO combines ready graphs with small and not-yet-built exact partitions");
     let ordinary_preflight_trace = take_trace(&db);
     assert_eq!(ordinary_preflight.rows, exact.rows);
     assert!(ordinary_preflight_trace.used_hnsw);
-    assert_eq!(ordinary_preflight_trace.supplemented_row_count, 1);
+    assert_eq!(ordinary_preflight_trace.supplemented_row_count, 501);
     assert!(
         !trace_candidates_in(&ordinary_preflight_trace, &first_rows).is_empty()
             && !trace_candidates_in(&ordinary_preflight_trace, &second_rows).is_empty(),
         "both healthy partition graph results survive the unavailable sibling: {ordinary_preflight_trace:?}"
     );
     assert!(
-        trace_candidates_in(&ordinary_preflight_trace, &third_rows).is_empty(),
-        "the unavailable partition contributes exact rows, not graph rows: trace={ordinary_preflight_trace:?}, rows={third_rows:?}"
+        trace_candidates_in(&ordinary_preflight_trace, &third_rows).is_empty()
+            && trace_candidates_in(&ordinary_preflight_trace, &fourth_rows).is_empty(),
+        "the small and unavailable partitions contribute exact rows, not graph rows: trace={ordinary_preflight_trace:?}"
+    );
+    assert_eq!(
+        disclosed_partition_routes(&ordinary_preflight),
+        vec![
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+            (
+                VectorSearchRoute::Exact,
+                Some("maintained_graph_unavailable")
+            ),
+            (
+                VectorSearchRoute::Exact,
+                Some("maintained_graph_unavailable")
+            ),
+        ],
+        "the eager receipt must carry each route the mixed search actually executed"
     );
     assert_indexed_refusal(
         db.execute(indexed_sql, &auto_bound)
@@ -803,7 +962,29 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
     let bounded_preflight_trace = take_trace(&db);
     assert_eq!(bounded_preflight.result.rows, exact.rows);
     assert!(bounded_preflight_trace.used_hnsw);
-    assert_eq!(bounded_preflight_trace.supplemented_row_count, 1);
+    assert_eq!(bounded_preflight_trace.supplemented_row_count, 501);
+    assert_eq!(
+        disclosed_partition_routes(&bounded_preflight.result),
+        vec![
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+            (
+                VectorSearchRoute::Exact,
+                Some("maintained_graph_unavailable")
+            ),
+            (
+                VectorSearchRoute::Exact,
+                Some("maintained_graph_unavailable")
+            ),
+        ],
+        "the bounded receipt must carry the same executed mixed routes"
+    );
     assert_bounded_indexed_refusal(bounded::execute(
         &db,
         &bounded_request(indexed_sql, auto_bound.clone()),
@@ -812,11 +993,17 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
     drive_maintenance(&db);
     db.__reset_last_query_vector_trace_for_test();
     let ready = bounded::execute(&db, &bounded_request(auto_sql, auto_bound.clone()))
-        .expect("all three partitions have complete maintained routes");
+        .expect("all four partitions have complete maintained routes");
     let ready_trace = take_trace(&db);
     assert_eq!(ready.result.rows, exact.rows);
-    assert_eq!(ready_trace.supplemented_row_count, 0);
+    // AUTO decides once for the statement, so a small partition whose graph is
+    // ready joins the one walk instead of being compared on its own.
+    assert_eq!(
+        ready_trace.supplemented_row_count, 0,
+        "every partition with a ready graph is answered by the statement's one walk"
+    );
     assert!(!trace_candidates_in(&ready_trace, &third_rows).is_empty());
+    assert!(!trace_candidates_in(&ready_trace, &fourth_rows).is_empty());
     let _shortfall = db
         .vector_store_for_test()
         .cap_partition_graph_candidates_for_test(&index(), &partition_key(1), 0);
@@ -829,11 +1016,31 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
     assert_eq!(ordinary_shortfall.rows, exact.rows);
     assert!(ordinary_shortfall_trace.used_hnsw);
     assert_eq!(ordinary_shortfall_trace.supplemented_row_count, 500);
-    assert!(
-        !trace_candidates_in(&ordinary_shortfall_trace, &first_rows).is_empty()
-            && !trace_candidates_in(&ordinary_shortfall_trace, &third_rows).is_empty()
-    );
+    assert!(!trace_candidates_in(&ordinary_shortfall_trace, &first_rows).is_empty());
     assert!(trace_candidates_in(&ordinary_shortfall_trace, &second_rows).is_empty());
+    assert!(!trace_candidates_in(&ordinary_shortfall_trace, &third_rows).is_empty());
+    assert_eq!(
+        disclosed_partition_routes(&ordinary_shortfall),
+        vec![
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+            (
+                VectorSearchRoute::Exact,
+                Some("maintained_graph_incomplete")
+            ),
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+        ],
+        "the receipt must report the graph shortfall that execution recovered from"
+    );
     assert_indexed_refusal(
         db.execute(indexed_sql, &auto_bound)
             .expect_err("INDEXED publishes no rows after a mid-merge shortfall"),
@@ -846,6 +1053,27 @@ fn auto_keeps_healthy_partition_results_for_preflight_and_mid_merge_fallbacks() 
     assert_eq!(bounded_shortfall.result.rows, exact.rows);
     assert!(bounded_shortfall_trace.used_hnsw);
     assert_eq!(bounded_shortfall_trace.supplemented_row_count, 500);
+    assert_eq!(
+        disclosed_partition_routes(&bounded_shortfall.result),
+        vec![
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+            (
+                VectorSearchRoute::Exact,
+                Some("maintained_graph_incomplete")
+            ),
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+            (
+                VectorSearchRoute::FilteredIndexed,
+                Some("maintained_graph_ready")
+            ),
+        ]
+    );
     assert_bounded_indexed_refusal(bounded::execute(
         &db,
         &bounded_request(indexed_sql, auto_bound.clone()),

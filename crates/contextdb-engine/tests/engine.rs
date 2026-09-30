@@ -26,8 +26,6 @@ mod indexed_equality_cursor_delivers_every_row;
 mod integer_negation_overflow_tests;
 #[path = "engine/memory_limit_admission_holds_for_text.rs"]
 mod memory_limit_admission_holds_for_text;
-#[path = "engine/migration_one_door_receipt.rs"]
-mod migration_one_door_receipt;
 #[path = "engine/nan_real_predicate_tests.rs"]
 mod nan_real_predicate_tests;
 #[path = "engine/ordered_cursor_settlement_does_not_rescan_its_buffer.rs"]

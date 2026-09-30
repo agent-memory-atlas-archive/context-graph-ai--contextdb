@@ -169,6 +169,7 @@ fn quarantined_cancel_fixture() -> (
                 },
                 resident_bytes: 1,
                 load_bytes: 1,
+                reclaim_bytes: 1,
             },
             Arc::new(QuarantineThenCancelLoader {
                 store: Arc::downgrade(&store),
@@ -212,6 +213,7 @@ fn quarantined_preload_propagates_typed_cancellation_on_both_search_routes() {
             max_visited_nodes: 32,
             max_vector_evaluations: 32,
         },
+        || Ok(()),
         || Ok(()),
         || Ok(()),
         |_| Ok(()),
@@ -671,6 +673,7 @@ fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() 
                         graph,
                         resident_bytes,
                         accountant: accountant.clone(),
+                        caller_adopted_bytes: 0,
                         fresh_tail: None,
                     },
                     encoded.len() as u64,
@@ -734,7 +737,20 @@ fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() 
                 exact.iter().map(|(id, _)| id.0).collect::<HashSet<_>>(),
                 (1..=10).collect::<HashSet<_>>()
             );
-            for mode in [VectorSearchMode::Indexed, VectorSearchMode::Auto] {
+            let (automatic, automatic_trace) = exec
+                .search_with_mode(
+                    r.clone(),
+                    &query,
+                    10,
+                    Some(&candidates),
+                    snapshot,
+                    VectorSearchMode::Auto,
+                )
+                .unwrap();
+            assert_eq!(automatic, exact);
+            assert!(!automatic_trace.used_hnsw);
+            {
+                let mode = VectorSearchMode::Indexed;
                 let (ordinary, trace) = exec
                     .search_with_mode(r.clone(), &query, 10, Some(&candidates), snapshot, mode)
                     .unwrap();
@@ -769,6 +785,7 @@ fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() 
                             max_visited_nodes: 128,
                             max_vector_evaluations: 128,
                         },
+                        || Ok(()),
                         || {
                             source_work += 1;
                             Ok(())
@@ -1164,6 +1181,7 @@ fn same_row_updates_published_in_reverse_transaction_order_remain_searchable() {
                     max_visited_nodes: 20_000,
                     max_vector_evaluations: 20_000,
                 },
+                || Ok(()),
                 || Ok(()),
                 || Ok(()),
                 |_| Ok(()),
@@ -1781,6 +1799,134 @@ fn dimension_mismatch_typed_error_with_positive_control() {
             .unwrap(),
         RowId(2),
     );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn selected_index_row_pruning_preserves_unrelated_resident_generation_and_indexed_answers() {
+    use contextdb_core::{VectorPartitionKey, VectorSearchMode};
+    use contextdb_vector::hnsw::HnswIndex;
+    use contextdb_vector::store::{LoadedVectorGraphGeneration, VectorGraphGeneration};
+    use contextdb_vector::{VectorIndexLayout, VectorPartitionRef};
+
+    let a = ref_named("items", "embedding_a");
+    let b = ref_named("items", "embedding_b");
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    let (store, _tx_mgr, exec) = setup_refs(&[(a.clone(), 3), (b.clone(), 3)], accountant.clone());
+    let layout = VectorIndexLayout::unpartitioned(3, VectorQuantization::F32).with_policy(
+        Some(1),
+        Some(8),
+        Some(32),
+        Some(16),
+        1,
+    );
+    for index in [&a, &b] {
+        store
+            .register_index_with_layout(index.clone(), layout.clone())
+            .unwrap();
+        let entries = (1..=4)
+            .map(|row| test_entry(index, row, ranked_vector(row as usize, 3), 1))
+            .collect::<Vec<_>>();
+        store.apply_inserts_with_accountant(entries.clone(), Some(accountant.as_ref()));
+        let graph = HnswIndex::from_vector_entries_with_policy(
+            &entries,
+            3,
+            VectorQuantization::F32,
+            layout.resolve_policy(entries.len(), 1),
+        );
+        let encoded = graph.encode_durable_generation().unwrap();
+        let graph =
+            HnswIndex::decode_durable_generation(&encoded, 3, VectorQuantization::F32).unwrap();
+        let resident_bytes = graph.estimated_resident_bytes();
+        accountant
+            .try_allocate_for(resident_bytes, "vector_test", "generation", "")
+            .unwrap();
+        store
+            .install_loaded_partition_generation(
+                &VectorPartitionRef::new(index.clone(), VectorPartitionKey::unpartitioned()),
+                true,
+                VectorGraphGeneration {
+                    generation_id: 1,
+                    covered_tx: TxId(1),
+                    covered_lsn: Lsn(1),
+                    durable_bytes: encoded.len() as u64,
+                    policy_revision: 1,
+                    hnsw_m: 8,
+                    hnsw_ef_construction: 32,
+                },
+                LoadedVectorGraphGeneration {
+                    graph,
+                    resident_bytes,
+                    accountant: accountant.clone(),
+                    caller_adopted_bytes: 0,
+                    fresh_tail: None,
+                },
+            )
+            .unwrap();
+    }
+    let partition_b = VectorPartitionRef::new(b.clone(), VectorPartitionKey::unpartitioned());
+    let status_before = store
+        .partition_graph_generation_status(&partition_b)
+        .unwrap();
+    assert!(status_before.base_resident);
+    let graph_before = store
+        .with_resident_partition_generation(&partition_b, true, |identity, graph| {
+            (
+                identity,
+                graph as *const HnswIndex as usize,
+                graph.graph_topology_digest_for_test(),
+            )
+        })
+        .unwrap();
+    let query = exact_vector(3, 0);
+    let search_b = || {
+        exec.search_with_mode(
+            b.clone(),
+            &query,
+            4,
+            None,
+            SnapshotId(1),
+            VectorSearchMode::Indexed,
+        )
+        .unwrap()
+        .0
+    };
+    let answers_before = search_b();
+    assert_eq!(answers_before.len(), 4);
+    assert_eq!(answers_before[0].0, RowId(1));
+
+    let released = store.prune_row_ids_in_indexes(
+        &[RowId(1)].into_iter().collect(),
+        std::slice::from_ref(&a),
+        accountant.as_ref(),
+    );
+    accountant.release(released);
+
+    assert_eq!(vector_count_for(&store, &a), 3);
+    assert!(
+        store
+            .entries_for_index(&a)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.row_id != RowId(1))
+    );
+    assert!(!store.has_hnsw_index_for(&a));
+    assert_eq!(vector_count_for(&store, &b), 4);
+    assert_eq!(
+        store.partition_graph_generation_status(&partition_b),
+        Some(status_before)
+    );
+    assert_eq!(
+        store.with_resident_partition_generation(&partition_b, true, |identity, graph| {
+            (
+                identity,
+                graph as *const HnswIndex as usize,
+                graph.graph_topology_digest_for_test(),
+            )
+        }),
+        Some(graph_before)
+    );
+    assert_eq!(search_b(), answers_before);
 }
 
 #[cfg(feature = "test-seams")]
@@ -2430,13 +2576,18 @@ fn clear_hnsw_keeps_accounting_charged_while_search_holds_graph() {
     let a_search = a.clone();
     thread::spawn(move || {
         done_search_tx
-            .send(exec_search.search(
-                a_search,
-                &ranked_vector(0, dim),
-                1,
-                None,
-                SnapshotId(50_000),
-            ))
+            .send(
+                exec_search
+                    .search_with_mode(
+                        a_search,
+                        &ranked_vector(0, dim),
+                        1,
+                        None,
+                        SnapshotId(50_000),
+                        contextdb_core::VectorSearchMode::Indexed,
+                    )
+                    .map(|(rows, _)| rows),
+            )
             .unwrap();
     });
     assert!(search_pause.wait_until_reached(TEST_TIMEOUT));
@@ -2571,6 +2722,7 @@ fn ordinary_and_bounded_indexed_search_share_snapshot_effort_across_size_band_de
                 max_visited_nodes: 20_000,
                 max_vector_evaluations: 20_000,
             },
+            || Ok(()),
             || Ok(()),
             || Ok(()),
             |_| Ok(()),

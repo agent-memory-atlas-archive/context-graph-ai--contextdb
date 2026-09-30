@@ -3,16 +3,17 @@ use contextdb_core::read_contract::{
 };
 use contextdb_engine::local_transport::{
     DeadlineOperationWait, DeadlineStage, LocalDeadlineOperation, LocalTransportError,
-    ManualDeadlineClock, connect_with_deadline, drain_shutdown_with_deadline,
-    expire_cursor_idle_with_deadline, expire_cursor_lifetime_with_deadline,
-    handshake_with_deadline, probe_stale_with_deadline, serve_request_with_deadline,
-    write_request_with_deadline,
+    ManualDeadlineClock, MonotonicDeadlineClock, connect_with_deadline,
+    drain_shutdown_with_deadline, expire_cursor_idle_with_deadline,
+    expire_cursor_lifetime_with_deadline, handshake_with_deadline, probe_stale_with_deadline,
+    serve_request_with_deadline, write_request_with_deadline,
 };
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 struct CountingWake {
     wakes: AtomicUsize,
@@ -33,6 +34,18 @@ fn counting_waker() -> (Arc<CountingWake>, Waker) {
         wakes: AtomicUsize::new(0),
     });
     (Arc::clone(&counter), Waker::from(counter))
+}
+
+struct SignallingWake(std::sync::mpsc::Sender<()>);
+
+impl Wake for SignallingWake {
+    fn wake(self: Arc<Self>) {
+        let _ = self.0.send(());
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.0.send(());
+    }
 }
 
 #[derive(Clone)]
@@ -113,6 +126,54 @@ fn dropped_completed_and_already_past_manual_waiters_leave_no_registration() {
     let mut already_past = clock.wait_until(79);
     assert_eq!(already_past.as_mut().poll(&mut context), Poll::Ready(()));
     assert_eq!(clock.registered_waiter_count(), 0);
+}
+
+#[test]
+fn monotonic_wait_wakes_at_its_actual_deadline_and_reaps_its_timer() {
+    let (started, started_at) = std::sync::mpsc::channel();
+    let (exited, exited_at) = std::sync::mpsc::channel();
+    let clock = MonotonicDeadlineClock::with_thread_lifecycle_for_test(started, exited);
+    let deadline_ms = clock.now_ms().saturating_add(1_000);
+    let mut wait = clock.wait_until(deadline_ms);
+    let (woke, wake_received) = std::sync::mpsc::channel();
+    let waker = Waker::from(Arc::new(SignallingWake(woke)));
+    let mut context = Context::from_waker(&waker);
+
+    assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+    started_at
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the actual monotonic timer worker starts");
+    wake_received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the monotonic timer wakes the registered future");
+    assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+    drop(wait);
+    exited_at
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the expired monotonic timer worker exits");
+}
+
+#[test]
+fn abandoning_a_monotonic_wait_reaps_its_actual_timer_thread() {
+    let (started, started_at) = std::sync::mpsc::channel();
+    let (exited, exited_at) = std::sync::mpsc::channel();
+    let clock = MonotonicDeadlineClock::with_thread_lifecycle_for_test(started, exited);
+    let mut wait = clock.wait_until(clock.now_ms().saturating_add(60_000));
+    let (_counter, waker) = counting_waker();
+    let mut context = Context::from_waker(&waker);
+
+    assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+    started_at
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the actual monotonic timer worker starts");
+    assert!(matches!(
+        exited_at.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    drop(wait);
+    exited_at
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dropping the wait makes its actual timer worker exit");
 }
 
 fn assert_operation_deadline(stage: DeadlineStage, factory: OperationFactory) {

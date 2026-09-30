@@ -68,9 +68,10 @@ async fn sync_round_trip_smoke() {
 
 #[tokio::test]
 async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
-    use contextdb_core::Value;
+    use contextdb_core::{Incarnation, Value};
     use contextdb_server::protocol::{
-        MessageType, PushRequest, PushResponse, WireApplyResult, decode, encode,
+        MessageType, PushRequest, PushResponse, SyncStatusRequest, SyncStatusResponse,
+        WireApplyResult, decode, encode,
     };
     use contextdb_server::transport::{HandlerRegistration, IncomingRequest};
     use std::sync::atomic::AtomicUsize;
@@ -86,6 +87,50 @@ async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
     .unwrap();
 
     let attempts = Arc::new(AtomicUsize::new(0));
+    let status_exchanges = Arc::new(AtomicUsize::new(0));
+    let hub_incarnation = Incarnation::mint();
+    let status_handler = Arc::new({
+        let status_exchanges = status_exchanges.clone();
+        move |request: IncomingRequest| {
+            let status_exchanges = status_exchanges.clone();
+            Box::pin(async move {
+                assert!(
+                    request.node_id.is_some(),
+                    "status must carry the authenticated edge identity"
+                );
+                let envelope = decode(&request.bytes).expect("decode authenticated status request");
+                assert_eq!(envelope.message_type, MessageType::StatusRequest);
+                let probe: SyncStatusRequest =
+                    rmp_serde::from_slice(&envelope.payload).expect("decode exact status lookup");
+                let exchange = status_exchanges.fetch_add(1, Ordering::SeqCst);
+                if exchange == 0 {
+                    assert!(
+                        probe.refused_schema_unit_digests.is_empty(),
+                        "initial status lookup is empty"
+                    );
+                } else {
+                    assert_eq!(exchange, 1, "schema retry needs one exact candidate lookup");
+                    assert_eq!(
+                        probe.refused_schema_unit_digests.len(),
+                        1,
+                        "lookup names the authored DDL unit"
+                    );
+                }
+                let reply = encode(
+                    MessageType::StatusResponse,
+                    &SyncStatusResponse {
+                        applied_push_watermark: Some(Lsn(0)),
+                        server_current_lsn: Some(Lsn(1)),
+                        hub_incarnation: Some(hub_incarnation),
+                        refused_schema_unit_digests_ack: Some(probe.refused_schema_unit_digests),
+                        ..Default::default()
+                    },
+                )
+                .expect("encode authenticated status response");
+                (request.responder)(reply).await
+            }) as contextdb_server::transport::TransportFuture<'static, ()>
+        }
+    });
     let handler = Arc::new(move |request: IncomingRequest| {
         let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
         Box::pin(async move {
@@ -135,7 +180,16 @@ async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
         let shutdown = shutdown.clone();
         async move {
             transport
-                .serve(vec![HandlerRegistration { subject, handler }], shutdown)
+                .serve(
+                    vec![
+                        HandlerRegistration { subject, handler },
+                        HandlerRegistration {
+                            subject: contextdb_server::subjects::status_subject("malformed-reply"),
+                            handler: status_handler,
+                        },
+                    ],
+                    shutdown,
+                )
                 .await
                 .expect("malformed-reply responder")
         }
@@ -160,6 +214,7 @@ async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
         .await
         .expect("push should retry malformed reply");
     assert_eq!(result.applied_rows, 1);
+    assert_eq!(status_exchanges.load(Ordering::SeqCst), 2);
     assert!(
         client.push_watermark() > Lsn(0),
         "push watermark should advance"

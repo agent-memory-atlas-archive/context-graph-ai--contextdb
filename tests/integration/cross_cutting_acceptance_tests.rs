@@ -25,10 +25,21 @@ fn ignored_arm64() {}
 
 #[test]
 fn oom_does_not_partially_commit_visible_state() {
+    // The accountant charges redb's writer
+    // page-cache floor on every open where a memory limit is already installed -- which is
+    // every open but the very first, since `SET MEMORY_LIMIT` runs after that one. A `1K`
+    // declared limit is below what the engine can operate a file-backed store under at all
+    // (the same reason `si_09_reopen_preserves_configured_memory_limit` needed correcting):
+    // reopening after `close` now fails at `open/load_table_metadata` before the test's own
+    // insert ever runs. `80K` is comfortably above the fixed reload cost (schema reload +
+    // writer cache floor, ~77.7 KiB measured), while still refusing the 4096-byte oversized
+    // insert this test pins (~4.2 KiB of headroom remains after reopen, well under what that
+    // insert requests) -- so both the reopen-succeeds and the oversized-insert-is-refused
+    // halves of the promise stay provable.
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("t01.db");
     let db = Database::open(&path).unwrap();
-    db.execute("SET MEMORY_LIMIT '1K'", &HashMap::new())
+    db.execute("SET MEMORY_LIMIT '80K'", &HashMap::new())
         .unwrap();
     db.execute(
         "CREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)",

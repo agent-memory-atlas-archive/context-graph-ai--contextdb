@@ -23,6 +23,20 @@ fn items_row(name: &str) -> HashMap<String, Value> {
     ])
 }
 
+/// What a declared budget has to carry before it carries any row.
+///
+/// A budget written as a small number of bytes was written when a table with a
+/// single-column PRIMARY KEY looked like it cost a few hundred bytes. It never
+/// did: every single-column PRIMARY KEY, UNIQUE and foreign-key index
+/// allocates a fixed 64 KiB exact-probe bitmap and holds it for the life of
+/// the index, and until the charge model was corrected the accountant could
+/// not see it. Now that it can, a budget that means "room for the schema and
+/// `headroom` bytes more" has to say so. `exact_indexes` is how many such
+/// indexes the arm's tables declare.
+fn budget_over_schema(exact_indexes: usize, headroom: usize) -> usize {
+    exact_indexes * contextdb_core::EXACT_PROBE_FILTER_BYTES + headroom
+}
+
 /// Creates the table and stores one row of `name`, reporting what the schema and
 /// that row each cost the accountant. Arms below size their budget from this
 /// rather than writing a number down, so they keep pinning the promised behavior
@@ -59,6 +73,7 @@ fn m01_insert_succeeds_under_budget() {
     .unwrap();
 
     // INSERT should succeed — budget is large enough.
+    let before_insert = accountant.usage().used;
     let result = db.execute(
         "INSERT INTO items (id, name) VALUES ($id, $name)",
         &make_params(vec![
@@ -72,17 +87,19 @@ fn m01_insert_succeeds_under_budget() {
     );
 
     // Memory used must reflect the actual row size (UUID=16 + "hello"=5 + overhead).
-    // A single row with a UUID and short TEXT should use between 32 and 1024 bytes.
-    let usage = accountant.usage();
+    // Measured as the INSERT's own delta rather than the store's total, because
+    // the total also carries the schema -- including the 64 KiB exact-probe
+    // bitmap the primary key's index allocates for its lifetime, which the
+    // accountant now sees. The row itself stays small: its values, its slot and
+    // side maps in the relational store, and one posting in the primary key.
+    let row_bytes = accountant.usage().used - before_insert;
     assert!(
-        usage.used >= 32,
-        "used bytes must be >= 32 after INSERT, got {}",
-        usage.used
+        row_bytes >= 32,
+        "a stored row must cost at least 32 bytes, got {row_bytes}"
     );
     assert!(
-        usage.used <= 1024,
-        "used bytes must be <= 1024 for a single small row, got {}",
-        usage.used
+        row_bytes <= 2048,
+        "a single row with a UUID and short TEXT must cost at most 2048 bytes, got {row_bytes}"
     );
 }
 
@@ -277,8 +294,9 @@ fn m04_vector_search_succeeds_under_budget() {
 // ---------------------------------------------------------------------------
 #[test]
 fn m05_vector_search_rejected_over_budget() {
-    // 8KB budget — enough for CREATE TABLE + one vector insert, too small for search pre-flight.
-    let accountant = Arc::new(MemoryAccountant::with_budget(8192));
+    // 8KB over the schema — enough for CREATE TABLE + one vector insert, too small for search
+    // pre-flight.
+    let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(1, 8192)));
     let db = Database::open_memory_with_accountant(accountant.clone());
     db.execute(
         "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(384))",
@@ -420,8 +438,8 @@ fn m07_bfs_succeeds_under_budget() {
 // ---------------------------------------------------------------------------
 #[test]
 fn m08_bfs_rejected_over_budget() {
-    // 4KB budget — enough for DDL + node inserts, too small for deep BFS frontier.
-    let accountant = Arc::new(MemoryAccountant::with_budget(4096));
+    // 4KB over the two schemas — enough for DDL + node inserts, too small for deep BFS frontier.
+    let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(2, 4096)));
     let db = Database::open_memory_with_accountant(accountant.clone());
     db.execute(
         "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT)",
@@ -576,9 +594,52 @@ fn m12_open_with_config_wires_accountant() {
         NAME,
     );
 
-    // Enough for the schema and less than one row, so only the accountant the
-    // caller supplied can be what refuses the INSERT.
-    let accountant = Arc::new(MemoryAccountant::with_budget(schema_bytes + row_bytes / 2));
+    // The writer's page-cache reserve charged at open (`redb_writer_cache_bytes_for_limit`)
+    // is sized from the declared budget itself, so the measurement db (opened under
+    // the large flat `MEASUREMENT_BUDGET`) and the real db below (opened under a much
+    // smaller, self-referential budget) are charged different reserves at open, even
+    // though the DDL and row costs measured on the measurement db are identical to
+    // what the real db pays. `schema_bytes` above is a TOTAL (`accountant.usage().used`
+    // right after CREATE TABLE), so it already has the measurement db's reserve baked
+    // in; pull that out to get the reserve-independent DDL charge, then size the real
+    // budget so it, in turn, pays exactly `ddl_charge + row_bytes / 2` over ITS OWN
+    // reserve. The real db's own reserve is a function of the budget being solved for,
+    // so resolve the two simultaneously with a fixed-point iteration — the reserve
+    // function is a bounded, monotonic share of the limit, so this converges in a few
+    // steps.
+    let measurement_reserve =
+        contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(
+            MEASUREMENT_BUDGET,
+        ));
+    let ddl_charge = schema_bytes - measurement_reserve;
+    let margin = row_bytes / 2;
+    // CREATE TABLE's own content-identity proof-maintenance step needs a small
+    // transient allowance ABOVE its final settled `ddl_charge`; at the fixed point with zero slack
+    // the DDL step itself is refused (observed: requested 228, available 127 —
+    // 101 bytes short) before the INSERT this test is calibrating for is ever
+    // reached. `ddl_transient_slack` covers that with headroom, and stays
+    // small enough that the margin the INSERT sees (`margin + ddl_transient_slack`)
+    // is still well under a full `row_bytes`, so a missing row charge fails
+    // this assertion.
+    let ddl_transient_slack: usize = 400;
+    assert!(
+        margin + ddl_transient_slack < row_bytes,
+        "the DDL transient slack must not swallow the INSERT margin: margin={margin} \
+         slack={ddl_transient_slack} row_bytes={row_bytes}"
+    );
+    let mut real_budget = schema_bytes + margin; // seed: the pre-fix formula
+    for _ in 0..16 {
+        let real_reserve =
+            contextdb_engine::persistence::redb_writer_cache_bytes_for_limit_for_test(Some(
+                real_budget,
+            ));
+        let next_budget = real_reserve + ddl_charge + margin + ddl_transient_slack;
+        if next_budget == real_budget {
+            break;
+        }
+        real_budget = next_budget;
+    }
+    let accountant = Arc::new(MemoryAccountant::with_budget(real_budget));
     let db = Database::open_with_config(
         tmp.path().join("m12.db"),
         Arc::new(contextdb_engine::plugin::CorePlugin),
@@ -925,8 +986,10 @@ fn mt1_drop_table_releases_accounting() {
 // ---------------------------------------------------------------------------
 #[test]
 fn mt2_update_rejection_leaves_accounting_unchanged() {
-    // Budget tight enough that a large UPDATE will be rejected.
-    let accountant = Arc::new(MemoryAccountant::with_budget(2048));
+    // Budget tight enough over the schema that the 4 KiB UPDATE below is
+    // rejected, and wide enough that the small row and the indexed read that
+    // locates it are not.
+    let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(1, 4096)));
     let db = Database::open_memory_with_accountant(accountant.clone());
 
     db.execute(
@@ -1031,7 +1094,7 @@ fn mt4_failed_vector_alloc_releases_row_bytes() {
     // Budget just enough for CREATE TABLE + row bytes, but not row + vector.
     // VECTOR(384) = 24 + 384*4 = 1560 bytes. Row ~200 bytes. Total ~1760.
     // Budget 1200 after CREATE TABLE overhead leaves room for row but not row+vector.
-    let accountant = Arc::new(MemoryAccountant::with_budget(1500));
+    let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(1, 1500)));
     let db = Database::open_memory_with_accountant(accountant.clone());
 
     db.execute(
@@ -1069,7 +1132,7 @@ fn mt5_hnsw_build_failure_no_leaked_bytes() {
     // HNSW needs ~entries * dim * 4 * 3 bytes.
     // 1000 entries * 4 dims * 4 bytes * 3 = 48000 bytes for HNSW.
     // Budget allows all rows but not the HNSW structure.
-    let accountant = Arc::new(MemoryAccountant::with_budget(40_000));
+    let accountant = Arc::new(MemoryAccountant::with_budget(budget_over_schema(1, 40_000)));
     let db = Database::open_memory_with_accountant(accountant.clone());
 
     db.execute(
@@ -1103,9 +1166,10 @@ fn mt5_hnsw_build_failure_no_leaked_bytes() {
     // actual rows + vectors + metadata, not the HNSW structure.
     let usage = accountant.usage();
     assert!(
-        usage.used <= 40_000,
-        "usage must not exceed budget (no HNSW leak): used={}",
-        usage.used
+        usage.used <= budget_over_schema(1, 40_000),
+        "usage must not exceed budget (no HNSW leak): used={} of {}",
+        usage.used,
+        budget_over_schema(1, 40_000),
     );
 
     // EXPLAIN should show BruteForce, not Hnsw.

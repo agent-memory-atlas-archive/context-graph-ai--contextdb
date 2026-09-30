@@ -5,7 +5,7 @@
 //! trip a NEWLY declared policy through the real on-disk encoding (`bincode`
 //! via `bincode::serde`, the path the engine's own persistence layer uses --
 //! see `crates/contextdb-engine/src/persistence.rs`), and (b) tolerate an
-//! EXISTING on-disk `TableMeta` that predates the field, decoding it with
+//! `TableMeta` payload without that trailing field, decoding it with
 //! `history_policy == None` rather than refusing to load.
 //!
 //! Discipline: no sleeps, no elapsed-time assertions, no raw clock reads --
@@ -67,19 +67,18 @@ fn sample_meta(history_policy: Option<HistoryPolicy>) -> TableMeta {
         primary_key_columns: Vec::new(),
         conflict_policy: Some(ConflictPolicy::KEEP_LATEST),
         history_policy,
-        // Current metadata includes absent custody declarations;
-        // the historical payload structs below retain their exact old shape.
+        // Current metadata includes absent custody declarations and an absent
+        // maintained-count declaration; the short-tail payload structs below
+        // retain their exact old shape.
         delivery_manifest_tables: None,
         edge_discard: None,
+        maintained_counts: None,
     }
 }
 
-/// The exact 16-field shape `TableMeta` had before `history_policy` was
-/// appended -- an on-disk payload written by a build that predates this
-/// change. `bincode`'s serde path is non-self-describing (no field names, no
-/// struct framing beyond the fields themselves), so a struct with the SAME
-/// field order and types serializes to byte-identical output to what the
-/// pre-change `TableMeta` produced.
+/// Sixteen-field TableMeta payload without `history_policy`. Bincode's serde
+/// path has no field names or struct framing; the same positional field order
+/// and types produce the exact input bytes the tail decoder must handle.
 #[derive(Serialize)]
 struct PreHistoryPolicyTableMeta {
     columns: Vec<ColumnDef>,
@@ -147,10 +146,9 @@ fn declared_history_policy_round_trips_through_the_real_on_disk_encoding() {
     }
 }
 
-/// An on-disk `TableMeta` written before `history_policy` existed still loads:
-/// the tail is absent, and the field decodes as `None` rather than failing the
-/// whole table's metadata load. This is the compatibility half of the tail-field
-/// contract -- an existing data root must open unchanged after this build lands.
+/// A `TableMeta` payload without the `history_policy` tail field decodes
+/// that field as `None`. This exercises the metadata decoder in isolation;
+/// opening a store still enforces the engine's format and schema checks.
 #[test]
 fn a_pre_history_policy_on_disk_table_meta_still_loads_with_no_declared_policy() {
     let bytes = legacy_bytes_without_history_policy();
@@ -168,16 +166,13 @@ fn a_pre_history_policy_on_disk_table_meta_still_loads_with_no_declared_policy()
         "a pre-existing table with no HISTORY declaration must decode as undeclared, not error \
          and not default to a policy nobody wrote"
     );
-    // The rest of the legacy payload must still decode intact.
+    // The rest of the short-tail payload must still decode intact.
     assert_eq!(decoded.conflict_policy, Some(ConflictPolicy::KEEP_LATEST));
     assert_eq!(decoded.columns.len(), 1);
 }
 
-/// The shape `TableMeta` had two fields further back -- BEFORE
-/// `conflict_policy` existed either, so this predates the current change
-/// entirely. This isolates whether a short-tail decode failure is specific
-/// to the newly appended field or a property of the encoding shared by
-/// every trailing field this struct has ever grown.
+/// TableMeta payload without `conflict_policy` or `history_policy`. This checks
+/// that tail exhaustion applies consistently across both optional fields.
 #[derive(Serialize)]
 struct PreConflictPolicyTableMeta {
     columns: Vec<ColumnDef>,
@@ -197,7 +192,7 @@ struct PreConflictPolicyTableMeta {
     primary_key_columns: Vec<String>,
 }
 
-/// Whether the compatibility gap above is unique to `history_policy` or a
+/// Whether the short-tail behavior above is unique to `history_policy` or a
 /// property of every trailing field this struct carries: decoding a payload
 /// two fields shorter (missing BOTH `conflict_policy` and `history_policy`)
 /// through the exact same on-disk path.

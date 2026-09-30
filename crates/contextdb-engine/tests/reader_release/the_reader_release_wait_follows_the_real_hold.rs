@@ -32,15 +32,15 @@ use contextdb_engine::local_transport::RuntimeDirectory;
 use contextdb_engine::persistence::read_persistence_test_scaffold::{
     RawRedbWriterOpenObservation, try_raw_redb_writer_open_for_test,
 };
-use contextdb_engine::persistence::{ReaderReleaseWait, wait_for_reader_release};
-use contextdb_engine::{
-    Database, ReadPhase, ReadProgress, ReadProgressObserver, ReadSession, ReadSessionOptions,
+use contextdb_engine::persistence::read_persistence_test_scaffold::{
+    ReaderSourceStartPause, pause_readers_at_source_start_for_test,
 };
+use contextdb_engine::persistence::{ReaderReleaseWait, wait_for_reader_release};
+use contextdb_engine::{Database, ReadSession, ReadSessionOptions};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 /// Failsafe only. Nothing here asserts how long a wake took; this exists so a
@@ -50,8 +50,8 @@ const WATCHDOG: Duration = Duration::from_secs(60);
 /// how a journey establishes that the wait is genuinely blocked on the holder
 /// rather than having already answered.
 const PARKED: Duration = Duration::from_secs(2);
-/// Enough committed bytes that loading the image reports its progress at least
-/// once, which is where a reader can be parked while it holds the store.
+/// A store with real committed content, so the load these journeys stop a
+/// reader inside is a real one and not an empty file's.
 const WIDE_ROWS: usize = 8;
 const WIDE_ROW_BYTES: usize = 512 * 1024;
 
@@ -118,79 +118,54 @@ fn idle_store(directory: &Path) -> PathBuf {
     path
 }
 
-/// Stops the reading thread inside the load, where it is holding the store,
-/// and lets the test decide when it may finish.
-#[derive(Default)]
+/// A real direct reader, stopped where its read-image source starts -- the
+/// first production point inside the load-time hold, before any registration
+/// is published -- and let go when the journey says so.
+///
+/// Nothing here manufactures a holder. The reader is an ordinary one, holding
+/// the store exactly as any reader does; the store simply stops it at that
+/// point until this handle releases it.
 struct ParkingReader {
-    entered: (Mutex<bool>, Condvar),
-    release: (Mutex<bool>, Condvar),
-    parked: AtomicBool,
+    /// This journey's own pause over its own store: the only handle that can
+    /// free the reader it stopped, and no handle at all on anyone else's.
+    pause: ReaderSourceStartPause,
+    ticket: u64,
 }
 
 impl ParkingReader {
-    fn wait_until_holding(&self) {
-        let (flag, signal) = &self.entered;
-        let mut entered = flag.lock().expect("parked reader state");
-        while !*entered {
-            let (next, timed_out) = signal
-                .wait_timeout(entered, WATCHDOG)
-                .expect("parked reader condvar");
-            entered = next;
-            assert!(
-                !timed_out.timed_out() || *entered,
-                "the reader never reported loading the store, so nothing ever held it"
-            );
-        }
-    }
-
     fn let_go(&self) {
-        let (flag, signal) = &self.release;
-        *flag.lock().expect("parked reader state") = true;
-        signal.notify_all();
+        self.pause.release(self.ticket);
     }
 }
 
-impl ReadProgressObserver for ParkingReader {
-    fn progress(&self, progress: ReadProgress) {
-        if progress.phase != ReadPhase::Hydrating || self.parked.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        {
-            let (flag, signal) = &self.entered;
-            *flag.lock().expect("parked reader state") = true;
-            signal.notify_all();
-        }
-        let (flag, signal) = &self.release;
-        let mut released = flag.lock().expect("parked reader state");
-        while !*released {
-            released = signal.wait(released).expect("parked reader condvar");
-        }
+/// A journey that came apart before it let its reader go still lets it go, so
+/// a failed assertion leaves no reading thread stopped in the store.
+impl Drop for ParkingReader {
+    fn drop(&mut self) {
+        self.let_go();
     }
 }
 
-/// A real direct reader, parked inside the load with the store held. Joining
-/// the returned handle after `let_go` is what releases it.
+/// A real direct reader, stopped at source start inside the load with the
+/// store held. Joining the returned handle after `let_go` is what releases it.
 fn park_a_reader(path: &Path, runtime: &Path) -> (Arc<ParkingReader>, std::thread::JoinHandle<()>) {
-    let parking = Arc::new(ParkingReader::default());
-    let observer: Arc<dyn ReadProgressObserver> = parking.clone();
+    let pause = pause_readers_at_source_start_for_test(path);
     let path = path.to_path_buf();
     let runtime = runtime.to_path_buf();
     let holding = std::thread::spawn(move || {
-        let session = ReadSession::open_with_progress_in_runtime_dir(
-            &path,
-            ReadSessionOptions::default(),
-            Some(runtime),
-            observer,
-        )
-        .expect("an idle store is readable");
+        let session =
+            ReadSession::open_in_runtime_dir(&path, ReadSessionOptions::default(), Some(runtime))
+                .expect("an idle store is readable");
         assert_eq!(
             session.route(),
             ReadRoute::File,
             "a direct reader is what holds the store; an owner route holds nothing"
         );
     });
-    parking.wait_until_holding();
-    (parking, holding)
+    let ticket = pause
+        .wait_for_paused_reader(WATCHDOG)
+        .expect("the reader never started its read-image source, so nothing ever held the store");
+    (Arc::new(ParkingReader { pause, ticket }), holding)
 }
 
 /// The definitive fact, asked of the storage engine itself: a store a direct

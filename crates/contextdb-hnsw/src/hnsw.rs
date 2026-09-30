@@ -285,6 +285,49 @@ impl<'b, T: Clone + Send + Sync> Point<'b, T> {
         self.origin_id
     }
 
+    /// How many neighbours this point keeps at `level`.
+    pub fn neighbour_count(&self, level: usize) -> usize {
+        self.neighbours.read().get(level).map_or(0, Vec::len)
+    }
+
+    /// Return one neighbour's physical and client identities without copying
+    /// its entire adjacency list. A caller can traverse an owned graph through
+    /// the same bounded source interface as an immutable saved graph.
+    pub fn neighbour_identity(&self, level: usize, position: usize) -> Option<(PointId, DataId)> {
+        self.neighbours
+            .read()
+            .get(level)?
+            .get(position)
+            .map(|neighbour| {
+                (
+                    neighbour.point_ref.get_point_id(),
+                    neighbour.point_ref.get_origin_id(),
+                )
+            })
+    }
+
+    /// Append the physical and client identities of this point's neighbours
+    /// at `level` to `out`, at most as many as `out` has spare capacity for,
+    /// so the caller decides -- and pays for -- every allocation. Returns how
+    /// many were appended. A caller sizes `out` with `neighbour_count` first;
+    /// a list grown by a concurrent insertion since then is cut at the
+    /// capacity rather than reallocated here.
+    pub fn copy_neighbour_ids(&self, level: usize, out: &mut Vec<(PointId, DataId)>) -> usize {
+        let neighbours = self.neighbours.read();
+        let Some(list) = neighbours.get(level) else {
+            return 0;
+        };
+        let room = out.capacity().saturating_sub(out.len());
+        let taken = list.len().min(room);
+        out.extend(list[..taken].iter().map(|neighbour| {
+            (
+                neighbour.point_ref.get_point_id(),
+                neighbour.point_ref.get_origin_id(),
+            )
+        }));
+        taken
+    }
+
     /// returns for each layer, a vector Neighbour of a point, one vector by layer
     /// useful for extern crate only as it reallocates vectors
     pub fn get_neighborhood_id(&self) -> Vec<Vec<Neighbour>> {
@@ -717,6 +760,24 @@ impl<'b, T: Clone + Send + Sync> PointIndexation<'b, T> {
         }
     } // end of get_point
 
+    /// The entry point's identity, if the graph has one yet.
+    pub fn entry_point_id(&self) -> Option<PointId> {
+        self.entry_point.read().as_ref().map(|point| point.p_id)
+    }
+
+    /// One point by physical identity, from a single read of the layer table.
+    /// Unlike `get_point`, it does not consult the entry point: a walk that
+    /// sized its own view of the layers asks only for points inside it, and a
+    /// point appended since is simply absent from that view.
+    pub fn resident_point(&self, p_id: &PointId) -> Option<Arc<Point<'b, T>>> {
+        let rank = usize::try_from(p_id.1).ok()?;
+        self.points_by_layer
+            .read()
+            .get(p_id.0 as usize)
+            .and_then(|layer| layer.get(rank))
+            .map(Arc::clone)
+    }
+
     /// Borrow one resident graph payload by physical identity without copying it.
     pub fn with_point_data<R>(&self, p_id: &PointId, f: impl FnOnce(&[T]) -> R) -> Option<R> {
         self.get_point(p_id).map(|point| f(point.data.get_v()))
@@ -839,6 +900,15 @@ impl<'b, T: Clone + Send + Sync + 'b> Iterator for IterPointLayer<'_, 'b, T> {
 
 // ============================================================================================
 
+/// The most neighbours a point keeps on the bottom layer (layer 0) of a graph
+/// built with `max_nb_connection` neighbours per upper layer: twice that, as
+/// Malkov and Yashunin's construction prescribes (`M_max0 = 2 * M`). Insertion
+/// and pruning build layer 0 to exactly this bound, and a search that expands
+/// a layer-0 point evaluates at most this many of its neighbours.
+pub const fn layer0_max_nb_connection(max_nb_connection: usize) -> usize {
+    max_nb_connection.saturating_mul(2)
+}
+
 // The fields are made pub(crate) to be able to initialize struct from hnswio
 /// The Base structure for hnsw implementation.
 /// The main useful functions are : new, insert, insert_parallel, search, parallel_search and file_dump
@@ -926,6 +996,10 @@ where
 
     pub fn get_max_nb_connection(&self) -> usize {
         self.graph.get_max_nb_connection()
+    }
+
+    pub fn get_max_nb_connection_layer0(&self) -> usize {
+        self.graph.get_max_nb_connection_layer0()
     }
 
     pub fn get_nb_point(&self) -> usize {
@@ -1046,6 +1120,9 @@ pub enum HnswSearchScratchContainer {
     SeenRows,
     QueryBytes,
     ExactKey,
+    /// One search's own directory of the serving pages it has resolved, sized
+    /// by the serving cache it shadows.
+    ServingPageDirectory,
 }
 
 /// A pre-growth or release event for request-bounded HNSW search scratch.
@@ -1539,6 +1616,11 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
     pub fn get_max_nb_connection(&self) -> usize {
         self.max_nb_connection
     }
+    /// returns the maximum of links a point keeps on the bottom layer, which
+    /// the construction makes wider than the upper layers'
+    pub fn get_max_nb_connection_layer0(&self) -> usize {
+        layer0_max_nb_connection(self.max_nb_connection)
+    }
     /// returns number of points stored in hnsw structure
     pub fn get_nb_point(&self) -> usize {
         self.layer_indexed_points.get_nb_point()
@@ -1782,6 +1864,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         &self,
         point: &[T],
         entry_point: Arc<Point<'b, T>>,
+        dist_to_entry_point: f32,
         ef: usize,
         layer: u8,
         before_source_entry: &mut dyn FnMut() -> std::result::Result<(), E>,
@@ -1799,8 +1882,6 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         let mut visited_point_ids = HashSet::<PointId>::new();
         let mut candidate_points = BinaryHeap::<PointWithOrder<T>>::new();
         let search = (|| {
-            before_distance().map_err(HnswBoundedSearchError::Callback)?;
-            let dist_to_entry_point = self.dist_f.eval(point, entry_point.data.get_v());
             scratch.ensure_set_capacity(
                 HnswSearchScratchContainer::VisitedPoints,
                 &mut visited_point_ids,
@@ -1966,6 +2047,9 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
 
         let mut visited_point_ids = HashSet::<PointId>::new();
         let mut candidate_points = BinaryHeap::<PointWithOrder<T>>::new();
+        // Whether the walk stopped because it had searched far enough, rather
+        // than because it ran out of anywhere to go.
+        let mut converged = false;
         let search = (|| {
             scratch.ensure_set_capacity(
                 HnswSearchScratchContainer::VisitedPoints,
@@ -2074,6 +2158,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                 // candidates. Native snapshot scoring decides their order;
                 // revisiting historical occurrences cannot add another row.
                 if return_points.len() >= allowed_count {
+                    converged = true;
                     break;
                 }
                 if return_points.len() >= ef {
@@ -2084,6 +2169,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                                 "allowed return heap",
                             ))?;
                     if return_points.len() >= ef && -candidate.dist_to_ref > farthest.dist_to_ref {
+                        converged = true;
                         break;
                     }
                 }
@@ -2093,20 +2179,23 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     .get(layer as usize)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
+                // The second return value says whether this point belongs to
+                // the allowed set. A point already visited was admitted when it
+                // was first reached, so it counts as allowed here.
                 let mut consider = |point_ref: &Arc<Point<'b, T>>| -> std::result::Result<
-                    Option<HnswAllowedSearchIncomplete>,
+                    (Option<HnswAllowedSearchIncomplete>, bool),
                     HnswBoundedSearchError<E>,
                 > {
                     before_source_entry().map_err(HnswBoundedSearchError::Callback)?;
                     if visited_point_ids.contains(&point_ref.p_id) {
-                        return Ok(None);
+                        return Ok((None, true));
                     }
                     if !allow_bridges && !allowed(point_ref.origin_id) {
-                        return Ok(None);
+                        return Ok((None, false));
                     }
                     match traversal.visit(before_source_entry)? {
                         Ok(()) => {}
-                        Err(reason) => return Ok(Some(reason)),
+                        Err(reason) => return Ok((Some(reason), true)),
                     }
                     let next_visited = visited_point_ids
                         .len()
@@ -2122,7 +2211,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     visited_point_ids.insert(point_ref.p_id);
                     match traversal.distance(before_distance)? {
                         Ok(()) => {}
-                        Err(reason) => return Ok(Some(reason)),
+                        Err(reason) => return Ok((Some(reason), true)),
                     }
                     let distance = self.dist_f.eval(point, point_ref.data.get_v());
                     let next_candidates = candidate_points
@@ -2138,7 +2227,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     )?;
                     candidate_points.push(PointWithOrder::new(point_ref, -distance));
                     if !allowed(point_ref.origin_id) {
-                        return Ok(None);
+                        return Ok((None, false));
                     }
                     traversal.allowed_admissions += 1;
                     let next_returns = return_points
@@ -2165,25 +2254,31 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     if return_points.len() > ef {
                         return_points.pop();
                     }
-                    Ok(None)
+                    Ok((None, true))
                 };
                 for neighbour in neighbours {
-                    if let Some(reason) = consider(&neighbour.point_ref)? {
+                    let (reason, neighbour_is_allowed) = consider(&neighbour.point_ref)?;
+                    if let Some(reason) = reason {
                         return Ok(Some(reason));
                     }
-                    if !allow_bridges && allowed_count < self.get_nb_point() {
+                    if !allow_bridges && !neighbour_is_allowed {
                         // A residual predicate can disconnect adjacent allowed
-                        // points. Traverse a fixed second hop through graph
-                        // links without measuring excluded vectors. The degree
-                        // bounds this work; every inspected point still reaches
-                        // the request's cancellation and source-work control.
+                        // points, and an excluded neighbour is exactly where
+                        // the induced allowed graph breaks. Step through THAT
+                        // neighbour once, as navigation, without measuring its
+                        // vector. An admitted neighbour is already a live
+                        // candidate and expands on its own turn, so bridging
+                        // past it would re-walk the same region at the square
+                        // of the graph degree. The degree bounds this work;
+                        // every inspected point still reaches the request's
+                        // cancellation and source-work control.
                         let bridges = neighbour.point_ref.neighbours.read();
                         for bridge in bridges
                             .get(layer as usize)
                             .map(Vec::as_slice)
                             .unwrap_or_default()
                         {
-                            if let Some(reason) = consider(&bridge.point_ref)? {
+                            if let (Some(reason), _) = consider(&bridge.point_ref)? {
                                 return Ok(Some(reason));
                             }
                         }
@@ -2199,8 +2294,47 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         );
         match search {
             Ok(incomplete) => {
+                // A layer that ran out of frontier while allowed points it had
+                // not reached remained has not searched this query's breadth.
+                // Under a selective filter its neighbours are refused before
+                // they are ever visited, so the walk can die a few steps from
+                // where it entered, holding nothing but the points it entered
+                // through -- an answer about those entry points, not about the
+                // query. Report that as incomplete so the caller navigates
+                // through the excluded points instead of publishing it.
+                //
+                // "Ran out" is the exact test: a walk that stopped because its
+                // nearest remaining candidate was already worse than what it
+                // held, or because it had found every admitted point, searched
+                // as far as it was asked to and is complete however few rows
+                // that left. A walk with nowhere left to go, admitted points it
+                // never reached, and a filter that could have cut it off, is
+                // not. Where nothing is excluded there is nothing to navigate
+                // around, and retrying would only walk the same ground twice.
+                //
+                // How connected the admitted points still are to each other
+                // decides which of those two a converged walk is. A filter that
+                // keeps a fraction `p` of the graph leaves each admitted point
+                // about `p * M` admitted neighbours, and below one admitted
+                // neighbour per admitted point the admitted set stops reaching
+                // itself at all: the fragments are separate graphs, and
+                // converging inside one of them says nothing about the others.
+                // So a walk over so sparse a filter has finished only when it
+                // has reached every admitted point; anything less is a report
+                // about the fragment it entered, not about the query.
+                let fragmented =
+                    allowed_count.saturating_mul(self.max_nb_connection) < self.get_nb_point();
+                //
+                // A walk that already navigates through excluded points is the
+                // remedy, not a candidate for it: it searched the whole graph
+                // and kept what it was allowed to keep, so converging there is
+                // finishing, however few admitted points it happened to meet.
+                let starved = !allow_bridges
+                    && traversal.allowed_admissions < allowed_count
+                    && allowed_count < self.get_nb_point()
+                    && (!converged || fragmented);
                 let incomplete = incomplete.or_else(|| {
-                    (return_points.len() < required_results)
+                    (return_points.len() < required_results || starved)
                         .then_some(HnswAllowedSearchIncomplete::InsufficientAllowedCandidates)
                 });
                 Ok(HnswAllowedLayerResult {
@@ -2343,7 +2477,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                 let nb_conn;
                 let extend_c;
                 if l == 0 {
-                    nb_conn = 2 * self.max_nb_connection;
+                    nb_conn = self.get_max_nb_connection_layer0();
                     extend_c = self.extend_candidates;
                 } else {
                     nb_conn = self.max_nb_connection;
@@ -2443,7 +2577,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
                     let threshold_shrinking = if l_n > 0 {
                         self.max_nb_connection
                     } else {
-                        2 * self.max_nb_connection
+                        self.get_max_nb_connection_layer0()
                     };
                     if nbn_at_l > threshold_shrinking {
                         // Keep the same directional-diversity heuristic used
@@ -2864,6 +2998,7 @@ impl<'b, T: Clone + Send + Sync, D: Distance<T> + Send + Sync> Hnsw<'b, T, D> {
         let neighbours_heap = self.bounded_search_layer(
             data,
             pivot,
+            dist_to_entry,
             ef,
             layer_to_search,
             &mut before_source_entry,

@@ -1,3 +1,4 @@
+use crate::hnsw::ServingPages;
 use crate::memory_budget::{MemoryBudget, VectorWorkspaceReservation};
 use crate::{HnswIndex, quantized::StoredVectorEntry};
 use contextdb_core::{
@@ -130,6 +131,11 @@ pub struct VectorMaintenanceProgressPauseHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VectorMaintenancePreparationPhaseForTest {
     LoadAuthoritativeRawVectors,
+    AdmitEncoding,
+    AdmitCandidate,
+    CandidateAdmitted,
+    AdmitPersistence,
+    PersistenceAdmitted,
     EncodeGraph,
     HashStateDigest,
     PrepareDurableGeneration,
@@ -362,6 +368,9 @@ impl MaintenanceProgressPauseSlot {
 thread_local! {
     static HELD_MAINTENANCE_LOCKS: RefCell<Vec<(StoreId, VectorIndexRef, VectorPartitionKey)>> = const { RefCell::new(Vec::new()) };
     static HELD_BULK_READ_LOCKS: RefCell<Vec<StoreId>> = const { RefCell::new(Vec::new()) };
+    /// The partitions the statement on this thread is searching, by address,
+    /// while it loads their graphs.
+    static STATEMENT_PARTITIONS: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
     static HELD_BULK_WRITE_LOCKS: RefCell<Vec<StoreId>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -454,18 +463,45 @@ pub(crate) struct BoundedIndexEligibility {
 struct PartitionVectors {
     entries: Vec<StoredVectorEntry>,
     by_row: HashMap<RowId, Vec<usize>>,
+    payload_memberships: HashMap<usize, usize>,
+    owned_payload_bytes: usize,
 }
 
 impl PartitionVectors {
     fn push(&mut self, entry: StoredVectorEntry) {
         let position = self.entries.len();
         self.by_row.entry(entry.row_id).or_default().push(position);
+        if let Some(identity) = entry.vector.payload_identity() {
+            self.payload_memberships
+                .entry(identity)
+                .or_insert(entry.estimated_bytes());
+        } else {
+            self.owned_payload_bytes = self
+                .owned_payload_bytes
+                .saturating_add(entry.estimated_bytes());
+        }
         self.entries.push(entry);
+    }
+
+    fn unique_payload_bytes(&self) -> usize {
+        self.owned_payload_bytes
+            .saturating_add(self.payload_memberships.values().copied().sum())
     }
 
     fn rebuild_row_positions(&mut self) {
         self.by_row.clear();
+        self.payload_memberships.clear();
+        self.owned_payload_bytes = 0;
         for (position, entry) in self.entries.iter().enumerate() {
+            if let Some(identity) = entry.vector.payload_identity() {
+                self.payload_memberships
+                    .entry(identity)
+                    .or_insert(entry.estimated_bytes());
+            } else {
+                self.owned_payload_bytes = self
+                    .owned_payload_bytes
+                    .saturating_add(entry.estimated_bytes());
+            }
             self.by_row.entry(entry.row_id).or_default().push(position);
         }
     }
@@ -574,6 +610,16 @@ pub struct VectorMaintenanceFailureDetails {
     pub recovery_instruction: &'static str,
 }
 
+/// Fixed maintenance metadata from a borrowed active or historical source.
+/// Sampling this value retains no key, graph, or vector allocation.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorPartitionSourceMaintenanceMetadata {
+    pub historical_only: bool,
+    pub quarantine: Option<VectorRouteQuarantineReason>,
+    pub failure: Option<VectorMaintenanceFailureDetails>,
+}
+
 impl VectorMaintenanceFailure {
     pub fn reason(self) -> &'static str {
         match self {
@@ -618,6 +664,8 @@ impl VectorMaintenanceFailureDetails {
             "finalize_repaired_vector_partition" => "finalize_repaired_vector_partition",
             "truncate_vector_partition_journal" => "truncate_vector_partition_journal",
             "load_durable_vector_generation" => "load_durable_vector_generation",
+            "read_vector_generation_source_page" => "read_vector_generation_source_page",
+            "inspect_vector_generation_inventory" => "inspect_vector_generation_inventory",
             "prepare_hnsw_tail" => "prepare_hnsw_tail",
             _ => "vector_maintenance",
         }
@@ -808,11 +856,187 @@ impl VectorMaintenanceFailureDetails {
     }
 }
 
+#[derive(Clone)]
 struct SealedHnswGeneration {
     identity: VectorGraphGeneration,
+    contents: Arc<SealedHnswGenerationContents>,
+}
+
+struct SealedHnswGenerationContents {
     graph: HnswIndex,
-    bytes: usize,
+    charge: SealedHnswCharge,
+}
+
+struct SealedHnswCharge {
+    /// Falls while the generation is resident when its serving cache gives
+    /// slots back; what remains is released when the generation goes.
+    bytes: AtomicUsize,
     accountant: Option<Arc<dyn MemoryBudget>>,
+}
+
+/// One snapshot-compatible graph layer, held by the statement that is
+/// searching it for as long as its search runs.
+///
+/// A sealed generation is held by an owned clone: it is immutable and carries
+/// its memory charge in a shared owner, so holding it keeps the graph and its
+/// charge alive even if a publication replaces the generation underneath. The
+/// mutable tail is held under its read lock instead. It is charged to its
+/// partition, not to a shared owner, and a publication moves or replaces it
+/// under that lock's write side, so holding the read side is what keeps it --
+/// and the rows the snapshot selected in it -- in place until the search lets
+/// go. Commits keep appending to it meanwhile; the search skips any point it
+/// did not see when it opened the layer, and per-row visibility drops rows
+/// newer than its snapshot.
+pub(crate) struct SnapshotCompatibleLayer<'s> {
+    pub(crate) identity: Option<VectorGraphGeneration>,
+    held: HeldLayer<'s>,
+    len: usize,
+}
+
+enum HeldLayer<'s> {
+    Sealed(SealedHnswGeneration),
+    Tail(parking_lot::MappedRwLockReadGuard<'s, HnswIndex>),
+    /// A tail whose search has finished. Its lock is given back before the
+    /// statement resolves its candidates, because resolving reads the
+    /// partition under its publication lock, and a publication waiting for
+    /// the tail's write side holds that lock.
+    Released,
+}
+
+impl SnapshotCompatibleLayer<'_> {
+    /// The layer's graph, while the search holds it.
+    pub(crate) fn graph(&self) -> Option<&HnswIndex> {
+        match &self.held {
+            HeldLayer::Sealed(sealed) => Some(sealed.graph()),
+            HeldLayer::Tail(tail) => Some(tail),
+            HeldLayer::Released => None,
+        }
+    }
+
+    /// The points the layer held when it was selected.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Give back a held tail's read lock once its search has finished. A
+    /// sealed generation stays held: it blocks no writer.
+    pub(crate) fn release_tail(&mut self) {
+        if matches!(self.held, HeldLayer::Tail(_)) {
+            self.held = HeldLayer::Released;
+        }
+    }
+}
+
+impl SealedHnswGeneration {
+    fn new(
+        identity: VectorGraphGeneration,
+        graph: HnswIndex,
+        bytes: usize,
+        accountant: Option<Arc<dyn MemoryBudget>>,
+    ) -> Self {
+        Self {
+            identity,
+            contents: Arc::new(SealedHnswGenerationContents {
+                graph,
+                charge: SealedHnswCharge {
+                    bytes: AtomicUsize::new(bytes),
+                    accountant,
+                },
+            }),
+        }
+    }
+
+    fn graph(&self) -> &HnswIndex {
+        &self.contents.graph
+    }
+
+    fn bytes(&self) -> usize {
+        self.contents.charge.bytes.load(Ordering::SeqCst)
+    }
+
+    /// How many serving slots this generation's cache holds, and what each is
+    /// charged; `None` for a generation that holds its vectors itself.
+    fn serving_slots(&self) -> Option<(usize, usize)> {
+        let graph = self.graph();
+        Some((graph.serving_cache_slots()?, graph.serving_slot_bytes()?))
+    }
+
+    /// Give serving slots back until at most `keep` remain and return what
+    /// that freed to the budget. The topology stays resident. A slot whose
+    /// page a walk is still reading is not given back, and keeps its charge.
+    fn give_back_serving_slots(&self, keep: usize) -> usize {
+        let freed = self.graph().give_back_serving_slots(keep);
+        self.contents.charge.release(freed)
+    }
+
+    fn into_parts(self) -> std::result::Result<ReleasedSealedGeneration, SealedHnswGeneration> {
+        let Self { identity, contents } = self;
+        match Arc::try_unwrap(contents) {
+            Ok(contents) => {
+                let SealedHnswGenerationContents { graph, charge } = contents;
+                let (bytes, accountant) = charge.disarm();
+                Ok((graph, bytes, accountant))
+            }
+            Err(contents) => Err(Self { identity, contents }),
+        }
+    }
+}
+
+/// While held, the partitions a statement named stay out of reach of the room
+/// its loads make; dropping it restores what an enclosing statement named.
+pub(crate) struct StatementPartitions {
+    previous: Option<Vec<usize>>,
+}
+
+impl Drop for StatementPartitions {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        STATEMENT_PARTITIONS.with(|declared| declared.replace(previous));
+    }
+}
+
+/// A sealed generation taken apart: its graph, the bytes it was charged for,
+/// and the accountant that charge belongs to when one is still attached.
+type ReleasedSealedGeneration = (HnswIndex, usize, Option<Arc<dyn MemoryBudget>>);
+
+impl SealedHnswCharge {
+    /// Return `bytes` of this charge to the budget while the generation stays
+    /// resident, never more than it still holds. Returns what was released.
+    fn release(&self, bytes: usize) -> usize {
+        if bytes == 0 {
+            return 0;
+        }
+        let released = match self
+            .bytes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                Some(held.saturating_sub(bytes))
+            }) {
+            Ok(held) | Err(held) => held.min(bytes),
+        };
+        if released != 0
+            && let Some(accountant) = self.accountant.as_ref()
+        {
+            accountant.release(released);
+        }
+        released
+    }
+
+    fn disarm(mut self) -> (usize, Option<Arc<dyn MemoryBudget>>) {
+        let bytes = self.bytes.swap(0, Ordering::SeqCst);
+        let accountant = self.accountant.take();
+        (bytes, accountant)
+    }
+}
+
+impl Drop for SealedHnswCharge {
+    fn drop(&mut self) {
+        let bytes = self.bytes.load(Ordering::SeqCst);
+        if bytes != 0
+            && let Some(accountant) = self.accountant.take()
+        {
+            accountant.release(bytes);
+        }
+    }
 }
 
 /// One retained-memory reservation whose release belongs to the object that
@@ -861,6 +1085,10 @@ pub struct DormantVectorGraphGeneration {
     /// during decode. A bounded caller reserves this known minimum before the
     /// loader performs any persistence I/O, then retains only owned residency.
     pub load_bytes: usize,
+    /// Space the cache should make before invoking a loader whose exact
+    /// request is learned from saved metadata. Ordinary owned decodes use the
+    /// same value as `load_bytes`.
+    pub reclaim_bytes: usize,
 }
 
 /// An owned, verified graph returned by a persistence-owned loader. The
@@ -872,6 +1100,10 @@ pub struct LoadedVectorGraphGeneration {
     pub graph: HnswIndex,
     pub resident_bytes: usize,
     pub accountant: Arc<dyn MemoryBudget>,
+    /// Resident bytes transferred from the active caller's temporary
+    /// reservation. A retained file reader reserves cache residency directly
+    /// against its session accountant, so this is zero for that path.
+    pub caller_adopted_bytes: usize,
     /// Restart may replay the bounded journal suffix while it loads the base.
     /// This graph was created fresh in this process and is therefore the one
     /// mutable layer later commits may extend.
@@ -1021,6 +1253,18 @@ impl Drop for LoadedRawVectorCandidate {
 
 #[doc(hidden)]
 pub trait DormantRawVectorLoader: Send + Sync {
+    fn supports_bounded_candidate_load(&self) -> bool {
+        false
+    }
+
+    /// A committed image has no raw-vector cache a later find reuses. When the
+    /// whole partition does not fit the reader's declaration, exact comparison
+    /// reads each stored body. A writable store keeps the whole-partition load,
+    /// so a short declaration is a typed refusal rather than a silent scan.
+    fn exact_comparison_streams_when_partition_does_not_fit(&self) -> bool {
+        false
+    }
+
     fn load(&self, directory: &[RawVectorDirectoryEntry]) -> Result<LoadedRawVectorPartition>;
 
     fn load_candidate(
@@ -1029,6 +1273,98 @@ pub trait DormantRawVectorLoader: Send + Sync {
         caller_charged: bool,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<LoadedRawVectorCandidate>;
+
+    /// Which open body read serves this loader. Loaders reporting the same
+    /// nonzero value read the same pinned durable image, so one statement's
+    /// scan serves all of them; zero means this loader has no such read.
+    fn body_scan_source(&self) -> usize {
+        0
+    }
+
+    /// Open one read of authoritative bodies that a statement reuses for every
+    /// candidate it compares: one pinned transaction, its tables opened once,
+    /// and one authentication batch. `None` means this loader has none.
+    fn open_body_scan(&self) -> Result<Option<Box<dyn RawVectorBodyScan>>> {
+        Ok(None)
+    }
+
+    /// `load_candidate`, reading the body through a statement's open scan.
+    fn load_candidate_with_scan(
+        &self,
+        _scan: &mut dyn RawVectorBodyScan,
+        identity: &RawVectorDirectoryEntry,
+        caller_charged: bool,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<LoadedRawVectorCandidate> {
+        self.load_candidate(identity, caller_charged, request)
+    }
+}
+
+/// One statement's open read of stored vector bodies. It reads exactly the
+/// directory identity it is handed, authenticates the body against the
+/// committed image, and holds nothing of it afterwards: the caller admits the
+/// body's bytes before asking and releases them once it has scored it.
+#[doc(hidden)]
+pub trait RawVectorBodyScan: Send {
+    fn read_body(
+        &mut self,
+        partition: &VectorPartitionRef,
+        identity: &RawVectorDirectoryEntry,
+        dimension: usize,
+        quantization: VectorQuantization,
+    ) -> Result<VectorEntry>;
+}
+
+/// The body reads one statement has open, so every exhaustive comparison it
+/// makes -- across every partition it admits -- goes through one pinned
+/// transaction instead of beginning one per vector.
+#[derive(Default)]
+pub struct RawVectorBodyReads {
+    open: Option<(usize, Box<dyn RawVectorBodyScan>)>,
+    #[cfg(any(test, feature = "test-seams"))]
+    opened: usize,
+}
+
+impl RawVectorBodyReads {
+    fn scan_for(
+        &mut self,
+        loader: &dyn DormantRawVectorLoader,
+    ) -> Result<Option<&mut dyn RawVectorBodyScan>> {
+        let source = loader.body_scan_source();
+        if source == 0 {
+            return Ok(None);
+        }
+        if self.open.as_ref().is_none_or(|(open, _)| *open != source) {
+            let Some(scan) = loader.open_body_scan()? else {
+                return Ok(None);
+            };
+            self.open = Some((source, scan));
+            contextdb_core::find_attribution::count("raw_body_scans_opened", 1);
+            #[cfg(any(test, feature = "test-seams"))]
+            {
+                self.opened += 1;
+            }
+        }
+        Ok(self
+            .open
+            .as_mut()
+            .map(|(_, scan)| scan.as_mut() as &mut dyn RawVectorBodyScan))
+    }
+
+    /// How many body reads this statement opened.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn opened_for_test(&self) -> usize {
+        self.opened
+    }
+}
+
+impl std::fmt::Debug for RawVectorBodyReads {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RawVectorBodyReads")
+            .field("open", &self.open.is_some())
+            .finish()
+    }
 }
 
 #[doc(hidden)]
@@ -1176,6 +1512,32 @@ impl VectorVisibilityCounts {
     }
 }
 
+/// Page-granular candidate scoring for one statement. It holds the sealed
+/// layers this snapshot serves and one page reader for each, so a page is
+/// authenticated once and then answers every candidate it holds instead of
+/// one. The layers are taken once, before the first candidate, and never
+/// looked up again per row: nothing here waits on the publication gate while
+/// a scan runs.
+pub(crate) struct SealedPageScoring {
+    layers: Vec<SealedPageLayer>,
+    query_norm: f32,
+}
+
+struct SealedPageLayer {
+    covered_tx: TxId,
+    generation: SealedHnswGeneration,
+    pages: Option<ServingPages>,
+}
+
+impl std::fmt::Debug for SealedPageScoring {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SealedPageScoring")
+            .field("layers", &self.layers.len())
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct IndexState {
     dimension: usize,
     quantization: VectorQuantization,
@@ -1194,6 +1556,8 @@ pub struct IndexState {
     raw_resident: AtomicBool,
     raw_resident_bytes: AtomicUsize,
     raw_accountant: RwLock<Option<Arc<dyn MemoryBudget>>>,
+    raw_payload_counter: RwLock<Arc<AtomicUsize>>,
+    raw_payload_header_counter: RwLock<Arc<AtomicUsize>>,
     /// This state still owns the map key and raw historical directory.  The
     /// flag retires only its maintained graph/count identity, without
     /// allocating a second copy of that key in a side registry.
@@ -1321,6 +1685,8 @@ impl IndexState {
             raw_resident: AtomicBool::new(true),
             raw_resident_bytes: AtomicUsize::new(0),
             raw_accountant: RwLock::new(None),
+            raw_payload_counter: RwLock::new(Arc::new(AtomicUsize::new(0))),
+            raw_payload_header_counter: RwLock::new(Arc::new(AtomicUsize::new(0))),
             historical_only: AtomicBool::new(false),
             hnsw: OnceLock::new(),
             hnsw_bytes: AtomicUsize::new(0),
@@ -1383,6 +1749,17 @@ impl IndexState {
 
     fn is_historical_only(&self) -> bool {
         self.historical_only.load(Ordering::SeqCst)
+    }
+
+    /// Sample only fixed scalar metadata, including from a borrowed source
+    /// view. This takes the existing field locks but no maintenance mutex.
+    #[doc(hidden)]
+    pub fn source_maintenance_metadata(&self) -> VectorPartitionSourceMaintenanceMetadata {
+        VectorPartitionSourceMaintenanceMetadata {
+            historical_only: self.is_historical_only(),
+            quarantine: self.route_quarantine(),
+            failure: self.maintenance_failure_details(),
+        }
     }
 
     fn mark_historical_only(&self) {
@@ -1511,20 +1888,36 @@ impl IndexState {
 
     fn attach_durable_raw_loader(
         &self,
-        expected: &[RawVectorDirectoryEntry],
+        mut expected: Vec<RawVectorDirectoryEntry>,
         loader: Arc<dyn DormantRawVectorLoader>,
     ) -> Result<()> {
         let _gate = self.raw_residency_gate.write();
+        let order = |entry: &RawVectorDirectoryEntry| {
+            (entry.row_id, entry.created_tx, entry.lsn, entry.deleted_tx)
+        };
+        expected.sort_unstable_by_key(order);
+        self.raw_directory.write().sort_unstable_by_key(order);
+        self.rebuild_raw_directory_positions();
         if self.raw_directory.read().as_slice() != expected {
             return Err(Error::Other(
                 "durable raw-vector membership changed outside publication".to_string(),
             ));
         }
+        // Commits append to the resident directory, while Redb enumerates the
+        // same durable set by key. Canonicalize both without another O(n)
+        // allocation before later eviction makes them positional again.
         *self.raw_loader.write() = Some(loader);
         Ok(())
     }
 
     pub(crate) fn ensure_raw_vectors_loaded(&self) -> Result<()> {
+        self.ensure_raw_vectors_loaded_with_copy_preference(false)
+    }
+
+    fn ensure_raw_vectors_loaded_with_copy_preference(
+        &self,
+        prefer_unique_owned: bool,
+    ) -> Result<()> {
         if self.raw_resident.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -1545,42 +1938,85 @@ impl IndexState {
         } = loaded;
         let reserved_bytes = reserved_resident_bytes.saturating_add(workspace_bytes);
         if entries.len() != expected.len() {
+            drop(entries);
             accountant.release(reserved_bytes);
             return Err(Error::Other(
                 "loaded raw vector partition does not match its directory count".to_string(),
             ));
         }
-        let mut vectors = PartitionVectors::default();
-        let mut resident_bytes = 0usize;
-        for (entry, identity) in entries.into_iter().zip(&expected) {
-            if entry.row_id != identity.row_id
+        if entries.iter().zip(&expected).any(|(entry, identity)| {
+            entry.row_id != identity.row_id
                 || entry.created_tx != identity.created_tx
                 || entry.deleted_tx != identity.deleted_tx
                 || entry.lsn != identity.lsn
-            {
-                accountant.release(reserved_bytes);
-                return Err(Error::Other(
-                    "loaded raw vector partition disagrees with its durable directory".to_string(),
-                ));
-            }
-            let stored = self.stored_entry(entry);
+        }) {
+            drop(entries);
+            accountant.release(reserved_bytes);
+            return Err(Error::Other(
+                "loaded raw vector partition disagrees with its durable directory".to_string(),
+            ));
+        }
+        let header_bytes = entries
+            .len()
+            .saturating_mul(crate::quantized::shared_payload_header_bytes());
+        if let Err(error) = accountant.try_allocate_for(
+            header_bytes,
+            "vector_index",
+            "load_raw_vector_headers",
+            "Raise MEMORY_LIMIT to hold the shared raw-vector allocation headers.",
+        ) {
+            drop(entries);
+            accountant.release(reserved_bytes);
+            return Err(error);
+        }
+        let mut header_reservation = RetainedMemoryCharge {
+            bytes: header_bytes,
+            accountant: accountant.clone(),
+        };
+        let mut vectors = PartitionVectors::default();
+        let mut resident_bytes = 0usize;
+        for entry in entries {
+            let mut stored = self.stored_entry(entry);
             resident_bytes = resident_bytes.saturating_add(stored.estimated_bytes());
+            stored.vector.promote_to_shared();
+            if let Some(positions) = vectors.by_row.get(&stored.row_id)
+                && let Some(prior) = positions
+                    .iter()
+                    .rev()
+                    .map(|position| &vectors.entries[*position])
+                    .find(|prior| prior.vector.representation_eq(&stored.vector))
+            {
+                stored.vector = prior.vector.clone();
+            }
             vectors.push(stored);
         }
         if resident_bytes != reserved_resident_bytes {
+            drop(vectors);
             accountant.release(reserved_bytes);
             return Err(Error::Other(format!(
                 "loaded raw vector charge mismatch: directory owns {} bytes but decoded vectors require {resident_bytes}",
                 reserved_resident_bytes
             )));
         }
-        *self.vectors.write() = vectors;
-        if workspace_bytes != 0 {
-            accountant.release(workspace_bytes);
+        if prefer_unique_owned {
+            // Detached copies retain a newly hydrated singleton inline. The
+            // common load still admits every temporary header before promotion;
+            // only a successful unwrap frees one before its surplus is released.
+            for entry in &mut vectors.entries {
+                entry.vector.move_unique_uncharged_to_owned();
+            }
+            vectors.rebuild_row_positions();
         }
-        *self.raw_accountant.write() = Some(accountant);
+        let unique_bytes = vectors.unique_payload_bytes();
+        header_reservation.bytes -=
+            vectors.payload_memberships.len() * crate::quantized::shared_payload_header_bytes();
+        *self.vectors.write() = vectors;
+        accountant.release(workspace_bytes.saturating_add(reserved_resident_bytes - unique_bytes));
+        let counter = self.raw_payload_counter.read().clone();
+        let header_counter = self.raw_payload_header_counter.read().clone();
+        self.attach_raw_accounting(accountant, counter, header_counter);
         self.raw_resident_bytes
-            .store(resident_bytes, Ordering::SeqCst);
+            .store(unique_bytes, Ordering::SeqCst);
         self.raw_resident.store(true, Ordering::SeqCst);
         #[cfg(any(test, feature = "test-seams"))]
         self.note_passive_activity(|activity| {
@@ -1598,11 +2034,33 @@ impl IndexState {
         self.raw_accountant.read().is_some()
     }
 
-    fn attach_raw_accounting(&self, accountant: Arc<dyn MemoryBudget>) {
+    fn attach_raw_accounting(
+        &self,
+        accountant: Arc<dyn MemoryBudget>,
+        counter: Arc<AtomicUsize>,
+        header_counter: Arc<AtomicUsize>,
+    ) {
         let mut owner = self.raw_accountant.write();
-        if owner.is_none() {
+        if owner.is_some()
+            && self.raw_resident.load(Ordering::SeqCst)
+            && Arc::ptr_eq(&*self.raw_payload_counter.read(), &counter)
+            && Arc::ptr_eq(&*self.raw_payload_header_counter.read(), &header_counter)
+        {
             *owner = Some(accountant);
+            return;
         }
+        *self.raw_payload_counter.write() = counter.clone();
+        *self.raw_payload_header_counter.write() = header_counter.clone();
+        for entry in &self.vectors.read().entries {
+            entry.vector.adopt_raw_charge(
+                accountant.clone(),
+                counter.clone(),
+                header_counter.clone(),
+            );
+        }
+        // Existing payload tokens retain their original funders. Future
+        // legacy/prepared publication adopts this current caller's owner.
+        *owner = Some(accountant);
     }
 
     /// Release a raw cache reservation owned by this state before the state
@@ -1611,17 +2069,16 @@ impl IndexState {
     /// settle those entries instead.
     fn release_accounted_raw_residency_for_removal(&self) -> bool {
         let _gate = self.raw_residency_gate.write();
-        let Some(accountant) = self.raw_accountant.write().take() else {
+        let Some(_accountant) = self.raw_accountant.write().take() else {
             return false;
         };
-        let bytes = self.raw_resident_bytes.swap(0, Ordering::SeqCst);
+        self.raw_resident_bytes.store(0, Ordering::SeqCst);
         let mut vectors = self.vectors.write();
         vectors.entries.clear();
         vectors.by_row.clear();
+        vectors.payload_memberships.clear();
+        vectors.owned_payload_bytes = 0;
         drop(vectors);
-        if bytes != 0 {
-            accountant.release(bytes);
-        }
         self.raw_resident.store(false, Ordering::SeqCst);
         #[cfg(any(test, feature = "test-seams"))]
         self.note_passive_activity(|activity| {
@@ -1633,25 +2090,19 @@ impl IndexState {
     }
 
     fn raw_payload_bytes(&self) -> usize {
-        if !self.raw_resident.load(Ordering::SeqCst) {
-            return 0;
+        if self.raw_resident.load(Ordering::SeqCst) {
+            self.raw_resident_bytes.load(Ordering::SeqCst)
+        } else {
+            0
         }
-        self.raw_resident_bytes.load(Ordering::SeqCst).max(
-            self.vectors
-                .read()
-                .entries
-                .iter()
-                .map(StoredVectorEntry::estimated_bytes)
-                .sum(),
-        )
     }
 
     fn directory_byte_count(&self) -> usize {
-        let directory_bytes = self
-            .raw_directory
-            .read()
-            .len()
-            .saturating_mul(std::mem::size_of::<RawVectorDirectoryEntry>());
+        let directory_bytes = self.raw_directory.read().len().saturating_mul(
+            std::mem::size_of::<RawVectorDirectoryEntry>()
+                + std::mem::size_of::<StoredVectorEntry>()
+                + std::mem::size_of::<(usize, usize)>(),
+        );
         let by_row = self.raw_directory_by_row.read();
         directory_bytes
             .saturating_add(self.visibility_counts.read().retained_bytes())
@@ -1811,12 +2262,8 @@ impl IndexState {
         let mut vectors = self.vectors.write();
         *vectors = PartitionVectors::default();
         drop(vectors);
-        let bytes = self.raw_resident_bytes.swap(0, Ordering::SeqCst);
-        if bytes != 0
-            && let Some(accountant) = self.raw_accountant.write().take()
-        {
-            accountant.release(bytes);
-        }
+        self.raw_resident_bytes.store(0, Ordering::SeqCst);
+        self.raw_accountant.write().take();
         self.raw_resident.store(false, Ordering::SeqCst);
         #[cfg(any(test, feature = "test-seams"))]
         self.note_passive_activity(|activity| {
@@ -1825,6 +2272,22 @@ impl IndexState {
                 .fetch_add(1, Ordering::SeqCst);
         });
         true
+    }
+
+    pub(crate) fn supports_bounded_raw_point_load(&self) -> bool {
+        !self.raw_resident.load(Ordering::SeqCst)
+            && self
+                .raw_loader
+                .read()
+                .as_ref()
+                .is_some_and(|loader| loader.supports_bounded_candidate_load())
+    }
+
+    pub(crate) fn exact_comparison_streams_when_partition_does_not_fit(&self) -> bool {
+        self.raw_loader
+            .read()
+            .as_ref()
+            .is_some_and(|loader| loader.exact_comparison_streams_when_partition_does_not_fit())
     }
 
     pub fn vector_count(&self) -> usize {
@@ -1855,18 +2318,14 @@ impl IndexState {
 
     pub fn byte_count(&self) -> usize {
         let vectors = self.vectors.read();
-        let raw_bytes = if self.raw_resident.load(Ordering::SeqCst) {
-            self.raw_resident_bytes.load(Ordering::SeqCst).max(
-                vectors
-                    .entries
-                    .iter()
-                    .map(StoredVectorEntry::estimated_bytes)
-                    .sum::<usize>(),
-            )
-        } else {
-            0
-        };
+        let raw_bytes = self.raw_payload_bytes();
         raw_bytes
+            .saturating_add(
+                vectors
+                    .payload_memberships
+                    .len()
+                    .saturating_mul(crate::quantized::shared_payload_header_bytes()),
+            )
             .saturating_add(
                 vectors
                     .entries
@@ -1894,7 +2353,7 @@ impl IndexState {
             .iter()
             .chain(sealed.change.iter())
             .fold(0usize, |bytes, generation| {
-                bytes.saturating_add(generation.bytes)
+                bytes.saturating_add(generation.bytes())
             })
             .saturating_add(sealed.retired.iter().fold(0usize, |bytes, chain| {
                 bytes
@@ -1902,14 +2361,14 @@ impl IndexState {
                         chain
                             .base
                             .as_ref()
-                            .map(|generation| generation.bytes)
+                            .map(SealedHnswGeneration::bytes)
                             .unwrap_or(0),
                     )
                     .saturating_add(
                         chain
                             .change
                             .as_ref()
-                            .map(|generation| generation.bytes)
+                            .map(SealedHnswGeneration::bytes)
                             .unwrap_or(0),
                     )
             }))
@@ -1937,13 +2396,22 @@ impl IndexState {
     }
 
     fn stored_by_row_id(&self, row_id: RowId) -> Option<StoredVectorEntry> {
+        self.with_stored_by_row_id(row_id, Clone::clone)
+    }
+
+    fn with_stored_by_row_id<R>(
+        &self,
+        row_id: RowId,
+        f: impl FnOnce(&StoredVectorEntry) -> R,
+    ) -> Option<R> {
         let vectors = self.vectors.read();
-        vectors.by_row.get(&row_id).and_then(|positions| {
+        let entry = vectors.by_row.get(&row_id).and_then(|positions| {
             positions
                 .iter()
                 .rev()
-                .find_map(|position| vectors.entries.get(*position).cloned())
-        })
+                .find_map(|position| vectors.entries.get(*position))
+        });
+        entry.map(f)
     }
 
     fn visible_entry_by_row(
@@ -1976,6 +2444,180 @@ impl IndexState {
         None
     }
 
+    /// The serving pages a statement can score its candidates from: the sealed
+    /// layers this snapshot selects, each ready to open its own page reader.
+    /// `None` when nothing here serves from pages, and every candidate is
+    /// read the way it is read today, through its own stored body.
+    ///
+    /// Only the graph route asks for this. Its layers are dormant until
+    /// something loads them, so this brings them in once, before the first
+    /// candidate, under the caller's own cancellable charge.
+    ///
+    /// Two refusals arrive the same way and mean opposite things. A caller who
+    /// cancelled or ran out of time has ended the search, and that travels out
+    /// — established by asking the caller again after any refusal, not by
+    /// assuming which callback reports which class. A caller who will not admit the generation's memory has not: the
+    /// per-row route still answers every candidate from its own stored body,
+    /// so that returns "no pages here" and the statement carries on, which is
+    /// what a declared memory limit is for -- sweeping a store larger than the
+    /// reader's memory. A layer that simply will not load says the same.
+    pub(crate) fn sealed_page_scoring<E>(
+        &self,
+        snapshot: SnapshotId,
+        query: &[f32],
+        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: &mut impl FnMut(usize),
+    ) -> std::result::Result<Option<SealedPageScoring>, E>
+    where
+        E: From<Error>,
+    {
+        if query.len() != self.dimension {
+            return Ok(None);
+        }
+        // A cancellation is captured on the way past and re-raised once the
+        // preloader is out of the way; a memory refusal deliberately is not,
+        // so it falls through to "no pages here" below. The preloader returns
+        // whatever a failed load charged before it hands the error back.
+        let cancelled: RefCell<Option<E>> = RefCell::new(None);
+        let preloaded = {
+            let mut checkpoint = || -> std::result::Result<(), Error> {
+                before_checkpoint().map_err(|error| {
+                    *cancelled.borrow_mut() = Some(error);
+                    Error::Other("the caller stopped this search".to_string())
+                })
+            };
+            let mut retain = |bytes: usize| -> std::result::Result<(), Error> {
+                before_retain(bytes).map_err(|_| {
+                    Error::Other(
+                        "the caller does not admit this generation's serving memory".to_string(),
+                    )
+                })
+            };
+            self.preload_snapshot_compatible_hnsw_layers_for_request::<Error>(
+                snapshot,
+                &mut checkpoint,
+                &mut retain,
+                release_retained,
+            )
+        };
+        if let Some(error) = cancelled.into_inner() {
+            return Err(error);
+        }
+        if preloaded.is_err() {
+            // A reservation boundary can refuse for reasons that are NOT a
+            // memory refusal -- a cancellation, an elapsed deadline, a parked
+            // release fault the caller TAKES rather than copies. Those must not
+            // be dropped here. Asking the caller once more is what makes the
+            // distinction by error class rather than by which callback happened
+            // to report it.
+            before_checkpoint()?;
+            return Ok(None);
+        }
+        let snapshot_tx = TxId::from_snapshot(snapshot);
+        let generations = {
+            let _publication = self.generation_publication.lock();
+            let sealed = self.sealed_hnsw.read();
+            if sealed.quarantine.is_some() {
+                return Ok(None);
+            }
+            let Some(location) = Self::selected_chain_location(&sealed, snapshot_tx) else {
+                return Ok(None);
+            };
+            let Ok((base, change, _)) = Self::selected_chain_layers(&sealed, location, snapshot_tx)
+            else {
+                return Ok(None);
+            };
+            let mut generations = vec![base];
+            generations.extend(change);
+            generations
+        };
+        let layers = generations
+            .into_iter()
+            .filter(|generation| generation.graph().serves_from_pages())
+            .map(|generation| SealedPageLayer {
+                covered_tx: generation.identity.covered_tx,
+                generation,
+                pages: None,
+            })
+            .collect::<Vec<_>>();
+        Ok((!layers.is_empty()).then(|| SealedPageScoring {
+            layers,
+            query_norm: HnswIndex::stored_query_norm(query),
+        }))
+    }
+
+    /// The directory holds exactly one version of this row. A second version --
+    /// superseded, re-created, or left behind by cleanup -- means an immutable
+    /// graph may name a point that is not the version this snapshot reads.
+    fn row_has_one_stored_version(&self, row_id: RowId) -> bool {
+        self.raw_directory_by_row
+            .read()
+            .get(&row_id)
+            .is_some_and(|positions| positions.len() == 1)
+    }
+
+    /// Score one candidate out of the statement's serving pages, and only when
+    /// the page body is certainly this row's visible body: the directory holds
+    /// one version of the row, and that version was already committed when the
+    /// layer was sealed. Anything else falls through to the row's own stored
+    /// body, so the published score is the same number either way.
+    #[allow(clippy::too_many_arguments)]
+    fn score_candidate_from_serving_pages<E>(
+        &self,
+        paged: &mut SealedPageScoring,
+        identity: &RawVectorDirectoryEntry,
+        query: &[f32],
+        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: &mut impl FnMut(usize),
+    ) -> std::result::Result<Option<f32>, E>
+    where
+        E: From<Error>,
+    {
+        if !self.row_has_one_stored_version(identity.row_id) {
+            return Ok(None);
+        }
+        let query_norm = paged.query_norm;
+        let charge = RefCell::new((before_retain, release_retained));
+        let mut acquire = |event| {
+            let mut charged = charge.borrow_mut();
+            crate::mem::apply_hnsw_scratch_acquire(event, &mut *charged.0)
+        };
+        let mut release = |event| {
+            let mut charged = charge.borrow_mut();
+            crate::mem::apply_hnsw_scratch_release(event, &mut *charged.1);
+        };
+        for layer in &mut paged.layers {
+            if identity.created_tx > layer.covered_tx {
+                continue;
+            }
+            if layer.pages.is_none() {
+                let Some(opened) = layer.generation.graph().serving_page_reader() else {
+                    continue;
+                };
+                layer.pages = Some(opened.map_err(E::from)?);
+            }
+            let Some(pages) = layer.pages.as_mut() else {
+                continue;
+            };
+            if let Some(score) = layer.generation.graph().serving_page_similarity(
+                identity.row_id,
+                query,
+                query_norm,
+                before_checkpoint,
+                before_distance,
+                &mut acquire,
+                &mut release,
+                pages,
+            )? {
+                return Ok(Some(score));
+            }
+        }
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn score_visible_candidate_inner<E>(
         &self,
@@ -1984,6 +2626,8 @@ impl IndexState {
         snapshot: SnapshotId,
         query: &[f32],
         caller_charged: bool,
+        paged: Option<&mut SealedPageScoring>,
+        bodies: Option<&mut RawVectorBodyReads>,
         before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
         before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
@@ -1995,7 +2639,11 @@ impl IndexState {
         before_checkpoint()?;
         if let Some(score) = self
             .with_visible_stored_entry_by_row(row_id, snapshot, |entry| {
-                before_distance().map(|()| entry.vector.cosine_similarity(query))
+                before_distance().map(|()| {
+                    #[cfg(feature = "test-seams")]
+                    crate::mem::observe_native_vector_score_for_test();
+                    entry.vector.cosine_similarity(query)
+                })
             })
             .transpose()?
         {
@@ -2005,11 +2653,34 @@ impl IndexState {
         let Some(identity) = self.visible_directory_entry_by_row(row_id, snapshot) else {
             return Ok(None);
         };
+        // A page this statement has already authenticated answers every vector
+        // it holds. Reading this candidate's own body instead would hash a
+        // fresh Merkle path for one vector out of the twenty a page carries.
+        if let Some(paged) = paged
+            && let Some(score) = self.score_candidate_from_serving_pages(
+                paged,
+                &identity,
+                query,
+                before_checkpoint,
+                before_distance,
+                before_retain,
+                release_retained,
+            )?
+        {
+            return Ok(Some(score));
+        }
         let loader = self.raw_loader.read().clone().ok_or_else(|| {
             E::from(Error::Other(
                 "dormant raw vector candidate has no loader".to_string(),
             ))
         })?;
+        // Exact fallback touches the partition membership and then its stored
+        // body. Both are physical work in addition to the distance calculation
+        // charged below; a bounded caller pays once for each touch.
+        if caller_charged && bodies.is_some() {
+            before_distance()?;
+            before_distance()?;
+        }
         let mut interrupted = None;
         let mut caller_reserved = 0usize;
         let loaded = {
@@ -2046,7 +2717,19 @@ impl IndexState {
                     }
                 }
             };
-            loader.load_candidate(&identity, caller_charged, &mut request)
+            match bodies {
+                Some(bodies) => match bodies.scan_for(loader.as_ref()) {
+                    Ok(Some(scan)) => loader.load_candidate_with_scan(
+                        scan,
+                        &identity,
+                        caller_charged,
+                        &mut request,
+                    ),
+                    Ok(None) => loader.load_candidate(&identity, caller_charged, &mut request),
+                    Err(error) => Err(error),
+                },
+                None => loader.load_candidate(&identity, caller_charged, &mut request),
+            }
         };
         let loaded = match loaded {
             Ok(loaded) => loaded,
@@ -2087,6 +2770,8 @@ impl IndexState {
             let stored = self.stored_entry_ref(entry);
             let body_bytes = stored.estimated_bytes();
             before_distance()?;
+            #[cfg(feature = "test-seams")]
+            crate::mem::observe_native_vector_score_for_test();
             Ok((stored.vector.cosine_similarity(query), body_bytes))
         })();
         drop(loaded);
@@ -2117,6 +2802,7 @@ impl IndexState {
         row_id: RowId,
         snapshot: SnapshotId,
         query: &[f32],
+        paged: Option<&mut SealedPageScoring>,
     ) -> Result<Option<f32>> {
         self.score_visible_candidate_inner(
             index,
@@ -2124,6 +2810,8 @@ impl IndexState {
             snapshot,
             query,
             false,
+            paged,
+            None,
             &mut || Ok::<(), Error>(()),
             &mut || Ok::<(), Error>(()),
             &mut |_bytes| Ok::<(), Error>(()),
@@ -2138,6 +2826,7 @@ impl IndexState {
         row_id: RowId,
         snapshot: SnapshotId,
         query: &[f32],
+        paged: Option<&mut SealedPageScoring>,
         before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
         before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
@@ -2152,11 +2841,76 @@ impl IndexState {
             snapshot,
             query,
             true,
+            paged,
+            None,
             before_checkpoint,
             before_distance,
             before_retain,
             release_retained,
         )
+    }
+
+    /// Score one row's own stored body for an exhaustive comparison, reading
+    /// it through the statement's open body read when the partition is not
+    /// resident. The body's bytes are admitted through `before_retain` before
+    /// it is read and released once it is scored.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bounded_score_stored_body<E>(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        query: &[f32],
+        bodies: &mut RawVectorBodyReads,
+        before_checkpoint: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_distance: &mut impl FnMut() -> std::result::Result<(), E>,
+        before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: &mut impl FnMut(usize),
+    ) -> std::result::Result<Option<f32>, E>
+    where
+        E: From<Error>,
+    {
+        self.score_visible_candidate_inner(
+            index,
+            row_id,
+            snapshot,
+            query,
+            true,
+            None,
+            Some(bodies),
+            before_checkpoint,
+            before_distance,
+            before_retain,
+            release_retained,
+        )
+    }
+
+    /// The row at one directory position if it is visible at `snapshot`;
+    /// `None` once the position is past the directory's end. Holds the
+    /// directory only for the lookup, so a caller can read the body without
+    /// keeping it locked.
+    pub(crate) fn visible_directory_row_at(
+        &self,
+        position: usize,
+        snapshot: SnapshotId,
+    ) -> Option<Option<RowId>> {
+        let directory = self.raw_directory.read();
+        let entry = directory.get(position)?;
+        Some(
+            (entry.created_tx.0 <= snapshot.0
+                && entry.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0))
+            .then_some(entry.row_id),
+        )
+    }
+
+    /// Whether this partition's exhaustive comparison can read bodies one at
+    /// a time instead of loading the partition's vectors whole: its vectors
+    /// are not resident and a loader can read one stored body by its
+    /// identity. Every durable loader can -- a committed image through its
+    /// authenticated body scan, a writable store through a point read of the
+    /// row's own membership.
+    pub(crate) fn streams_raw_bodies(&self) -> bool {
+        self.supports_bounded_raw_point_load()
     }
 
     fn vector_for_row_lsn(&self, row_id: RowId, lsn: Lsn) -> Option<Vec<f32>> {
@@ -2224,12 +2978,33 @@ impl IndexState {
         positions.insert(at, position);
         drop(by_row);
         drop(directory);
-        self.raw_resident_bytes
-            .fetch_add(entry.estimated_bytes(), Ordering::SeqCst);
+        if let Some(accountant) = self.raw_accountant.read().clone() {
+            entry.vector.adopt_raw_charge(
+                accountant,
+                self.raw_payload_counter.read().clone(),
+                self.raw_payload_header_counter.read().clone(),
+            );
+        }
+        let mut vectors = self.vectors.write();
+        if entry
+            .vector
+            .payload_identity()
+            .is_none_or(|identity| !vectors.payload_memberships.contains_key(&identity))
+        {
+            self.raw_resident_bytes
+                .fetch_add(entry.estimated_bytes(), Ordering::SeqCst);
+        }
         // A durable loader resolves the partition's current checksummed
         // membership at load time, so it remains valid after this already-
         // durable publication and makes the updated partition evictable.
-        self.vectors.write().push(entry);
+        vectors.push(entry);
+    }
+
+    fn push_entry_with(&self, entry: StoredVectorEntry, after: impl FnOnce(&StoredVectorEntry)) {
+        let _residency = self.raw_residency_gate.read();
+        let row_id = entry.row_id;
+        self.push_entry(entry);
+        let _ = self.with_stored_by_row_id(row_id, after);
     }
 
     /// Extend a graph that was built fresh in this process. Loaded durable
@@ -2367,17 +3142,14 @@ impl IndexState {
         let mut vectors = self.vectors.write();
         vectors.entries.clear();
         vectors.by_row.clear();
+        vectors.payload_memberships.clear();
+        vectors.owned_payload_bytes = 0;
         self.raw_directory.write().clear();
         self.raw_directory_by_row.write().clear();
         *self.visibility_counts.write() = VectorVisibilityCounts::default();
         self.raw_loader.write().take();
-        let bytes = self.raw_resident_bytes.swap(0, Ordering::SeqCst);
-        let accountant = self.raw_accountant.write().take();
-        if bytes != 0
-            && let Some(accountant) = accountant
-        {
-            accountant.release(bytes);
-        }
+        self.raw_resident_bytes.store(0, Ordering::SeqCst);
+        self.raw_accountant.write().take();
         self.raw_resident.store(true, Ordering::SeqCst);
     }
 
@@ -2418,10 +3190,9 @@ impl IndexState {
         0
     }
 
-    /// Physically drop the entries `keep` rejects. When this state carries
-    /// the accountant it owns every resident body, tombstoned or not, so the
-    /// dropped bytes are returned from its own record right here and the
-    /// caller receives `0`. A state without an accountant instead hands back
+    /// Physically drop the entries `keep` rejects. Accounted immutable bodies
+    /// return their reservation only when the final shared holder drops, so
+    /// the caller receives `0`. A state without an accountant instead hands back
     /// only the bytes the caller's per-insert admission still holds: a body
     /// that was tombstoned had that admission returned at the commit that
     /// superseded it, so only a still-current body is reported.
@@ -2438,7 +3209,7 @@ impl IndexState {
             if keep(entry) {
                 true
             } else {
-                if state_owned || entry.deleted_tx.is_none() {
+                if !state_owned && entry.deleted_tx.is_none() {
                     released = released.saturating_add(entry.estimated_bytes());
                 }
                 false
@@ -2447,14 +3218,8 @@ impl IndexState {
         vectors.rebuild_row_positions();
         *self.raw_directory.write() = vectors.entries.iter().map(Self::directory_entry).collect();
         self.rebuild_raw_directory_positions();
-        self.raw_resident_bytes.store(
-            vectors
-                .entries
-                .iter()
-                .map(StoredVectorEntry::estimated_bytes)
-                .sum(),
-            Ordering::SeqCst,
-        );
+        self.raw_resident_bytes
+            .store(vectors.unique_payload_bytes(), Ordering::SeqCst);
         drop(vectors);
         #[cfg(any(test, feature = "test-seams"))]
         if released != 0 {
@@ -2463,13 +3228,6 @@ impl IndexState {
                     .hnsw_repairs_or_compactions
                     .fetch_add(1, Ordering::SeqCst);
             });
-        }
-        if state_owned
-            && released != 0
-            && let Some(accountant) = self.raw_accountant.read().clone()
-        {
-            accountant.release(released);
-            return 0;
         }
         released
     }
@@ -2515,11 +3273,7 @@ impl IndexState {
     }
 
     fn release_sealed_generation(generation: SealedHnswGeneration) {
-        if generation.bytes != 0
-            && let Some(accountant) = generation.accountant
-        {
-            accountant.release(generation.bytes);
-        }
+        drop(generation);
     }
 
     /// A loader transfers both reservations to this store only on successful
@@ -2624,18 +3378,39 @@ impl IndexState {
         })
     }
 
+    /// How many saved layers this snapshot still has to load: its base and
+    /// its change are a load each.
+    pub(crate) fn dormant_layer_count_for_snapshot(&self, snapshot: SnapshotId) -> usize {
+        self.dormant_bytes_for_snapshot(snapshot, |_| 1)
+    }
+
     pub(crate) fn dormant_load_bytes_for_snapshot(&self, snapshot: SnapshotId) -> usize {
-        fn missing_bytes(
-            resident: Option<&SealedHnswGeneration>,
-            dormant: Option<&DormantSealedGeneration>,
-        ) -> usize {
-            dormant
-                .filter(|dormant| {
-                    !resident
-                        .is_some_and(|resident| resident.identity == dormant.descriptor.identity)
-                })
-                .map_or(0, |dormant| dormant.descriptor.load_bytes)
-        }
+        self.dormant_bytes_for_snapshot(snapshot, |dormant| dormant.descriptor.reclaim_bytes)
+    }
+
+    /// What the saved graphs this snapshot still has to load occupy: the
+    /// most serving pages their loads could use.
+    pub(crate) fn dormant_page_bytes_for_snapshot(&self, snapshot: SnapshotId) -> usize {
+        self.dormant_bytes_for_snapshot(snapshot, |dormant| {
+            usize::try_from(dormant.descriptor.identity.durable_bytes).unwrap_or(usize::MAX)
+        })
+    }
+
+    fn dormant_bytes_for_snapshot(
+        &self,
+        snapshot: SnapshotId,
+        bytes: fn(&DormantSealedGeneration) -> usize,
+    ) -> usize {
+        let missing_bytes =
+            |resident: Option<&SealedHnswGeneration>, dormant: Option<&DormantSealedGeneration>| {
+                dormant
+                    .filter(|dormant| {
+                        !resident.is_some_and(|resident| {
+                            resident.identity == dormant.descriptor.identity
+                        })
+                    })
+                    .map_or(0, bytes)
+            };
 
         let sealed = self.sealed_hnsw.read();
         match Self::selected_chain_location(&sealed, TxId::from_snapshot(snapshot)) {
@@ -2711,13 +3486,13 @@ impl IndexState {
         let sealed_len = sealed
             .base
             .as_ref()
-            .map(|generation| generation.graph.len())
+            .map(|generation| generation.graph().len())
             .unwrap_or(0)
             .saturating_add(
                 sealed
                     .change
                     .as_ref()
-                    .map(|generation| generation.graph.len())
+                    .map(|generation| generation.graph().len())
                     .unwrap_or(0),
             );
         let total = sealed_len.saturating_add(tail.unwrap_or(0));
@@ -2758,7 +3533,9 @@ impl IndexState {
         descriptor: DormantVectorGraphGeneration,
         loader: Arc<dyn DormantVectorGraphLoader>,
     ) -> Result<()> {
-        if descriptor.load_bytes < descriptor.resident_bytes {
+        if descriptor.load_bytes < descriptor.resident_bytes
+            || descriptor.reclaim_bytes < descriptor.resident_bytes
+        {
             return Err(Error::Other(
                 "dormant vector load admission is smaller than resident ownership".to_string(),
             ));
@@ -2877,6 +3654,7 @@ impl IndexState {
             graph,
             resident_bytes,
             accountant,
+            caller_adopted_bytes: _,
             mut fresh_tail,
         } = loaded;
         // A row commit already admitted and validated insertion against this
@@ -2900,6 +3678,7 @@ impl IndexState {
                 graph,
                 resident_bytes,
                 accountant,
+                caller_adopted_bytes: 0,
                 fresh_tail,
             });
             return Err(Error::Other(
@@ -2913,18 +3692,14 @@ impl IndexState {
                 graph,
                 resident_bytes,
                 accountant,
+                caller_adopted_bytes: 0,
                 fresh_tail,
             });
             return Err(Error::Other(
                 "a sealed vector change can only be superseded by a replacement base".to_string(),
             ));
         }
-        let incoming = SealedHnswGeneration {
-            identity,
-            graph,
-            bytes: resident_bytes,
-            accountant: Some(accountant),
-        };
+        let incoming = SealedHnswGeneration::new(identity, graph, resident_bytes, Some(accountant));
         let installing_pending_base = is_base
             && sealed
                 .pending_base
@@ -3169,20 +3944,20 @@ impl IndexState {
                             chain
                                 .base
                                 .as_ref()
-                                .map(|generation| generation.bytes)
+                                .map(SealedHnswGeneration::bytes)
                                 .unwrap_or(0),
                         )
                         .saturating_add(
                             chain
                                 .change
                                 .as_ref()
-                                .map(|generation| generation.bytes)
+                                .map(SealedHnswGeneration::bytes)
                                 .unwrap_or(0),
                         )
                 })
                 .saturating_add(
                     superseded_base
-                        .map(|generation| generation.bytes)
+                        .map(SealedHnswGeneration::bytes)
                         .unwrap_or(0),
                 ),
         )
@@ -3216,7 +3991,7 @@ impl IndexState {
         } else {
             sealed.change.as_ref()
         }?;
-        Some(f(generation.identity, &generation.graph))
+        Some(f(generation.identity, generation.graph()))
     }
 
     /// Load one cataloged graph without holding a store lock across I/O or
@@ -3359,7 +4134,14 @@ impl IndexState {
                             "loaded vector residency overflow".to_string(),
                         )));
                     };
-                    let Some(transient) = caller_reserved.checked_sub(adopted) else {
+                    if loaded.caller_adopted_bytes > adopted {
+                        Self::release_uninstalled_loaded_generation(loaded);
+                        return Err(E::from(Error::Other(
+                            "loaded vector caller ownership exceeds its residency".to_string(),
+                        )));
+                    }
+                    let Some(transient) = caller_reserved.checked_sub(loaded.caller_adopted_bytes)
+                    else {
                         Self::release_uninstalled_loaded_generation(loaded);
                         return Err(E::from(Error::Other(
                             "loaded vector residency exceeds its caller reservation".to_string(),
@@ -3391,6 +4173,9 @@ impl IndexState {
     where
         E: From<Error>,
     {
+        // One share for this layer, however many times a moving fresh tail
+        // makes it load again.
+        let layer_load = contextdb_core::serving_cache_share::begin_layer_load();
         for _ in 0..4 {
             let dormant = {
                 let sealed = self.sealed_hnsw.read();
@@ -3441,13 +4226,19 @@ impl IndexState {
                     "injected vector post-load reconciliation failure".to_string(),
                 )));
             }
+            #[cfg(feature = "test-seams")]
+            let moved_under_the_load = crate::test_seam::take_vector_stale_dormant_load_for_test();
+            #[cfg(not(feature = "test-seams"))]
+            let moved_under_the_load = false;
             let identity = dormant.descriptor.identity;
             let _publication = self.generation_publication.lock();
-            if loaded.fresh_tail.as_ref().is_some_and(|tail| {
-                self.fresh_tail_revision.load(Ordering::SeqCst) != expected_tail_revision
-                    || tail.replayed_through_lsn.0
-                        < self.fresh_tail_mutated_through_lsn.load(Ordering::SeqCst)
-            }) {
+            if moved_under_the_load
+                || loaded.fresh_tail.as_ref().is_some_and(|tail| {
+                    self.fresh_tail_revision.load(Ordering::SeqCst) != expected_tail_revision
+                        || tail.replayed_through_lsn.0
+                            < self.fresh_tail_mutated_through_lsn.load(Ordering::SeqCst)
+                })
+            {
                 Self::release_uninstalled_loaded_generation(loaded);
                 continue;
             }
@@ -3465,6 +4256,9 @@ impl IndexState {
             };
             if !still_selected {
                 Self::release_uninstalled_loaded_generation(loaded);
+                // A publication moved this layer's chain; the statement loads
+                // it again from there, on the share given back here.
+                layer_load.give_back();
                 return Ok(false);
             }
             let already_resident = {
@@ -3553,6 +4347,7 @@ impl IndexState {
         let Some(dormant) = dormant else {
             return Ok(false);
         };
+        let layer_load = contextdb_core::serving_cache_share::begin_layer_load();
         let loaded = self.load_dormant_generation(
             &dormant,
             if is_base {
@@ -3581,6 +4376,7 @@ impl IndexState {
         }) else {
             drop(sealed);
             Self::release_uninstalled_loaded_generation(loaded);
+            layer_load.give_back();
             return Ok(false);
         };
         let selected = if is_base {
@@ -3591,6 +4387,7 @@ impl IndexState {
         if !selected.is_some_and(|selected| selected.descriptor.identity == identity) {
             drop(sealed);
             Self::release_uninstalled_loaded_generation(loaded);
+            layer_load.give_back();
             return Ok(false);
         }
         let resident = if is_base {
@@ -3610,6 +4407,7 @@ impl IndexState {
             graph,
             resident_bytes,
             accountant,
+            caller_adopted_bytes: _,
             fresh_tail,
         } = loaded;
         if let Some(tail) = fresh_tail
@@ -3617,12 +4415,12 @@ impl IndexState {
         {
             tail.accountant.release(tail.resident_bytes);
         }
-        let old = resident.replace(SealedHnswGeneration {
+        let old = resident.replace(SealedHnswGeneration::new(
             identity,
             graph,
-            bytes: resident_bytes,
-            accountant: Some(accountant),
-        });
+            resident_bytes,
+            Some(accountant),
+        ));
         sealed.pending_generation_count = sealed.pending_generation_count.saturating_sub(1);
         drop(sealed);
         if let Some(old) = old {
@@ -3865,6 +4663,8 @@ impl IndexState {
             let Some((location, is_base)) = load else {
                 return Ok(());
             };
+            contextdb_core::find_attribution::count("dormant_layers_loaded", 1);
+            let _loading = contextdb_core::find_attribution::stage("graph_load");
             match location {
                 SealedChainLocation::Current => {
                     self.preload_dormant_sealed_generation_with(
@@ -3890,6 +4690,211 @@ impl IndexState {
         Err(E::from(Error::Other(
             "snapshot-compatible vector layers changed repeatedly while loading".to_string(),
         )))
+    }
+
+    /// The resident layers of the chain a snapshot selects, cloned while the
+    /// registry still holds them. `Err` names what is missing, so a caller can
+    /// report a chain that is merely dormant apart from one that is gone. The
+    /// flag says the fresh tail is still in front of the sealed frontier and
+    /// belongs in the same search.
+    fn selected_chain_layers(
+        sealed: &SealedHnswGenerations,
+        location: SealedChainLocation,
+        snapshot_tx: TxId,
+    ) -> std::result::Result<
+        (SealedHnswGeneration, Option<SealedHnswGeneration>, bool),
+        VectorGraphLayerAvailability,
+    > {
+        match location {
+            SealedChainLocation::Current => {
+                let base_identity =
+                    Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref())
+                        .expect("a selected current vector chain has a base identity");
+                let Some(base) = sealed
+                    .base
+                    .as_ref()
+                    .filter(|base| base.identity == base_identity)
+                    .cloned()
+                else {
+                    let availability = if sealed.dormant_base.is_some() {
+                        VectorGraphLayerAvailability::Dormant
+                    } else {
+                        VectorGraphLayerAvailability::Unavailable
+                    };
+                    return Err(availability);
+                };
+                let change_identity =
+                    Self::layer_identity(sealed.change.as_ref(), sealed.dormant_change.as_ref());
+                let change = if let Some(identity) = change_identity {
+                    let Some(change) = sealed
+                        .change
+                        .as_ref()
+                        .filter(|change| change.identity == identity)
+                        .cloned()
+                    else {
+                        let availability = if sealed.dormant_change.is_some() {
+                            VectorGraphLayerAvailability::Dormant
+                        } else {
+                            VectorGraphLayerAvailability::Unavailable
+                        };
+                        return Err(availability);
+                    };
+                    Some(change)
+                } else {
+                    None
+                };
+                // A later commit cannot suppress an older reader's eligible
+                // tail. Search it exactly when the sealed frontier predates
+                // the snapshot; per-row visibility drops any newer points.
+                let active_frontier = change_identity.unwrap_or(base_identity);
+                Ok((base, change, active_frontier.covered_tx < snapshot_tx))
+            }
+            SealedChainLocation::Retired { base_generation_id } => {
+                let chain = sealed
+                    .retired
+                    .iter()
+                    .find(|chain| {
+                        Self::retired_chain_base_identity(chain)
+                            .is_some_and(|identity| identity.generation_id == base_generation_id)
+                    })
+                    .expect("a selected retired vector chain remains registered");
+                let base_identity = Self::retired_chain_base_identity(chain)
+                    .expect("a selected retired vector chain has a base identity");
+                let Some(base) = chain
+                    .base
+                    .as_ref()
+                    .filter(|base| base.identity == base_identity)
+                    .cloned()
+                else {
+                    let availability = if chain.dormant_base.is_some() {
+                        VectorGraphLayerAvailability::Dormant
+                    } else {
+                        VectorGraphLayerAvailability::Unavailable
+                    };
+                    return Err(availability);
+                };
+                let change_identity = Self::retired_chain_change_identity(chain);
+                let change = if let Some(identity) = change_identity {
+                    let Some(change) = chain
+                        .change
+                        .as_ref()
+                        .filter(|change| change.identity == identity)
+                        .cloned()
+                    else {
+                        let availability = if chain.dormant_change.is_some() {
+                            VectorGraphLayerAvailability::Dormant
+                        } else {
+                            VectorGraphLayerAvailability::Unavailable
+                        };
+                        return Err(availability);
+                    };
+                    Some(change)
+                } else {
+                    None
+                };
+                Ok((base, change, false))
+            }
+        }
+    }
+
+    /// Every non-empty snapshot-compatible layer of this partition's chain --
+    /// the sealed base, the sealed change beside it and the mutable tail --
+    /// selected under one `generation_publication` acquisition and held for
+    /// the search that asked for them.
+    ///
+    /// `with_snapshot_compatible_hnsw_layers` lends each layer to a callback
+    /// and takes it back, which is all a search over ONE partition needs. A
+    /// search over several partitions has to hold every partition's layers at
+    /// once -- it spends one candidate budget across all of them -- so it
+    /// holds them here instead: sealed generations as owned clones, the tail
+    /// under its read lock, both taken while the publication lock pins the
+    /// chain, so the layers a snapshot selects are exactly the layers the
+    /// search walks, whatever is published after.
+    pub(crate) fn snapshot_compatible_owned_layers(
+        &self,
+        snapshot: SnapshotId,
+    ) -> (
+        VectorGraphLayerAvailability,
+        Vec<SnapshotCompatibleLayer<'_>>,
+    ) {
+        let snapshot_tx = TxId::from_snapshot(snapshot);
+        let publication = self.generation_publication.lock();
+        let sealed = self.sealed_hnsw.read();
+        if sealed.quarantine.is_some() {
+            return (VectorGraphLayerAvailability::Unavailable, Vec::new());
+        }
+        let held_tail = || {
+            self.hnsw.get().and_then(|tail| {
+                parking_lot::RwLockReadGuard::try_map(tail.read(), |tail| {
+                    tail.as_ref().filter(|tail| !tail.is_empty())
+                })
+                .ok()
+            })
+        };
+        let Some(location) = Self::selected_chain_location(&sealed, snapshot_tx) else {
+            // No sealed chain answers this snapshot. A bare mutable tail does
+            // exactly when the lending door would serve it alone.
+            let tail_only = sealed.base.is_none()
+                && sealed.dormant_base.is_none()
+                && sealed.change.is_none()
+                && sealed.dormant_change.is_none()
+                && self.serving_policy().is_some()
+                && !self.maintenance_sample_active.load(Ordering::SeqCst)
+                && self.max_tx() <= snapshot_tx;
+            let tail = tail_only.then(held_tail).flatten();
+            drop(sealed);
+            drop(publication);
+            let Some(tail) = tail else {
+                return (VectorGraphLayerAvailability::Unavailable, Vec::new());
+            };
+            #[cfg(any(test, feature = "test-seams"))]
+            if let Some(slot) = self.graph_callback_pause.lock().clone() {
+                slot.pause_after(0);
+            }
+            let len = tail.len();
+            return (
+                VectorGraphLayerAvailability::Ready,
+                vec![SnapshotCompatibleLayer {
+                    identity: None,
+                    held: HeldLayer::Tail(tail),
+                    len,
+                }],
+            );
+        };
+        let (base, change, include_tail) =
+            match Self::selected_chain_layers(&sealed, location, snapshot_tx) {
+                Ok(layers) => layers,
+                Err(availability) => return (availability, Vec::new()),
+            };
+        drop(sealed);
+        let tail = include_tail.then(held_tail).flatten();
+        drop(publication);
+        #[cfg(any(test, feature = "test-seams"))]
+        if let Some(slot) = self.graph_callback_pause.lock().clone() {
+            slot.pause_after(0);
+        }
+        let mut layers =
+            Vec::with_capacity(1 + usize::from(change.is_some()) + usize::from(tail.is_some()));
+        for generation in std::iter::once(base).chain(change) {
+            let len = generation.graph().len();
+            if len == 0 {
+                continue;
+            }
+            layers.push(SnapshotCompatibleLayer {
+                identity: Some(generation.identity),
+                held: HeldLayer::Sealed(generation),
+                len,
+            });
+        }
+        if let Some(tail) = tail {
+            let len = tail.len();
+            layers.push(SnapshotCompatibleLayer {
+                identity: None,
+                held: HeldLayer::Tail(tail),
+                len,
+            });
+        }
+        (VectorGraphLayerAvailability::Ready, layers)
     }
 
     /// Visit the complete graph layers compatible with `snapshot`. Ordinary
@@ -3998,8 +5003,8 @@ impl IndexState {
             return Ok((VectorGraphLayerAvailability::Unavailable, Vec::new()));
         }
         let location = Self::selected_chain_location(&sealed, snapshot_tx);
-        let tail = self.hnsw.get().map(|tail| tail.read());
         let Some(location) = location else {
+            let tail = self.hnsw.get().map(|tail| tail.read());
             let tail_only = sealed.base.is_none()
                 && sealed.dormant_base.is_none()
                 && sealed.change.is_none()
@@ -4014,6 +5019,7 @@ impl IndexState {
             else {
                 return Ok((VectorGraphLayerAvailability::Unavailable, Vec::new()));
             };
+            drop(sealed);
             drop(publication);
             #[cfg(any(test, feature = "test-seams"))]
             if let Some(slot) = self.graph_callback_pause.lock().clone() {
@@ -4024,95 +5030,22 @@ impl IndexState {
                 vec![(None, visit(tail_graph)?)],
             ));
         };
-        let (base, change, include_tail) = match location {
-            SealedChainLocation::Current => {
-                let base_identity =
-                    Self::layer_identity(sealed.base.as_ref(), sealed.dormant_base.as_ref())
-                        .expect("a selected current vector chain has a base identity");
-                let Some(base) = sealed
-                    .base
-                    .as_ref()
-                    .filter(|base| base.identity == base_identity)
-                else {
-                    let availability = if sealed.dormant_base.is_some() {
-                        VectorGraphLayerAvailability::Dormant
-                    } else {
-                        VectorGraphLayerAvailability::Unavailable
-                    };
-                    return Ok((availability, Vec::new()));
-                };
-                let change_identity =
-                    Self::layer_identity(sealed.change.as_ref(), sealed.dormant_change.as_ref());
-                let change = if let Some(identity) = change_identity {
-                    let Some(change) = sealed
-                        .change
-                        .as_ref()
-                        .filter(|change| change.identity == identity)
-                    else {
-                        let availability = if sealed.dormant_change.is_some() {
-                            VectorGraphLayerAvailability::Dormant
-                        } else {
-                            VectorGraphLayerAvailability::Unavailable
-                        };
-                        return Ok((availability, Vec::new()));
-                    };
-                    Some(change)
-                } else {
-                    None
-                };
-                // A later commit cannot suppress an older reader's eligible
-                // tail. Search it exactly when the sealed frontier predates
-                // the snapshot; per-row visibility drops any newer points.
-                let active_frontier = change_identity.unwrap_or(base_identity);
-                (base, change, active_frontier.covered_tx < snapshot_tx)
-            }
-            SealedChainLocation::Retired { base_generation_id } => {
-                let chain = sealed
-                    .retired
-                    .iter()
-                    .find(|chain| {
-                        Self::retired_chain_base_identity(chain)
-                            .is_some_and(|identity| identity.generation_id == base_generation_id)
-                    })
-                    .expect("a selected retired vector chain remains registered");
-                let base_identity = Self::retired_chain_base_identity(chain)
-                    .expect("a selected retired vector chain has a base identity");
-                let Some(base) = chain
-                    .base
-                    .as_ref()
-                    .filter(|base| base.identity == base_identity)
-                else {
-                    let availability = if chain.dormant_base.is_some() {
-                        VectorGraphLayerAvailability::Dormant
-                    } else {
-                        VectorGraphLayerAvailability::Unavailable
-                    };
-                    return Ok((availability, Vec::new()));
-                };
-                let change_identity = Self::retired_chain_change_identity(chain);
-                let change = if let Some(identity) = change_identity {
-                    let Some(change) = chain
-                        .change
-                        .as_ref()
-                        .filter(|change| change.identity == identity)
-                    else {
-                        let availability = if chain.dormant_change.is_some() {
-                            VectorGraphLayerAvailability::Dormant
-                        } else {
-                            VectorGraphLayerAvailability::Unavailable
-                        };
-                        return Ok((availability, Vec::new()));
-                    };
-                    Some(change)
-                } else {
-                    None
-                };
-                (base, change, false)
-            }
+        let (base, change, include_tail) =
+            match Self::selected_chain_layers(&sealed, location, snapshot_tx) {
+                Ok(layers) => layers,
+                Err(availability) => return Ok((availability, Vec::new())),
+            };
+        // Sealed generations are immutable and carry their reservation in a
+        // shared owner. Clone the selected chain while it is registered, then
+        // release the registry before arbitrary query callbacks run. A
+        // concurrent replacement can publish immediately, while the old
+        // graph and its charge remain alive until this search drops its clone.
+        drop(sealed);
+        let tail = if include_tail {
+            self.hnsw.get().map(|tail| tail.read())
+        } else {
+            None
         };
-        // The guards above pin the selected graph objects. Publication may
-        // wait on those guards, but the publication mutex itself must not be
-        // held while arbitrary query callbacks execute.
         drop(publication);
         let mut results = Vec::with_capacity(
             1usize
@@ -4125,9 +5058,9 @@ impl IndexState {
         if let Some(slot) = self.graph_callback_pause.lock().clone() {
             slot.pause_after(0);
         }
-        results.push((Some(base.identity), visit(&base.graph)?));
+        results.push((Some(base.identity), visit(base.graph())?));
         if let Some(change) = change {
-            results.push((Some(change.identity), visit(&change.graph)?));
+            results.push((Some(change.identity), visit(change.graph())?));
         }
         if include_tail && let Some(tail) = tail.as_ref().and_then(|tail| tail.as_ref()) {
             results.push((None, visit(tail)?));
@@ -4373,12 +5306,8 @@ impl IndexState {
                         hnsw_ef_construction: hnsw_ef_construction as u32,
                     }
                 };
-                let generation = SealedHnswGeneration {
-                    identity,
-                    graph,
-                    bytes: old_bytes,
-                    accountant: old_accountant,
-                };
+                let generation =
+                    SealedHnswGeneration::new(identity, graph, old_bytes, old_accountant);
                 if base_known {
                     sealed.change = Some(generation);
                 } else {
@@ -4482,14 +5411,28 @@ impl IndexState {
             return false;
         }
 
+        let restored = match restored {
+            Some(restored) => match restored.into_parts() {
+                Ok(restored) => Some(restored),
+                Err(restored) => {
+                    match origin {
+                        MAINTENANCE_SAMPLE_MOVED_BASE => sealed.base = Some(restored),
+                        MAINTENANCE_SAMPLE_MOVED_CHANGE => sealed.change = Some(restored),
+                        _ => unreachable!("only a moved generation can be restored"),
+                    }
+                    return false;
+                }
+            },
+            None => None,
+        };
         let discarded_tail = tail.take();
         let discarded_bytes = self.hnsw_bytes.swap(0, Ordering::SeqCst);
         let discarded_accountant = self.hnsw_accountant.write().take();
         let restored_old_tail = restored.is_some();
-        if let Some(restored) = restored {
-            *tail = Some(restored.graph);
-            self.hnsw_bytes.store(restored.bytes, Ordering::SeqCst);
-            *self.hnsw_accountant.write() = restored.accountant;
+        if let Some((graph, bytes, accountant)) = restored {
+            *tail = Some(graph);
+            self.hnsw_bytes.store(bytes, Ordering::SeqCst);
+            *self.hnsw_accountant.write() = accountant;
         }
         self.fresh_tail_replayed_through_lsn.store(
             if restored_old_tail {
@@ -4630,12 +5573,12 @@ impl IndexState {
             return;
         }
         Self::retire_current_chain(&mut sealed);
-        sealed.base = Some(SealedHnswGeneration {
+        sealed.base = Some(SealedHnswGeneration::new(
             identity,
-            graph: hnsw,
+            hnsw,
             bytes,
-            accountant: Some(accountant),
-        });
+            Some(accountant),
+        ));
         sealed.change = None;
         sealed.dormant_base = None;
         sealed.dormant_change = None;
@@ -4786,12 +5729,12 @@ impl IndexState {
         self.hnsw_bytes.store(empty_bytes, Ordering::SeqCst);
         empty_charge.bytes = 0;
         *self.hnsw_accountant.write() = Some(accountant.clone());
-        self.sealed_hnsw.write().base = Some(SealedHnswGeneration {
+        self.sealed_hnsw.write().base = Some(SealedHnswGeneration::new(
             identity,
             graph,
-            bytes: resident_bytes,
-            accountant: Some(accountant),
-        });
+            resident_bytes,
+            Some(accountant),
+        ));
         Ok((encoded, resident_bytes))
     }
 
@@ -4845,12 +5788,6 @@ impl IndexState {
 
 impl Drop for IndexState {
     fn drop(&mut self) {
-        let raw_bytes = self.raw_resident_bytes.swap(0, Ordering::SeqCst);
-        if let Some(accountant) = self.raw_accountant.write().take()
-            && raw_bytes != 0
-        {
-            accountant.release(raw_bytes);
-        }
         self.drop_hnsw_without_accounting();
     }
 }
@@ -5155,7 +6092,8 @@ fn compatibility_hnsw_profile(
 ) -> (usize, usize, usize) {
     match quantization {
         VectorQuantization::F32 => match count {
-            n if n < HNSW_MEDIUM_PROFILE_START => (16, 200, count.max(200)),
+            0..=2_500 => (16, 200, 10),
+            n if n < HNSW_MEDIUM_PROFILE_START => (16, 200, 20),
             n if n < HNSW_LARGE_PROFILE_START => (24, 400, 400),
             _ => (16, 200, 200),
         },
@@ -5274,7 +6212,6 @@ pub struct PreparedPartitionedVectorBatch {
     touched: HashSet<VectorPartitionRef>,
     requested: HashMap<VectorIndexRef, PartitionKeySet>,
     projected_live_or_retained_partitions: HashMap<VectorIndexRef, usize>,
-    move_raw_body_bytes: usize,
     directory_reservation: PreparedDirectoryReservation,
     tail_insertions: PreparedTailInsertions,
 }
@@ -5366,12 +6303,32 @@ impl PreparedTailInsertions {
 #[derive(Clone)]
 struct PreparedDirectoryReservation {
     charge: Arc<Mutex<Option<RetainedMemoryCharge>>>,
+    index_charges: Arc<Mutex<HashMap<VectorIndexRef, RetainedMemoryCharge>>>,
+}
+
+struct PreparedDirectoryCharges {
+    store: Option<RetainedMemoryCharge>,
+    indexes: HashMap<VectorIndexRef, RetainedMemoryCharge>,
+}
+
+impl PreparedDirectoryCharges {
+    fn owner(&self, index: &VectorIndexRef) -> Option<Arc<dyn MemoryBudget>> {
+        self.store
+            .as_ref()
+            .or_else(|| self.indexes.get(index))
+            .map(|charge| charge.accountant.clone())
+    }
+
+    fn get_mut(&mut self, index: &VectorIndexRef) -> Option<&mut RetainedMemoryCharge> {
+        self.store.as_mut().or_else(|| self.indexes.get_mut(index))
+    }
 }
 
 impl PreparedDirectoryReservation {
     fn empty() -> Self {
         Self {
             charge: Arc::new(Mutex::new(None)),
+            index_charges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -5384,11 +6341,33 @@ impl PreparedDirectoryReservation {
         )?;
         Ok(Self {
             charge: Arc::new(Mutex::new(Some(RetainedMemoryCharge { bytes, accountant }))),
+            index_charges: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    fn take(&self) -> Option<RetainedMemoryCharge> {
-        self.charge.lock().take()
+    fn reserve_index(
+        &self,
+        index: VectorIndexRef,
+        accountant: Arc<dyn MemoryBudget>,
+        bytes: usize,
+    ) -> Result<()> {
+        let reservation = Self::reserve(accountant, bytes)?;
+        self.index_charges.lock().insert(
+            index,
+            reservation
+                .charge
+                .lock()
+                .take()
+                .expect("new reservation owns its charge"),
+        );
+        Ok(())
+    }
+
+    fn take(&self) -> PreparedDirectoryCharges {
+        PreparedDirectoryCharges {
+            store: self.charge.lock().take(),
+            indexes: std::mem::take(&mut *self.index_charges.lock()),
+        }
     }
 }
 
@@ -5398,7 +6377,18 @@ impl std::fmt::Debug for PreparedDirectoryReservation {
             .debug_struct("PreparedDirectoryReservation")
             .field(
                 "bytes",
-                &self.charge.lock().as_ref().map_or(0, |charge| charge.bytes),
+                &self
+                    .charge
+                    .lock()
+                    .as_ref()
+                    .map_or(0, |charge| charge.bytes)
+                    .saturating_add(
+                        self.index_charges
+                            .lock()
+                            .values()
+                            .map(|charge| charge.bytes)
+                            .sum::<usize>(),
+                    ),
             )
             .finish()
     }
@@ -5407,6 +6397,7 @@ impl std::fmt::Debug for PreparedDirectoryReservation {
 impl PartialEq for PreparedDirectoryReservation {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.charge, &other.charge)
+            && Arc::ptr_eq(&self.index_charges, &other.index_charges)
     }
 }
 
@@ -5442,23 +6433,65 @@ fn prepared_directory_growth_upper_bound(
     reclaimable_partitions: &HashSet<VectorPartitionRef>,
     requested: &HashMap<VectorIndexRef, PartitionKeySet>,
 ) -> usize {
+    prepared_directory_growth_upper_bound_matching(
+        inserts,
+        moves,
+        reclaimable_partitions,
+        requested,
+        |_| true,
+    )
+}
+
+fn prepared_directory_growth_upper_bound_matching(
+    inserts: &[PartitionedVectorEntry],
+    moves: &[PartitionedVectorMove],
+    reclaimable_partitions: &HashSet<VectorPartitionRef>,
+    requested: &HashMap<VectorIndexRef, PartitionKeySet>,
+    matches: impl Fn(&VectorIndexRef) -> bool,
+) -> usize {
     let directory_entry = std::mem::size_of::<RawVectorDirectoryEntry>()
+        .saturating_add(std::mem::size_of::<StoredVectorEntry>())
+        .saturating_add(std::mem::size_of::<(usize, usize)>())
+        .saturating_add(crate::quantized::shared_payload_header_bytes())
         .saturating_add(4 * std::mem::size_of::<TxId>() + 8 * std::mem::size_of::<(u64, u64)>())
         .saturating_add(std::mem::size_of::<(RowId, Vec<usize>)>())
         .saturating_add(std::mem::size_of::<usize>())
         .saturating_add(std::mem::size_of::<(RowId, VectorPartitionKey)>())
-        .saturating_sub(std::mem::size_of::<VectorPartitionKey>());
+        .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
+        .saturating_add(std::mem::size_of::<(RowId, Vec<VectorPartitionKey>)>())
+        .saturating_add(std::mem::size_of::<VectorPartitionKey>());
     let mut bytes = inserts
-        .len()
-        .saturating_add(moves.len())
+        .iter()
+        .filter(|insert| matches(&insert.entry.index))
+        .count()
+        .saturating_add(
+            moves
+                .iter()
+                .filter(|row_move| matches(&row_move.index))
+                .count(),
+        )
         .saturating_mul(directory_entry);
-    for insert in inserts {
-        bytes = bytes.saturating_add(insert.partition_key.estimated_bytes());
+    for insert in inserts.iter().filter(|insert| matches(&insert.entry.index)) {
+        bytes = bytes
+            .saturating_add(insert.partition_key.estimated_bytes())
+            .saturating_add(
+                insert
+                    .partition_key
+                    .estimated_bytes()
+                    .saturating_sub(std::mem::size_of::<VectorPartitionKey>()),
+            );
     }
-    for row_move in moves {
-        bytes = bytes.saturating_add(row_move.target_partition_key.estimated_bytes());
+    for row_move in moves.iter().filter(|row_move| matches(&row_move.index)) {
+        bytes = bytes
+            .saturating_add(row_move.target_partition_key.estimated_bytes())
+            .saturating_add(
+                row_move
+                    .source_partition_key
+                    .estimated_bytes()
+                    .saturating_add(row_move.target_partition_key.estimated_bytes()),
+            );
     }
-    for keys in requested.values() {
+    for (_, keys) in requested.iter().filter(|(index, _)| matches(index)) {
         for key in keys {
             bytes = bytes
                 .saturating_add(std::mem::size_of::<Arc<IndexState>>())
@@ -5467,7 +6500,10 @@ fn prepared_directory_growth_upper_bound(
                 .saturating_add(key.estimated_bytes());
         }
     }
-    for partition in reclaimable_partitions {
+    for partition in reclaimable_partitions
+        .iter()
+        .filter(|partition| matches(&partition.index))
+    {
         bytes = bytes.saturating_add(partition.partition_key.estimated_bytes());
     }
     bytes
@@ -5532,6 +6568,10 @@ struct VectorColumnState {
     layout: RwLock<VectorIndexLayout>,
     partitions: RwLock<BTreeMap<VectorPartitionKey, Arc<IndexState>>>,
     row_to_partition: RwLock<HashMap<RowId, VectorPartitionKey>>,
+    /// Every physical partition in which a row identity has retained history.
+    /// The current directory above stays the fast path; this one makes an old
+    /// snapshot resolve its own placement without probing every partition.
+    row_partition_history: RwLock<HashMap<RowId, Vec<VectorPartitionKey>>>,
     /// File-backed open reserves the lightweight registry/directory image as
     /// one retained category. The column keeps that exact reservation so a
     /// later DROP COLUMN/TABLE returns it once, independent of cache state.
@@ -5557,6 +6597,7 @@ impl VectorColumnState {
             layout: RwLock::new(layout),
             partitions: RwLock::new(partitions),
             row_to_partition: RwLock::new(HashMap::new()),
+            row_partition_history: RwLock::new(HashMap::new()),
             directory_accounting: Mutex::new(None),
         }
     }
@@ -5569,6 +6610,7 @@ impl VectorColumnState {
         self.partitions.read().get(key).cloned()
     }
 
+    /// The partitions, or none if their map cannot be read right now.
     fn partition_snapshots(&self) -> Vec<(VectorPartitionKey, Arc<IndexState>)> {
         self.partitions
             .read()
@@ -5692,7 +6734,91 @@ impl VectorColumnState {
         self.row_to_partition.read().get(&row_id).cloned()
     }
 
+    fn with_partition_candidates_for_row<E, T>(
+        &self,
+        row_id: RowId,
+        mut inspect_partition: impl FnMut(
+            &VectorPartitionKey,
+            &Arc<IndexState>,
+        ) -> std::result::Result<Option<T>, E>,
+    ) -> std::result::Result<Option<T>, E> {
+        let current_rows = self.row_to_partition.read();
+        let history = self.row_partition_history.read();
+        let partitions = self.partitions.read();
+        #[cfg(feature = "test-seams")]
+        crate::mem::observe_bounded_candidate_grouping_for_test(
+            crate::mem::BoundedCandidateGroupingEventForTest::RowDirectoryLookup,
+        );
+        let current = current_rows.get(&row_id);
+
+        if let Some(key) = current
+            && let Some(state) = partitions.get(key)
+            && let Some(value) = inspect_partition(key, state)?
+        {
+            return Ok(Some(value));
+        }
+        if let Some(keys) = history.get(&row_id) {
+            for key in keys {
+                if current == Some(key) {
+                    continue;
+                }
+                if let Some(state) = partitions.get(key)
+                    && let Some(value) = inspect_partition(key, state)?
+                {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn with_snapshot_visible_partition_for_row<E, T, C>(
+        &self,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        before_visibility_probe: &mut C,
+        mut inspect_visible_partition: impl FnMut(
+            &VectorPartitionKey,
+            &Arc<IndexState>,
+            &mut C,
+        ) -> std::result::Result<Option<T>, E>,
+    ) -> std::result::Result<Option<T>, E>
+    where
+        C: FnMut() -> std::result::Result<(), E>,
+    {
+        self.with_partition_candidates_for_row(row_id, |key, state| {
+            before_visibility_probe()?;
+            #[cfg(feature = "test-seams")]
+            crate::mem::observe_bounded_candidate_grouping_for_test(
+                crate::mem::BoundedCandidateGroupingEventForTest::SnapshotVisibilityProbe,
+            );
+            if state.directory_has_visible_row(row_id, snapshot) {
+                inspect_visible_partition(key, state, before_visibility_probe)
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn note_partition_history(&self, row_id: RowId, key: &VectorPartitionKey) {
+        let mut history = self.row_partition_history.write();
+        // Publication has already reserved one retained key slot. Starting at
+        // one and extending exactly keeps the retained-directory delta aligned
+        // with that pre-commit reservation instead of Vec's four-slot append
+        // growth making the first historical identity larger than admitted.
+        let keys = history
+            .entry(row_id)
+            .or_insert_with(|| Vec::with_capacity(1));
+        if let Err(position) = keys.binary_search(key) {
+            if keys.len() == keys.capacity() {
+                keys.reserve_exact(1);
+            }
+            keys.insert(position, key.clone());
+        }
+    }
+
     fn note_live_insert(&self, key: &VectorPartitionKey, entry: &StoredVectorEntry) {
+        self.note_partition_history(entry.row_id, key);
         if entry.deleted_tx.is_none() {
             self.row_to_partition
                 .write()
@@ -5701,6 +6827,7 @@ impl VectorColumnState {
     }
 
     fn note_tombstone(&self, key: &VectorPartitionKey, row_id: RowId) {
+        self.note_partition_history(row_id, key);
         let mut rows = self.row_to_partition.write();
         if rows.get(&row_id).is_some_and(|current| current == key) {
             rows.remove(&row_id);
@@ -5714,6 +6841,8 @@ impl VectorColumnState {
         old_row_id: RowId,
         new_row_id: RowId,
     ) {
+        self.note_partition_history(old_row_id, source_key);
+        self.note_partition_history(new_row_id, target_key);
         let mut rows = self.row_to_partition.write();
         if rows
             .get(&old_row_id)
@@ -5727,13 +6856,21 @@ impl VectorColumnState {
     fn rebuild_current_rows(&self) {
         let partitions = self.partition_snapshots();
         let mut latest = HashMap::<RowId, (TxId, Lsn, VectorPartitionKey)>::new();
+        let mut history = HashMap::<RowId, Vec<VectorPartitionKey>>::new();
         for (key, state) in partitions {
-            for entry in state
-                .raw_directory
-                .read()
-                .iter()
-                .filter(|entry| entry.deleted_tx.is_none())
-            {
+            for entry in state.raw_directory.read().iter() {
+                let keys = history
+                    .entry(entry.row_id)
+                    .or_insert_with(|| Vec::with_capacity(1));
+                if keys.last() != Some(&key) {
+                    if keys.len() == keys.capacity() {
+                        keys.reserve_exact(1);
+                    }
+                    keys.push(key.clone());
+                }
+                if entry.deleted_tx.is_some() {
+                    continue;
+                }
                 let replace = latest
                     .get(&entry.row_id)
                     .is_none_or(|(tx, lsn, _)| (entry.created_tx, entry.lsn) > (*tx, *lsn));
@@ -5742,6 +6879,7 @@ impl VectorColumnState {
                 }
             }
         }
+        *self.row_partition_history.write() = history;
         *self.row_to_partition.write() = latest
             .into_iter()
             .map(|(row_id, (_, _, key))| (row_id, key))
@@ -5762,6 +6900,14 @@ impl VectorColumnState {
             partitions.retain(|key, _| !removed.contains(key));
             removed
         };
+        if !removed.is_empty() {
+            let mut history = self.row_partition_history.write();
+            history.retain(|_, keys| {
+                keys.retain(|key| !removed.contains(key));
+                keys.shrink_to_fit();
+                !keys.is_empty()
+            });
+        }
         !removed.is_empty()
     }
 
@@ -5787,6 +6933,34 @@ impl VectorColumnState {
         }
     }
 
+    fn raw_allocation_bytes_matching(&self, keep: impl Fn(&Arc<IndexState>) -> bool) -> usize {
+        let partitions = self.partitions.read();
+        let mut total = 0usize;
+        for (position, state) in partitions.values().enumerate() {
+            if !keep(state) {
+                continue;
+            }
+            let vectors = state.vectors.read();
+            total = total.saturating_add(vectors.owned_payload_bytes);
+            for (identity, bytes) in &vectors.payload_memberships {
+                let already_counted = partitions.values().take(position).any(|prior| {
+                    keep(prior)
+                        && prior
+                            .vectors
+                            .read()
+                            .payload_memberships
+                            .contains_key(identity)
+                });
+                if !already_counted {
+                    total = total
+                        .saturating_add(*bytes)
+                        .saturating_add(crate::quantized::shared_payload_header_bytes());
+                }
+            }
+        }
+        total
+    }
+
     fn retained_bytes(&self, index: &VectorIndexRef) -> usize {
         let state_bytes = self
             .partitions
@@ -5794,12 +6968,12 @@ impl VectorColumnState {
             .values()
             .fold(0usize, |bytes, state| {
                 bytes
-                    .saturating_add(state.raw_payload_bytes())
                     .saturating_add(state.hnsw_bytes.load(Ordering::SeqCst))
                     .saturating_add(state.sealed_hnsw_bytes())
             });
         self.directory_ownership(index)
             .total()
+            .saturating_add(self.raw_allocation_bytes_matching(|_| true))
             .saturating_add(state_bytes)
     }
 
@@ -5842,6 +7016,25 @@ impl VectorColumnState {
             ownership.typed_partition_keys = ownership
                 .typed_partition_keys
                 .saturating_add(key.estimated_bytes());
+        }
+        drop(rows);
+        let history = self.row_partition_history.read();
+        ownership.partition_vectors = ownership.partition_vectors.saturating_add(
+            history
+                .len()
+                .saturating_mul(std::mem::size_of::<(RowId, Vec<VectorPartitionKey>)>()),
+        );
+        for keys in history.values() {
+            ownership.partition_vectors = ownership.partition_vectors.saturating_add(
+                keys.capacity()
+                    .saturating_mul(std::mem::size_of::<VectorPartitionKey>()),
+            );
+            for key in keys {
+                ownership.typed_partition_keys = ownership.typed_partition_keys.saturating_add(
+                    key.estimated_bytes()
+                        .saturating_sub(std::mem::size_of::<VectorPartitionKey>()),
+                );
+            }
         }
         ownership
     }
@@ -6107,6 +7300,10 @@ pub struct VectorStore {
         HashMap<(VectorPartitionRef, VectorJournalTruncationPhaseForTest), Arc<OneShotFaultSlot>>,
     >,
     workspace_bytes: Arc<AtomicUsize>,
+    raw_payload_bytes: Arc<AtomicUsize>,
+    /// Allocation headers remain visible in raw metadata receipts even when
+    /// only a holder outside the registry retains the shared body.
+    raw_payload_header_bytes: Arc<AtomicUsize>,
     memory_accountant: RwLock<Option<Arc<dyn MemoryBudget>>>,
     #[cfg(any(test, feature = "test-seams"))]
     memory_workspace_pause: Mutex<Option<Arc<MaintenanceProgressPauseSlot>>>,
@@ -6152,9 +7349,10 @@ impl PreparedVectorPublication {
     #[doc(hidden)]
     pub fn memory_swap_vector_bytes(&self) -> usize {
         self.registry.iter().fold(0usize, |total, (index, column)| {
-            let mut bytes = total.saturating_add(column.directory_retained_bytes(index));
+            let mut bytes = total
+                .saturating_add(column.directory_retained_bytes(index))
+                .saturating_add(column.raw_allocation_bytes_matching(|_| true));
             for (_, state) in column.partition_snapshots() {
-                bytes = bytes.saturating_add(state.raw_payload_bytes());
                 if self
                     .preserved_states
                     .contains(&(Arc::as_ptr(&state) as usize))
@@ -6171,19 +7369,22 @@ impl PreparedVectorPublication {
     #[doc(hidden)]
     pub fn preserved_state_bytes(&self) -> usize {
         self.registry.values().fold(0usize, |total, column| {
+            let preserved = |state: &Arc<IndexState>| {
+                self.preserved_states
+                    .contains(&(Arc::as_ptr(state) as usize))
+            };
             column
                 .partition_snapshots()
                 .into_iter()
-                .filter(|(_, state)| {
-                    self.preserved_states
-                        .contains(&(Arc::as_ptr(state) as usize))
-                })
-                .fold(total, |bytes, (_, state)| {
-                    bytes
-                        .saturating_add(state.raw_payload_bytes())
-                        .saturating_add(state.hnsw_bytes.load(Ordering::SeqCst))
-                        .saturating_add(state.sealed_hnsw_bytes())
-                })
+                .filter(|(_, state)| preserved(state))
+                .fold(
+                    total.saturating_add(column.raw_allocation_bytes_matching(preserved)),
+                    |bytes, (_, state)| {
+                        bytes
+                            .saturating_add(state.hnsw_bytes.load(Ordering::SeqCst))
+                            .saturating_add(state.sealed_hnsw_bytes())
+                    },
+                )
         })
     }
 
@@ -6267,6 +7468,8 @@ impl VectorStore {
             last_maintenance_partition: Mutex::new(None),
             graph_use_sequence: AtomicU64::new(0),
             workspace_bytes: Arc::new(AtomicUsize::new(0)),
+            raw_payload_bytes: Arc::new(AtomicUsize::new(0)),
+            raw_payload_header_bytes: Arc::new(AtomicUsize::new(0)),
             memory_accountant: RwLock::new(None),
             #[cfg(any(test, feature = "test-seams"))]
             memory_workspace_pause: Mutex::new(None),
@@ -6482,8 +7685,7 @@ impl VectorStore {
                 .partition_state(&key)
                 .expect("unpartitioned declaration always owns its empty-key state");
             let stored = state.stored_entry(entry);
-            state.push_entry(stored.clone());
-            column.note_live_insert(&key, &stored);
+            state.push_entry_with(stored, |stored| column.note_live_insert(&key, stored));
         }
         PreparedVectorPublication::new(registry)
     }
@@ -6549,8 +7751,9 @@ impl VectorStore {
                 .partition_state(&entry.partition_key)
                 .expect("prepared partition was admitted");
             let stored = state.stored_entry(entry.entry);
-            state.push_entry(stored.clone());
-            column.note_live_insert(&entry.partition_key, &stored);
+            state.push_entry_with(stored, |stored| {
+                column.note_live_insert(&entry.partition_key, stored)
+            });
         }
         for column in registry.values() {
             if !column.layout().is_partitioned() {
@@ -7398,13 +8601,57 @@ impl VectorStore {
                 column.install_directory_accounting(bytes, accountant.clone());
             }
             for (_, state) in column.partition_snapshots() {
-                if state.raw_payload_bytes() != 0 {
-                    state.attach_raw_accounting(accountant.clone());
+                if state.raw_resident.load(Ordering::SeqCst) {
+                    state.attach_raw_accounting(
+                        accountant.clone(),
+                        self.raw_payload_bytes.clone(),
+                        self.raw_payload_header_bytes.clone(),
+                    );
                 }
             }
         }
         let old_registry = std::mem::replace(&mut *self.registry.write(), registry);
         for column in old_registry.values() {
+            column.clear_hnsw_except(&*accountant, &preserved_states);
+        }
+    }
+
+    /// Replace only vector indexes owned by a received-schema dependency
+    /// closure. Unaffected registries and their maintained graphs retain the
+    /// same Arc identity and are never rebuilt by this publication.
+    pub fn publish_prepared_received_schema_tables(
+        &self,
+        publication: PreparedVectorPublication,
+        affected_tables: &std::collections::HashSet<String>,
+        accountant: Arc<dyn MemoryBudget>,
+    ) {
+        let _bulk = self.bulk_gate.write();
+        let (incoming, preserved_states) = publication.into_parts();
+        for (index, column) in &incoming {
+            if column.directory_accounting.lock().is_none() {
+                let bytes = column.directory_retained_bytes(index);
+                column.install_directory_accounting(bytes, accountant.clone());
+            }
+            for (_, state) in column.partition_snapshots() {
+                if state.raw_resident.load(Ordering::SeqCst) {
+                    state.attach_raw_accounting(
+                        accountant.clone(),
+                        self.raw_payload_bytes.clone(),
+                        self.raw_payload_header_bytes.clone(),
+                    );
+                }
+            }
+        }
+        let retired = {
+            let mut registry = self.registry.write();
+            let retired = registry
+                .extract_if(|index, _| affected_tables.contains(&index.table))
+                .map(|(_, column)| column)
+                .collect::<Vec<_>>();
+            registry.extend(incoming);
+            retired
+        };
+        for column in retired {
             column.clear_hnsw_except(&*accountant, &preserved_states);
         }
     }
@@ -7944,15 +9191,23 @@ impl VectorStore {
             projected_counts.insert(index, count);
         }
 
-        let move_raw_body_bytes = valid_moves.iter().fold(0usize, |bytes, row_move| {
-            bytes.saturating_add(
-                self.try_partition_state(&row_move.index, &row_move.source_partition_key)
-                    .and_then(|state| state.stored_by_row_id(row_move.old_row_id))
-                    .map_or(0, |entry| entry.estimated_bytes()),
-            )
-        });
         let directory_reservation = if let Some(accountant) = self.memory_accountant.read().clone()
         {
+            let copied_body_bytes = valid_moves.iter().fold(0usize, |bytes, row_move| {
+                let body = self
+                    .try_partition_state(&row_move.index, &row_move.source_partition_key)
+                    .and_then(|source| {
+                        source.with_stored_by_row_id(row_move.old_row_id, |entry| {
+                            if entry.vector.payload_identity().is_none() {
+                                entry.estimated_bytes()
+                            } else {
+                                0
+                            }
+                        })
+                    })
+                    .unwrap_or(0);
+                bytes.saturating_add(body)
+            });
             PreparedDirectoryReservation::reserve(
                 accountant,
                 prepared_directory_growth_upper_bound(
@@ -7961,10 +9216,56 @@ impl VectorStore {
                     &effective_reclaimable_partitions,
                     &requested,
                 )
-                .saturating_add(move_raw_body_bytes),
+                .saturating_add(copied_body_bytes),
             )?
         } else {
-            PreparedDirectoryReservation::empty()
+            let reservation = PreparedDirectoryReservation::empty();
+            for index in Self::sorted_refs(touched.iter().map(|partition| partition.index.clone()))
+            {
+                let column = self
+                    .try_column(&index)
+                    .expect("touched vector index was validated");
+                // A received/replayed replacement owns its directory charge even
+                // when the surrounding legacy store has no accountant. Prepare
+                // its next publication with that owner; other legacy columns keep
+                // their existing body-only accounting protocol.
+                let accountant = column
+                    .directory_accounting
+                    .lock()
+                    .as_ref()
+                    .map(|charge| charge.accountant.clone());
+                let Some(accountant) = accountant else {
+                    continue;
+                };
+                let copied_body_bytes = valid_moves
+                    .iter()
+                    .filter(|row_move| row_move.index == index)
+                    .fold(0usize, |bytes, row_move| {
+                        let body = self
+                            .try_partition_state(&row_move.index, &row_move.source_partition_key)
+                            .and_then(|source| {
+                                source.with_stored_by_row_id(row_move.old_row_id, |entry| {
+                                    if entry.vector.payload_identity().is_none() {
+                                        entry.estimated_bytes()
+                                    } else {
+                                        0
+                                    }
+                                })
+                            })
+                            .unwrap_or(0);
+                        bytes.saturating_add(body)
+                    });
+                let bytes = prepared_directory_growth_upper_bound_matching(
+                    inserts,
+                    &valid_moves,
+                    &effective_reclaimable_partitions,
+                    &requested,
+                    |candidate| candidate == &index,
+                )
+                .saturating_add(copied_body_bytes);
+                reservation.reserve_index(index, accountant, bytes)?;
+            }
+            reservation
         };
 
         let tail_insertions = self.prepare_tail_insertions(inserts, &valid_moves)?;
@@ -7977,7 +9278,6 @@ impl VectorStore {
             touched,
             requested,
             projected_live_or_retained_partitions: projected_counts,
-            move_raw_body_bytes,
             directory_reservation,
             tail_insertions,
         })
@@ -8043,7 +9343,7 @@ impl VectorStore {
             .or_else(|| self.memory_accountant.read().clone())
             .unwrap_or_else(crate::memory_budget::unlimited_memory_budget);
         let bytes = resident_bytes.saturating_add(scratch_bytes);
-        self.reclaim_idle_graphs_for(bytes, Some(&state));
+        self.reclaim_idle_graphs_for(bytes, &[state.as_ref()]);
         accountant.try_allocate_for(bytes, "vector_index", "prepare_hnsw_tail",
             "Reduce vector volume or raise MEMORY_LIMIT before committing another searchable vector.")?;
         let charge = RetainedMemoryCharge { bytes, accountant };
@@ -8200,14 +9500,7 @@ impl VectorStore {
         lsn: Lsn,
         accountant: Option<&dyn MemoryBudget>,
     ) -> PreparedPartitionedVectorPublication {
-        let mut directory_reservation = prepared.directory_reservation.take();
-        if let Some(reservation) = directory_reservation.as_mut() {
-            assert!(
-                prepared.move_raw_body_bytes <= reservation.bytes,
-                "prepared vector reservation covers moved raw bodies"
-            );
-            reservation.bytes -= prepared.move_raw_body_bytes;
-        }
+        let mut directory_reservations = prepared.directory_reservation.take();
         let touched_indexes = Self::sorted_refs(
             prepared
                 .touched
@@ -8243,7 +9536,6 @@ impl VectorStore {
                     touched: _,
                     requested: _,
                     projected_live_or_retained_partitions: _,
-                    move_raw_body_bytes: _,
                     directory_reservation: _,
                     tail_insertions,
                 } = pending
@@ -8255,7 +9547,7 @@ impl VectorStore {
                     moves,
                     lsn,
                     accountant,
-                    &tail_insertions,
+                    (&tail_insertions, &mut directory_reservations),
                 );
             });
             // Publish the matching retained-directory charge before releasing
@@ -8264,7 +9556,7 @@ impl VectorStore {
             // charge.
             self.settle_directory_accounting_for_indexes(
                 &touched_indexes,
-                directory_reservation.as_mut(),
+                &mut directory_reservations,
             );
             true
         });
@@ -8282,7 +9574,6 @@ impl VectorStore {
                 touched,
                 requested,
                 projected_live_or_retained_partitions: _,
-                move_raw_body_bytes: _,
                 directory_reservation: _,
                 tail_insertions,
             } = prepared;
@@ -8295,7 +9586,7 @@ impl VectorStore {
                     moves,
                     lsn,
                     accountant,
-                    &tail_insertions,
+                    (&tail_insertions, &mut directory_reservations),
                 );
 
                 let mut rebuild_indexes = HashSet::<VectorIndexRef>::new();
@@ -8319,7 +9610,7 @@ impl VectorStore {
             });
             self.settle_directory_accounting_for_indexes(
                 &touched_indexes,
-                directory_reservation.as_mut(),
+                &mut directory_reservations,
             );
         });
         PreparedPartitionedVectorPublication
@@ -8328,13 +9619,12 @@ impl VectorStore {
     fn settle_directory_accounting_for_indexes(
         &self,
         indexes: &[VectorIndexRef],
-        reservation: Option<&mut RetainedMemoryCharge>,
+        reservations: &mut PreparedDirectoryCharges,
     ) {
-        let Some(reservation) = reservation else {
-            return;
-        };
         for index in indexes {
-            if let Some(column) = self.try_column(index) {
+            if let Some(reservation) = reservations.get_mut(index)
+                && let Some(column) = self.try_column(index)
+            {
                 column.settle_directory_accounting(index, reservation);
             }
         }
@@ -8763,6 +10053,53 @@ impl VectorStore {
         })
     }
 
+    /// Apply already-classified scalar marks only to the current registered
+    /// source, without allocating or cloning its typed partition key. Each
+    /// `None` leaves its field unchanged; this adapter cannot clear marks.
+    /// Intentional cancellation must be omitted from `failure`, preserving an
+    /// earlier actionable failure as in `record_partition_maintenance_error`.
+    ///
+    /// Call after dropping all source views and outside any already-held
+    /// partition-maintenance or publication closure. This callback-free path
+    /// takes the ordinary bulk, maintenance, registry and partition guards,
+    /// but does not enter the callback-bearing maintenance stack.
+    #[doc(hidden)]
+    pub fn apply_partition_source_maintenance_metadata(
+        &self,
+        index: &VectorIndexRef,
+        expected_state: &Arc<IndexState>,
+        failure: Option<VectorMaintenanceFailureDetails>,
+        quarantine: Option<VectorRouteQuarantineReason>,
+    ) -> bool {
+        self.with_bulk_read(|| {
+            let Some(column) = self.try_column(index) else {
+                return false;
+            };
+            let _maintenance = expected_state.maintenance.lock();
+            let registry = self.registry.read();
+            if !registry
+                .get(index)
+                .is_some_and(|current| Arc::ptr_eq(current, &column))
+            {
+                return false;
+            }
+            let partitions = column.partitions.read();
+            if !partitions
+                .values()
+                .any(|current| Arc::ptr_eq(current, expected_state))
+            {
+                return false;
+            }
+            if let Some(failure) = failure {
+                expected_state.record_maintenance_failure(failure);
+            }
+            if let Some(quarantine) = quarantine {
+                expected_state.set_route_quarantine(quarantine);
+            }
+            true
+        })
+    }
+
     /// Whether this key retains raw historical vectors but no longer owns a
     /// maintained indexed state. Exact readers still inspect it when their
     /// snapshot can see one of those versions; indexed readers must treat it
@@ -8787,6 +10124,69 @@ impl VectorStore {
         self.with_bulk_read(|| {
             self.try_column(index)
                 .and_then(|column| column.current_partition(row_id))
+        })
+    }
+
+    /// Visit the current partition and then the row's retained historical
+    /// partitions until the callback resolves one. The callback borrows each
+    /// key/state in place, so it can charge and test snapshot membership before
+    /// allocating a retained clone.
+    #[doc(hidden)]
+    pub fn with_partition_candidates_for_row<E, T>(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        inspect_partition: impl FnMut(
+            &VectorPartitionKey,
+            &Arc<IndexState>,
+        ) -> std::result::Result<Option<T>, E>,
+    ) -> std::result::Result<Option<T>, E>
+    where
+        E: From<Error>,
+    {
+        self.with_bulk_read(|| {
+            let column = self.try_column(index).ok_or_else(|| {
+                E::from(Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })
+            })?;
+            column.with_partition_candidates_for_row(row_id, inspect_partition)
+        })
+    }
+
+    /// Resolve the row's snapshot-visible physical partition through the
+    /// reverse directory. The store owns both lookup and visibility probing;
+    /// callers see only a partition whose raw directory contains the row at
+    /// the requested snapshot.
+    #[doc(hidden)]
+    pub fn with_snapshot_visible_partition_for_row<E, T, C>(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        before_visibility_probe: &mut C,
+        inspect_visible_partition: impl FnMut(
+            &VectorPartitionKey,
+            &Arc<IndexState>,
+            &mut C,
+        ) -> std::result::Result<Option<T>, E>,
+    ) -> std::result::Result<Option<T>, E>
+    where
+        E: From<Error>,
+        C: FnMut() -> std::result::Result<(), E>,
+    {
+        self.with_bulk_read(|| {
+            let column = self.try_column(index).ok_or_else(|| {
+                E::from(Error::UnknownVectorIndex {
+                    index: index.clone(),
+                })
+            })?;
+            column.with_snapshot_visible_partition_for_row(
+                row_id,
+                snapshot,
+                before_visibility_probe,
+                inspect_visible_partition,
+            )
         })
     }
 
@@ -8966,6 +10366,138 @@ impl VectorStore {
         self.evict_idle_graphs_except(None)
     }
 
+    /// Free at least `needed` bytes of serving pages from the paged
+    /// generations resident in this store, so that a graph load that did not
+    /// fit can: serving pages give way to a topology.
+    ///
+    /// Only serving slots are given back, never a topology, so no partition a
+    /// search is walking or about to walk stops being searchable from its
+    /// graph; a page given back is read and authenticated again when a walk
+    /// next needs it, and no answer changes. The largest caches give first,
+    /// down to one level they all share, so no partition is left with a
+    /// smaller cache than another gave up to, and none is taken below one
+    /// slot. If even that frees less than `needed`, nothing is given back:
+    /// the load is refused either way and the caches stay warm.
+    pub fn give_back_serving_pages(&self, needed: usize) -> usize {
+        self.give_back_serving_pages_where(needed, false, |_| true)
+    }
+
+    /// Before the statement on this thread loads its partitions, take back
+    /// up to `wanted` bytes of serving pages from idle partitions it is not
+    /// searching, so its own loads can have the caches they would have on a
+    /// fresh reader. Their topologies stay resident, so they are not read
+    /// again; only pages they can re-read are given up. Gives what it can.
+    pub(crate) fn give_back_serving_pages_outside_statement(&self, wanted: usize) -> usize {
+        let Some(searched) = STATEMENT_PARTITIONS.with(|declared| declared.borrow().clone()) else {
+            return 0;
+        };
+        self.give_back_serving_pages_where(wanted, true, |state| {
+            !searched.contains(&(state as *const IndexState as usize))
+        })
+    }
+
+    fn give_back_serving_pages_where(
+        &self,
+        needed: usize,
+        partial: bool,
+        from: impl Fn(&IndexState) -> bool,
+    ) -> usize {
+        if needed == 0 {
+            return 0;
+        }
+        // Every lock here is only tried: this runs inside whatever allocation
+        // was refused, which may already hold any of them, and a cache that
+        // cannot be reached right now simply keeps its pages. Nothing here
+        // allocates either -- the memory it would need is what is short -- so
+        // the generations are visited where they are, once per question.
+        let freed_at = |level: usize| {
+            let mut freed = 0_usize;
+            self.for_each_serving_generation(&from, |generation| {
+                if let Some((slots, slot_bytes)) = generation.serving_slots() {
+                    freed = freed
+                        .saturating_add(slots.saturating_sub(level).saturating_mul(slot_bytes));
+                }
+            });
+            freed
+        };
+        let needed = if partial {
+            needed.min(freed_at(1))
+        } else {
+            needed
+        };
+        if needed == 0 {
+            return 0;
+        }
+        if freed_at(1) < needed {
+            contextdb_core::find_attribution::count("serving_page_give_back_short", 1);
+            return 0;
+        }
+        // The highest level every cache can keep while the ones above it
+        // still free what is needed.
+        let mut high = 1_usize;
+        self.for_each_serving_generation(&from, |generation| {
+            if let Some((slots, _)) = generation.serving_slots() {
+                high = high.max(slots);
+            }
+        });
+        let mut low = 1_usize;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if freed_at(middle) >= needed {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        let mut freed = 0_usize;
+        self.for_each_serving_generation(&from, |generation| {
+            if generation
+                .serving_slots()
+                .is_some_and(|(slots, _)| slots > low)
+            {
+                freed = freed.saturating_add(generation.give_back_serving_slots(low));
+            }
+        });
+        contextdb_core::find_attribution::count("serving_page_bytes_given_back", freed as u64);
+        contextdb_core::find_attribution::note_serving_pages_given_back(freed);
+        freed
+    }
+
+    /// Visit every resident sealed generation of the partitions `from`
+    /// accepts, in place and without allocating, under locks that are only
+    /// tried: a registry, column or partition that is busy right now is
+    /// skipped.
+    fn for_each_serving_generation(
+        &self,
+        from: &impl Fn(&IndexState) -> bool,
+        mut visit: impl FnMut(&SealedHnswGeneration),
+    ) {
+        let Some(registry) = self.registry.try_read() else {
+            return;
+        };
+        for column in registry.values() {
+            let Some(partitions) = column.partitions.try_read() else {
+                continue;
+            };
+            for state in partitions.values() {
+                if !from(state.as_ref()) {
+                    continue;
+                }
+                let Some(sealed) = state.sealed_hnsw.try_read() else {
+                    continue;
+                };
+                for generation in sealed.base.iter().chain(sealed.change.iter()).chain(
+                    sealed
+                        .retired
+                        .iter()
+                        .flat_map(|chain| chain.base.iter().chain(chain.change.iter())),
+                ) {
+                    visit(generation);
+                }
+            }
+        }
+    }
+
     pub(crate) fn evict_idle_graphs_except(&self, selected: Option<&IndexState>) -> usize {
         self.registry
             .read()
@@ -8991,13 +10523,78 @@ impl VectorStore {
             .store(sequence, Ordering::Relaxed);
     }
 
+    /// What the memory budget this store charges has free, if it has a limit.
+    pub(crate) fn memory_available_bytes(&self) -> Option<usize> {
+        self.memory_accountant
+            .read()
+            .as_ref()
+            .and_then(|accountant| accountant.available_bytes())
+    }
+
+    /// Name the partitions the statement on this thread is about to search,
+    /// so a load it makes never evicts one of them to make room.
+    pub(crate) fn declare_statement_partitions(states: &[&IndexState]) -> StatementPartitions {
+        let searched = states
+            .iter()
+            .map(|state| *state as *const IndexState as usize)
+            .collect::<Vec<_>>();
+        StatementPartitions {
+            previous: STATEMENT_PARTITIONS.with(|declared| declared.replace(Some(searched))),
+        }
+    }
+
     /// Release reloadable graphs only when a finite shared budget cannot
     /// admit the next allocation. With room available, alternating
     /// partitions remain warm.
+    /// Make room for the graphs a read is about to load, never by taking one
+    /// the same read is going to search.
+    ///
+    /// `selected` names every partition this statement has admitted, not just
+    /// the one whose load is being sized. A find over several Contexts loads
+    /// them one after another, so excluding only the partition in hand lets
+    /// each load evict the sibling the previous one just loaded, and the find
+    /// re-reads every graph it has already read.
     pub(crate) fn reclaim_idle_graphs_for(
         &self,
         required_bytes: usize,
-        selected: Option<&IndexState>,
+        selected: &[&IndexState],
+    ) -> usize {
+        self.reclaim_idle_graphs_except(required_bytes, |state| {
+            selected
+                .iter()
+                .any(|selected| std::ptr::eq(state, *selected))
+        })
+    }
+
+    /// Make `short` more bytes free for a graph the statement on this thread
+    /// is loading, by evicting idle graphs of partitions that statement is
+    /// not searching. A statement that declared nothing evicts nothing here:
+    /// without its partitions named, any sibling it already loaded could be
+    /// taken.
+    pub fn make_room_for_graph_load(&self, short: usize) -> usize {
+        if short == 0 {
+            return 0;
+        }
+        let Some(searched) = STATEMENT_PARTITIONS.with(|declared| declared.borrow().clone()) else {
+            return 0;
+        };
+        let Some(available) = self
+            .memory_accountant
+            .read()
+            .as_ref()
+            .and_then(|accountant| accountant.available_bytes())
+        else {
+            return 0;
+        };
+        self.reclaim_idle_graphs_except(available.saturating_add(short), |state| {
+            searched.contains(&(state as *const IndexState as usize))
+        })
+    }
+
+    fn reclaim_idle_graphs_except(
+        &self,
+        required_bytes: usize,
+        selected: impl Fn(&IndexState) -> bool,
     ) -> usize {
         let Some(accountant) = self.memory_accountant.read().clone() else {
             return 0;
@@ -9016,13 +10613,13 @@ impl VectorStore {
             .read()
             .iter()
             .flat_map(|(index, column)| {
-                column.partition_snapshots().into_iter().filter_map(
-                    move |(partition_key, state)| {
-                        selected
-                            .is_none_or(|selected| !std::ptr::eq(state.as_ref(), selected))
+                column
+                    .partition_snapshots()
+                    .into_iter()
+                    .filter_map(|(partition_key, state)| {
+                        (!selected(state.as_ref()))
                             .then(|| (VectorPartitionRef::new(index.clone(), partition_key), state))
-                    },
-                )
+                    })
             })
             .collect::<Vec<_>>();
         candidates.sort_by(
@@ -9046,6 +10643,12 @@ impl VectorStore {
             },
         );
 
+        contextdb_core::find_attribution::count("graph_reclaims_over_budget", 1);
+        contextdb_core::find_attribution::count(
+            "graph_reclaim_required_bytes",
+            required_bytes as u64,
+        );
+        contextdb_core::find_attribution::count("graph_reclaim_available_bytes", available as u64);
         let mut evicted = 0usize;
         for (_, state) in candidates {
             if required_bytes <= available {
@@ -9055,6 +10658,7 @@ impl VectorStore {
             evicted += usize::from(state.evict_resident_sealed_generation(false));
             available = accountant.available_bytes().unwrap_or(usize::MAX);
         }
+        contextdb_core::find_attribution::count("sealed_generations_evicted", evicted as u64);
         evicted
     }
 
@@ -9122,6 +10726,16 @@ impl VectorStore {
         self.apply_inserts_with_accountant(inserts, None);
     }
 
+    fn attach_legacy_raw_accounting(&self, state: &Arc<IndexState>) {
+        if let Some(owner) = self.memory_accountant.read().clone() {
+            state.attach_raw_accounting(
+                owner,
+                self.raw_payload_bytes.clone(),
+                self.raw_payload_header_bytes.clone(),
+            );
+        }
+    }
+
     pub fn apply_inserts_with_accountant(
         &self,
         inserts: Vec<VectorEntry>,
@@ -9153,10 +10767,12 @@ impl VectorStore {
                 && let Some(state) = column.partition_state(&VectorPartitionKey::unpartitioned())
             {
                 let index = entry.index.clone();
+                self.attach_legacy_raw_accounting(&state);
                 let stored_entry = state.stored_entry(entry);
-                state.push_entry(stored_entry.clone());
-                column.note_live_insert(&VectorPartitionKey::unpartitioned(), &stored_entry);
-                state.insert_into_materialized_hnsw(&index, &stored_entry, accountant);
+                state.push_entry_with(stored_entry, |stored| {
+                    column.note_live_insert(&VectorPartitionKey::unpartitioned(), stored);
+                    state.insert_into_materialized_hnsw(&index, stored, accountant);
+                });
             }
         }
     }
@@ -9246,18 +10862,21 @@ impl VectorStore {
             let key = VectorPartitionKey::unpartitioned();
             if let Some(column) = self.try_column(&index)
                 && let Some(state) = column.partition_state(&key)
-                && let Some(old) = state.stored_by_row_id(old_row_id)
+                && let Some(old) =
+                    state.with_stored_by_row_id(old_row_id, StoredVectorEntry::owned_copy)
                 && old.deleted_tx.is_none()
             {
+                self.attach_legacy_raw_accounting(&state);
                 state.tombstone_row(old_row_id, tx);
                 let mut moved = old;
                 moved.row_id = new_row_id;
                 moved.created_tx = tx;
                 moved.deleted_tx = None;
                 moved.lsn = lsn;
-                state.push_entry(moved.clone());
-                column.note_move(&key, &key, old_row_id, new_row_id);
-                state.insert_into_materialized_hnsw(&index, &moved, accountant);
+                state.push_entry_with(moved, |stored| {
+                    column.note_move(&key, &key, old_row_id, new_row_id);
+                    state.insert_into_materialized_hnsw(&index, stored, accountant);
+                });
             }
         }
     }
@@ -9374,10 +10993,12 @@ impl VectorStore {
             if let Some(column) = self.try_column(&entry.index)
                 && let Some(state) = column.partition_state(&VectorPartitionKey::unpartitioned())
             {
+                self.attach_legacy_raw_accounting(&state);
                 let stored_entry = state.stored_entry_ref(entry);
-                state.push_entry(stored_entry.clone());
-                column.note_live_insert(&VectorPartitionKey::unpartitioned(), &stored_entry);
-                state.insert_into_materialized_hnsw(&entry.index, &stored_entry, accountant);
+                state.push_entry_with(stored_entry, |stored| {
+                    column.note_live_insert(&VectorPartitionKey::unpartitioned(), stored);
+                    state.insert_into_materialized_hnsw(&entry.index, stored, accountant);
+                });
             }
         }
     }
@@ -9395,18 +11016,21 @@ impl VectorStore {
             let key = VectorPartitionKey::unpartitioned();
             if let Some(column) = self.try_column(index)
                 && let Some(state) = column.partition_state(&key)
-                && let Some(old) = state.stored_by_row_id(*old_row_id)
+                && let Some(old) =
+                    state.with_stored_by_row_id(*old_row_id, StoredVectorEntry::owned_copy)
                 && old.deleted_tx.is_none()
             {
+                self.attach_legacy_raw_accounting(&state);
                 state.tombstone_row(*old_row_id, *tx);
                 let mut moved = old;
                 moved.row_id = *new_row_id;
                 moved.created_tx = *tx;
                 moved.deleted_tx = None;
                 moved.lsn = lsn;
-                state.push_entry(moved.clone());
-                column.note_move(&key, &key, *old_row_id, *new_row_id);
-                state.insert_into_materialized_hnsw(index, &moved, accountant);
+                state.push_entry_with(moved, |stored| {
+                    column.note_move(&key, &key, *old_row_id, *new_row_id);
+                    state.insert_into_materialized_hnsw(index, stored, accountant);
+                });
             }
         }
     }
@@ -9482,8 +11106,9 @@ impl VectorStore {
         moves: Vec<PartitionedVectorMove>,
         lsn: Lsn,
         accountant: Option<&dyn MemoryBudget>,
-        tail_insertions: &PreparedTailInsertions,
+        publication_owners: (&PreparedTailInsertions, &mut PreparedDirectoryCharges),
     ) {
+        let (tail_insertions, directory_reservations) = publication_owners;
         let deleted_rows = deletes
             .iter()
             .map(|delete| (delete.partition.index.clone(), delete.row_id))
@@ -9514,11 +11139,15 @@ impl VectorStore {
             let Some(state) = column.partition_state(&insert.partition_key) else {
                 continue;
             };
-            if let Some(owner) = self.memory_accountant.read().clone() {
-                state.attach_raw_accounting(owner);
+            if let Some(owner) = directory_reservations.owner(&insert.entry.index) {
+                state.attach_raw_accounting(
+                    owner,
+                    self.raw_payload_bytes.clone(),
+                    self.raw_payload_header_bytes.clone(),
+                );
             }
             let index = insert.entry.index.clone();
-            let stored = state.stored_entry(insert.entry);
+            let mut stored = state.stored_entry(insert.entry);
             let already_present = state.with_entries(|entries| {
                 entries.iter().any(|existing| {
                     existing.row_id == stored.row_id
@@ -9534,14 +11163,29 @@ impl VectorStore {
                     })
                 });
             if already_present || live_without_replacement {
+                let bytes = stored.estimated_bytes();
+                drop(stored);
                 if let Some(accountant) = accountant {
-                    accountant.release(stored.estimated_bytes());
+                    accountant.release(bytes);
                 }
                 continue;
             }
-            state.push_entry(stored.clone());
-            column.note_live_insert(&insert.partition_key, &stored);
-            tail_insertions.publish(&state, stored.row_id, stored.lsn);
+            if state.raw_residency_is_accounted() && !stored.vector.payload_is_charged() {
+                let reservation = directory_reservations
+                    .get_mut(&index)
+                    .expect("accounted insertion owns its prepared header reservation");
+                let header_bytes = crate::quantized::shared_payload_header_bytes();
+                assert!(
+                    reservation.bytes >= header_bytes,
+                    "prepared reservation covers the new shared allocation header"
+                );
+                reservation.bytes -= header_bytes;
+                stored.vector.promote_to_shared();
+            }
+            state.push_entry_with(stored, |stored| {
+                column.note_live_insert(&insert.partition_key, stored);
+                tail_insertions.publish(&state, stored.row_id, stored.lsn);
+            });
         }
         for row_move in moves {
             #[cfg(feature = "test-seams")]
@@ -9556,8 +11200,12 @@ impl VectorStore {
             let Some(target) = column.partition_state(&row_move.target_partition_key) else {
                 continue;
             };
-            if let Some(owner) = self.memory_accountant.read().clone() {
-                target.attach_raw_accounting(owner);
+            if let Some(owner) = directory_reservations.owner(&row_move.index) {
+                target.attach_raw_accounting(
+                    owner,
+                    self.raw_payload_bytes.clone(),
+                    self.raw_payload_header_bytes.clone(),
+                );
             }
             let Some(old) = source.stored_by_row_id(row_move.old_row_id) else {
                 continue;
@@ -9571,14 +11219,26 @@ impl VectorStore {
             moved.created_tx = row_move.tx;
             moved.deleted_tx = None;
             moved.lsn = lsn;
-            target.push_entry(moved.clone());
-            column.note_move(
-                &row_move.source_partition_key,
-                &row_move.target_partition_key,
-                row_move.old_row_id,
-                row_move.new_row_id,
-            );
-            tail_insertions.publish(&target, moved.row_id, lsn);
+            if moved.vector.payload_identity().is_none()
+                && let Some(reservation) = directory_reservations.get_mut(&row_move.index)
+            {
+                // Preparation reserved a new body and header before this copy.
+                // Its source remains owned and charged for historical readers.
+                let bytes = moved
+                    .estimated_bytes()
+                    .saturating_add(crate::quantized::shared_payload_header_bytes());
+                reservation.bytes -= bytes;
+                moved.vector.promote_to_shared();
+            }
+            target.push_entry_with(moved, |stored| {
+                column.note_move(
+                    &row_move.source_partition_key,
+                    &row_move.target_partition_key,
+                    row_move.old_row_id,
+                    row_move.new_row_id,
+                );
+                tail_insertions.publish(&target, stored.row_id, lsn);
+            });
         }
     }
 
@@ -9597,9 +11257,11 @@ impl VectorStore {
             if let Some(column) = self.try_column(&index)
                 && let Some(state) = column.partition_state(&VectorPartitionKey::unpartitioned())
             {
+                self.attach_legacy_raw_accounting(&state);
                 let stored_entry = state.stored_entry(entry);
-                state.push_entry(stored_entry.clone());
-                column.note_live_insert(&VectorPartitionKey::unpartitioned(), &stored_entry);
+                state.push_entry_with(stored_entry, |stored| {
+                    column.note_live_insert(&VectorPartitionKey::unpartitioned(), stored)
+                });
             }
         });
     }
@@ -9622,9 +11284,11 @@ impl VectorStore {
                 let Some(state) = column.partition_state(&partition.partition_key) else {
                     return;
                 };
+                self.attach_legacy_raw_accounting(&state);
                 let stored = state.stored_entry(entry.entry);
-                state.push_entry(stored.clone());
-                column.note_live_insert(&partition.partition_key, &stored);
+                state.push_entry_with(stored, |stored| {
+                    column.note_live_insert(&partition.partition_key, stored)
+                });
             });
         })
     }
@@ -9692,6 +11356,7 @@ impl VectorStore {
                     column.partitions.write().clear();
                 }
                 column.row_to_partition.write().clear();
+                column.row_partition_history.write().clear();
             }
             for partition in dormant {
                 let column = self
@@ -9707,6 +11372,8 @@ impl VectorStore {
                         })
                         .clone()
                 };
+                *state.raw_payload_counter.write() = self.raw_payload_bytes.clone();
+                *state.raw_payload_header_counter.write() = self.raw_payload_header_bytes.clone();
                 state.install_dormant_raw_directory(partition.directory, partition.loader)?;
                 if state.vector_count() == 0 && state.entry_count() != 0 {
                     column.mark_historical_only(&partition.partition.partition_key);
@@ -9745,7 +11412,7 @@ impl VectorStore {
                                 .to_string(),
                         )
                     })?;
-                state.attach_durable_raw_loader(&partition.directory, partition.loader)?;
+                state.attach_durable_raw_loader(partition.directory, partition.loader)?;
             }
             let indexes = Self::sorted_refs(self.registry.read().keys().cloned());
             let sampled = self.directory_bytes_before_reclamation(&indexes);
@@ -9784,6 +11451,7 @@ impl VectorStore {
                     column.partitions.write().clear();
                 }
                 column.row_to_partition.write().clear();
+                column.row_partition_history.write().clear();
             }
             for entry in entries {
                 self.insert_loaded_vector(entry);
@@ -9841,6 +11509,7 @@ impl VectorStore {
                     column.partitions.write().clear();
                 }
                 column.row_to_partition.write().clear();
+                column.row_partition_history.write().clear();
             }
             self.create_partition_states(&requested);
             for entry in entries {
@@ -9850,9 +11519,11 @@ impl VectorStore {
                 let state = column
                     .partition_state(&entry.partition_key)
                     .expect("loaded partition was admitted");
+                self.attach_legacy_raw_accounting(&state);
                 let stored = state.stored_entry(entry.entry);
-                state.push_entry(stored.clone());
-                column.note_live_insert(&entry.partition_key, &stored);
+                state.push_entry_with(stored, |stored| {
+                    column.note_live_insert(&entry.partition_key, stored)
+                });
             }
             for column in self.registry.read().values() {
                 if !column.layout().is_partitioned() {
@@ -10058,6 +11729,77 @@ impl VectorStore {
         })
     }
 
+    /// What copying the entries of every index `keep` selects would cost at
+    /// its widest point, computed without loading or cloning anything: the
+    /// owned clone `try_partitioned_entries_matching` returns, plus the
+    /// stored entries and their directory a store built from that clone
+    /// holds. A caller admits this BEFORE it hydrates or clones, so a copy
+    /// the declared limit cannot hold is refused before it exists.
+    #[doc(hidden)]
+    pub fn partitioned_copy_bytes_matching(&self, keep: impl Fn(&VectorIndexRef) -> bool) -> usize {
+        self.with_bulk_read(|| {
+            let mut bytes = 0usize;
+            for index in Self::sorted_refs(self.registry.read().keys().cloned()) {
+                if !keep(&index) {
+                    continue;
+                }
+                let Some(column) = self.try_column(&index) else {
+                    continue;
+                };
+                let layout = column.layout();
+                let clone_entry = std::mem::size_of::<PartitionedVectorEntry>()
+                    .saturating_add(layout.dimension.saturating_mul(std::mem::size_of::<f32>()))
+                    .saturating_add(index.table.len())
+                    .saturating_add(index.column.len());
+                let stored_entry = std::mem::size_of::<StoredVectorEntry>()
+                    .saturating_add(crate::quantized::shared_payload_header_bytes())
+                    .saturating_add(std::mem::size_of::<(usize, usize)>())
+                    .saturating_add(crate::quantized::stored_vector_resident_bytes(
+                        layout.dimension,
+                        layout.quantization,
+                    ))
+                    .saturating_add(2 * std::mem::size_of::<RawVectorDirectoryEntry>());
+                for (partition_key, state) in column.partition_snapshots() {
+                    let per_entry = clone_entry
+                        .saturating_add(partition_key.estimated_bytes())
+                        .saturating_add(stored_entry);
+                    bytes = bytes.saturating_add(state.entry_count().saturating_mul(per_entry));
+                }
+            }
+            bytes
+        })
+    }
+
+    /// `try_all_partitioned_entries` restricted to the indexes `keep`
+    /// selects: only those are hydrated and cloned.
+    #[doc(hidden)]
+    pub fn try_partitioned_entries_matching(
+        &self,
+        keep: impl Fn(&VectorIndexRef) -> bool,
+    ) -> Result<Vec<PartitionedVectorEntry>> {
+        self.with_bulk_read(|| {
+            let mut entries = Vec::new();
+            for index in Self::sorted_refs(self.registry.read().keys().cloned()) {
+                if !keep(&index) {
+                    continue;
+                }
+                let Some(column) = self.try_column(&index) else {
+                    continue;
+                };
+                for (partition_key, state) in column.partition_snapshots() {
+                    state.ensure_raw_vectors_loaded_with_copy_preference(true)?;
+                    entries.extend(
+                        state
+                            .all_entries(&index)
+                            .into_iter()
+                            .map(|entry| PartitionedVectorEntry::new(partition_key.clone(), entry)),
+                    );
+                }
+            }
+            Ok(entries)
+        })
+    }
+
     #[doc(hidden)]
     pub fn try_all_partitioned_entries(&self) -> Result<Vec<PartitionedVectorEntry>> {
         self.with_bulk_read(|| {
@@ -10077,6 +11819,55 @@ impl VectorStore {
                 }
             }
             Ok(entries)
+        })
+    }
+
+    /// Retention's selected-column removal; other indexes keep their states.
+    /// Whole-row removal can update reverse maps in place instead of copying
+    /// every surviving partition key into a rebuilt map.
+    #[doc(hidden)]
+    pub fn prune_row_ids_in_indexes(
+        &self,
+        row_ids: &HashSet<RowId>,
+        indexes: &[VectorIndexRef],
+        accountant: &dyn MemoryBudget,
+    ) -> usize {
+        self.with_bulk_maintenance(|| {
+            let sampled = self.directory_bytes_before_reclamation(indexes);
+            let mut released = 0usize;
+            for index in indexes {
+                let Some(column) = self.try_column(index) else {
+                    continue;
+                };
+                {
+                    let partitions = column.partitions.read();
+                    for state in partitions.values() {
+                        if state.directory_names_any_row(row_ids) {
+                            released =
+                                released.saturating_add(state.prune_directory_versions(|entry| {
+                                    !row_ids.contains(&entry.row_id)
+                                }));
+                        }
+                        state.clear_hnsw(accountant);
+                    }
+                }
+                if column.layout.read().is_partitioned() {
+                    column
+                        .partitions
+                        .write()
+                        .retain(|_, state| state.entry_count() != 0);
+                }
+                column
+                    .row_to_partition
+                    .write()
+                    .retain(|row, _| !row_ids.contains(row));
+                column
+                    .row_partition_history
+                    .write()
+                    .retain(|row, _| !row_ids.contains(row));
+            }
+            self.reconcile_directory_accounting_for_indexes(&sampled);
+            released
         })
     }
 
@@ -10235,6 +12026,80 @@ impl VectorStore {
         })
     }
 
+    /// Visit selected retained identities at the existing directory frontier.
+    /// The caller can admit each owned copy before making it; vector bodies
+    /// and unrelated directory entries are never materialized by this visit.
+    #[doc(hidden)]
+    pub fn visit_directory_versions_for_rows(
+        &self,
+        index: &VectorIndexRef,
+        row_ids: &HashSet<RowId>,
+        mut visit: impl FnMut(&RawVectorDirectoryEntry) -> Result<()>,
+    ) -> Result<()> {
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+        self.with_bulk_read(|| {
+            let Some(column) = self.try_column(index) else {
+                return Ok(());
+            };
+            let partitions = column.partitions.read();
+            for state in partitions.values() {
+                if !state.directory_names_any_row(row_ids) {
+                    continue;
+                }
+                let directory = state.raw_directory.read();
+                for page in directory.chunks(128) {
+                    for entry in page {
+                        if row_ids.contains(&entry.row_id) {
+                            visit(entry)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Name every retained version for the selected row identities without
+    /// loading vector bodies. Complete-image replacement uses this after the
+    /// replacement registry is published, when the prior live version is now
+    /// historical but still owns a raw body and durable membership.
+    pub fn directory_versions_for_rows(
+        &self,
+        index: &VectorIndexRef,
+        row_ids: &HashSet<RowId>,
+    ) -> Vec<VectorVersionIdentity> {
+        if row_ids.is_empty() {
+            return Vec::new();
+        }
+        self.with_bulk_read(|| {
+            let Some(column) = self.try_column(index) else {
+                return Vec::new();
+            };
+            let mut matched = Vec::new();
+            for (_, state) in column.partition_snapshots() {
+                if !state.directory_names_any_row(row_ids) {
+                    continue;
+                }
+                matched.extend(
+                    state
+                        .raw_directory
+                        .read()
+                        .iter()
+                        .filter(|entry| row_ids.contains(&entry.row_id))
+                        .map(|entry| VectorVersionIdentity {
+                            index: index.clone(),
+                            row_id: entry.row_id,
+                            created_tx: entry.created_tx,
+                            lsn: entry.lsn,
+                        }),
+                );
+            }
+            matched
+        })
+    }
+
     pub fn entries_for_index(&self, index: &VectorIndexRef) -> Result<Vec<VectorEntry>> {
         self.with_bulk_read(|| {
             let column = self
@@ -10267,6 +12132,40 @@ impl VectorStore {
         self.full_index_entries_touched.load(Ordering::SeqCst)
     }
 
+    /// Count the raw snapshot and selected live graph input without loading or
+    /// cloning vector bodies. A change graph selects only the post-base suffix.
+    #[doc(hidden)]
+    pub fn partition_generation_entry_counts(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        snapshot: SnapshotId,
+        after_lsn: Option<Lsn>,
+    ) -> Result<(usize, usize)> {
+        self.with_bulk_read(|| {
+            let state = self.partition_state(index, partition_key)?;
+            let directory = state.raw_directory.read();
+            let mut raw = 0usize;
+            let mut selected = 0usize;
+            for entry in directory
+                .iter()
+                .filter(|entry| entry.created_tx.0 <= snapshot.0)
+            {
+                raw = raw
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Other("vector snapshot count overflow".into()))?;
+                if entry.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+                    && after_lsn.is_none_or(|lsn| entry.lsn > lsn)
+                {
+                    selected = selected
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Other("vector graph count overflow".into()))?;
+                }
+            }
+            Ok((raw, selected))
+        })
+    }
+
     /// Capture the finite entry prefix visible at a committed frontier. Writers
     /// only append or tombstone entries; each payload copy takes one short read
     /// lock, and a later tombstone cannot erase visibility at this snapshot.
@@ -10280,8 +12179,20 @@ impl VectorStore {
         self.with_bulk_read(|| {
             let state = self.partition_state(index, partition_key)?;
             state.ensure_raw_vectors_loaded()?;
-            let count = state.vectors.read().entries.len();
-            let mut entries = Vec::new();
+            let (count, snapshot_count) = {
+                let vectors = state.vectors.read();
+                (
+                    vectors.entries.len(),
+                    vectors
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.created_tx.0 <= snapshot.0)
+                        .count(),
+                )
+            };
+            // The frontier's admitted raw slots never grow geometrically or
+            // reserve space for later commits while bodies are copied.
+            let mut entries = Vec::with_capacity(snapshot_count);
             for position in 0..count {
                 let entry = {
                     let vectors = state.vectors.read();
@@ -10290,6 +12201,86 @@ impl VectorStore {
                         .get(position)
                         .filter(|entry| entry.created_tx.0 <= snapshot.0)
                         .map(|entry| entry.to_vector_entry(index.clone()))
+                };
+                if let Some(mut entry) = entry {
+                    if entry.deleted_tx.is_some_and(|tx| tx.0 > snapshot.0) {
+                        entry.deleted_tx = None;
+                    }
+                    entries.push(entry);
+                }
+            }
+            Ok(entries)
+        })
+    }
+
+    /// Copy only the live entries consumed by a generation at its pinned
+    /// frontier. Retained history stays in the store; later appends and
+    /// tombstones cannot enlarge this snapshot's admitted selection.
+    #[doc(hidden)]
+    pub fn entries_for_partition_generation_at_snapshot(
+        &self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        snapshot: SnapshotId,
+        after_lsn: Option<Lsn>,
+    ) -> Result<Vec<VectorEntry>> {
+        self.with_bulk_read(|| {
+            let state = self.partition_state(index, partition_key)?;
+            state.ensure_raw_vectors_loaded()?;
+            let selected = |created_tx: TxId, deleted_tx: Option<TxId>, lsn: Lsn| {
+                created_tx.0 <= snapshot.0
+                    && deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+                    && after_lsn.is_none_or(|boundary| lsn > boundary)
+            };
+            let directory_count = state
+                .raw_directory
+                .read()
+                .iter()
+                .filter(|entry| selected(entry.created_tx, entry.deleted_tx, entry.lsn))
+                .count();
+            let (count, snapshot_count) = {
+                let vectors = state.vectors.read();
+                (
+                    vectors.entries.len(),
+                    vectors
+                        .entries
+                        .iter()
+                        .filter(|entry| selected(entry.created_tx, entry.deleted_tx, entry.lsn))
+                        .count(),
+                )
+            };
+            if snapshot_count != directory_count {
+                // The engine priced this metadata frontier. Refuse an
+                // inconsistent resident image before allocating any body.
+                return Err(Error::StoreCorrupted {
+                    path: format!("vector index {}.{}", index.table, index.column),
+                    reason: "generation selection differs from its raw directory".into(),
+                });
+            }
+            let mut entries = Vec::with_capacity(snapshot_count);
+            for position in 0..count {
+                let entry = {
+                    let vectors = state.vectors.read();
+                    match vectors
+                        .entries
+                        .get(position)
+                        .filter(|entry| selected(entry.created_tx, entry.deleted_tx, entry.lsn))
+                    {
+                        Some(entry) => {
+                            if entries.len() == snapshot_count {
+                                // Valid writes only append after this frontier
+                                // or add future tombstones. Never grow a body
+                                // owner beyond the counted selection.
+                                return Err(Error::StoreCorrupted {
+                                    path: format!("vector index {}.{}", index.table, index.column),
+                                    reason: "generation selection grew at its pinned frontier"
+                                        .into(),
+                                });
+                            }
+                            Some(entry.to_vector_entry(index.clone()))
+                        }
+                        None => None,
+                    }
                 };
                 if let Some(mut entry) = entry {
                     if entry.deleted_tx.is_some_and(|tx| tx.0 > snapshot.0) {
@@ -10483,9 +12474,9 @@ impl VectorStore {
     }
 
     pub fn clear_hnsw_for(&self, index: &VectorIndexRef, accountant: &dyn MemoryBudget) {
-        self.with_index_maintenance(index, || {
-            if let Some(state) = self.try_state(index) {
-                state.clear_hnsw(accountant);
+        self.with_bulk_maintenance(|| {
+            if let Some(column) = self.try_column(index) {
+                column.clear_hnsw(accountant);
             }
         });
     }
@@ -11105,7 +13096,7 @@ impl VectorStore {
                          retain: &mut _,
                          release: &mut _| {
                 state.bounded_score_visible_candidate(
-                    index, row_id, snapshot, query, checkpoint, distance, retain, release,
+                    index, row_id, snapshot, query, None, checkpoint, distance, retain, release,
                 )
             };
             let current = column.current_partition(row_id);
@@ -11446,6 +13437,8 @@ impl VectorStore {
         let registry = self.registry.read();
         let mut receipt = VectorMemoryOwnershipSnapshot {
             temporary_workspace: self.workspace_bytes.load(Ordering::SeqCst),
+            raw_vector_bodies: self.raw_payload_bytes.load(Ordering::SeqCst),
+            raw_reverse_directory: self.raw_payload_header_bytes.load(Ordering::SeqCst),
             ..VectorMemoryOwnershipSnapshot::default()
         };
         for (index, column) in registry.iter() {
@@ -11461,11 +13454,6 @@ impl VectorStore {
                 .saturating_add(directory.typed_partition_keys);
             let partitions = column.partitions.read();
             for state in partitions.values() {
-                if state.raw_resident.load(Ordering::SeqCst) {
-                    receipt.raw_vector_bodies = receipt
-                        .raw_vector_bodies
-                        .saturating_add(state.raw_resident_bytes.load(Ordering::SeqCst));
-                }
                 receipt.mutable_tail = receipt
                     .mutable_tail
                     .saturating_add(state.hnsw_bytes.load(Ordering::SeqCst));
@@ -11473,12 +13461,12 @@ impl VectorStore {
                 let current_base = sealed
                     .base
                     .as_ref()
-                    .map(|generation| generation.bytes)
+                    .map(SealedHnswGeneration::bytes)
                     .unwrap_or(0);
                 let current_change = sealed
                     .change
                     .as_ref()
-                    .map(|generation| generation.bytes)
+                    .map(SealedHnswGeneration::bytes)
                     .unwrap_or(0);
                 if state.vector_count() == 0 {
                     receipt.retired_pinned_graph_bytes = receipt
@@ -11497,14 +13485,14 @@ impl VectorStore {
                                 chain
                                     .base
                                     .as_ref()
-                                    .map(|generation| generation.bytes)
+                                    .map(SealedHnswGeneration::bytes)
                                     .unwrap_or(0),
                             )
                             .saturating_add(
                                 chain
                                     .change
                                     .as_ref()
-                                    .map(|generation| generation.bytes)
+                                    .map(SealedHnswGeneration::bytes)
                                     .unwrap_or(0),
                             )
                     }));
@@ -11521,6 +13509,20 @@ impl VectorStore {
     /// bytes without guessing from the then-current cache contents.
     #[doc(hidden)]
     pub fn account_loaded_state(&self, accountant: Arc<dyn MemoryBudget>) -> Result<usize> {
+        self.account_loaded_state_within(accountant, 0)
+    }
+
+    /// `account_loaded_state` for a store whose contents were admitted ahead
+    /// of their allocation: `reserved` bytes already charged to `accountant`
+    /// become the objects' own charges. Only what the objects hold beyond
+    /// `reserved` is newly admitted, and a surplus is released. On an error
+    /// nothing of `reserved` is touched; the caller still owns it.
+    #[doc(hidden)]
+    pub fn account_loaded_state_within(
+        &self,
+        accountant: Arc<dyn MemoryBudget>,
+        reserved: usize,
+    ) -> Result<usize> {
         self.with_bulk_maintenance(|| {
             if self.memory_accountant.read().is_some() {
                 return Err(Error::Other(
@@ -11531,6 +13533,7 @@ impl VectorStore {
             let mut directory = Vec::with_capacity(registry.len());
             let mut raw = Vec::<(Arc<IndexState>, usize)>::new();
             let mut total = 0usize;
+            let mut raw_payloads = HashSet::new();
             for (index, column) in registry.iter() {
                 if column.directory_accounting.lock().is_some() {
                     return Err(Error::Other(format!(
@@ -11542,40 +13545,70 @@ impl VectorStore {
                 total = total.saturating_add(bytes);
                 directory.push((column.clone(), bytes));
                 for (_, state) in column.partition_snapshots() {
-                    if state.raw_residency_is_accounted() {
+                    if !state.raw_resident.load(Ordering::SeqCst) {
                         continue;
                     }
+                    // Price every owned body independently, and deduplicate
+                    // only real shared Arc identities. No representation,
+                    // reservation or counter changes before admission succeeds.
                     let bytes = state.raw_payload_bytes();
-                    if bytes == 0 {
-                        continue;
+                    for entry in &state.vectors.read().entries {
+                        match entry.vector.payload_identity() {
+                            None => {
+                                if !entry.vector.payload_is_charged() {
+                                    total = total.saturating_add(entry.estimated_bytes());
+                                }
+                                total = total.saturating_add(crate::quantized::shared_payload_header_bytes());
+                            }
+                            Some(identity) if !entry.vector.payload_is_charged() && raw_payloads.insert(identity) => {
+                                total = total.saturating_add(entry.estimated_bytes())
+                                    .saturating_add(entry.vector.payload_header_bytes());
+                            }
+                            Some(_) => {}
+                        }
                     }
-                    total = total.saturating_add(bytes);
+                    // Include empty and already-accounted resident states so
+                    // future legacy inserts inherit their body-only owner.
                     raw.push((state, bytes));
                 }
             }
             accountant.try_allocate_for(
-                total,
+                total.saturating_sub(reserved),
                 "open",
                 "load_vector_directories",
                 "Open the database with a larger MEMORY_LIMIT or reduce retained vector identities.",
             )?;
+            if reserved > total {
+                accountant.release(reserved - total);
+            }
             for (column, bytes) in directory {
                 column.install_directory_accounting(bytes, accountant.clone());
             }
             for (state, bytes) in raw {
-                debug_assert!(state.raw_accountant.read().is_none());
+                {
+                    let mut vectors = state.vectors.write();
+                    for entry in &mut vectors.entries {
+                        entry.vector.promote_to_shared_with_header_owner(Some(accountant.clone()));
+                    }
+                    vectors.rebuild_row_positions();
+                }
                 state.raw_resident_bytes.store(bytes, Ordering::SeqCst);
-                *state.raw_accountant.write() = Some(accountant.clone());
+                state.attach_raw_accounting(accountant.clone(), self.raw_payload_bytes.clone(), self.raw_payload_header_bytes.clone());
+            }
+            for column in registry.values() {
+                for (_, state) in column.partition_snapshots() {
+                    *state.raw_payload_counter.write() = self.raw_payload_bytes.clone();
+                    *state.raw_payload_header_counter.write() = self.raw_payload_header_bytes.clone();
+                }
             }
             *self.memory_accountant.write() = Some(accountant);
             Ok(total)
         })
     }
 
-    /// Whether the state that currently owns this row also owns the raw-body
-    /// reservation. A commit must not return that reservation merely because
-    /// it tombstoned the body; physical pruning or cache/index removal is the
-    /// one release.
+    /// Whether the current row's partition has adopted allocation-owned raw
+    /// reservations. A commit must not return a reservation merely because it
+    /// tombstoned one membership; the final shared payload holder releases it.
     pub fn raw_entry_charge_owned_by_state(&self, index: &VectorIndexRef, row_id: RowId) -> bool {
         self.with_bulk_read(|| {
             let Some(column) = self.try_column(index) else {
@@ -11652,7 +13685,9 @@ mod tests {
             (
                 VectorQuantization::F32,
                 [
-                    (16, 200, 5_000),
+                    (16, 200, 10),
+                    (16, 200, 10),
+                    (16, 200, 20),
                     (24, 400, 400),
                     (24, 400, 400),
                     (16, 200, 200),
@@ -11660,15 +13695,32 @@ mod tests {
             ),
             (
                 VectorQuantization::SQ8,
-                [(8, 32, 96), (12, 64, 128), (12, 64, 128), (12, 64, 128)],
+                [
+                    (8, 32, 96),
+                    (8, 32, 96),
+                    (8, 32, 96),
+                    (12, 64, 128),
+                    (12, 64, 128),
+                    (12, 64, 128),
+                ],
             ),
             (
                 VectorQuantization::SQ4,
-                [(8, 32, 96), (12, 64, 128), (12, 64, 128), (12, 64, 128)],
+                [
+                    (8, 32, 96),
+                    (8, 32, 96),
+                    (8, 32, 96),
+                    (12, 64, 128),
+                    (12, 64, 128),
+                    (12, 64, 128),
+                ],
             ),
         ] {
             let silent = VectorIndexLayout::unpartitioned(3, quantization);
-            for (count, expected) in [5_000, 5_001, 50_000, 50_001].into_iter().zip(expected) {
+            for (count, expected) in [625, 2_500, 5_000, 5_001, 50_000, 50_001]
+                .into_iter()
+                .zip(expected)
+            {
                 let resolved = silent.resolve_policy(count, 1);
                 assert_eq!(
                     (
@@ -11983,7 +14035,7 @@ mod tests {
             .unwrap();
 
         let ordinary = state
-            .score_visible_candidate(&index, RowId(7), SnapshotId(3), &[1.0, 0.0])
+            .score_visible_candidate(&index, RowId(7), SnapshotId(3), &[1.0, 0.0], None)
             .unwrap();
         assert_eq!(ordinary, Some(1.0));
         assert_eq!(accountant.live_bytes(), 0);
@@ -11998,6 +14050,7 @@ mod tests {
                 RowId(7),
                 SnapshotId(3),
                 &[1.0, 0.0],
+                None,
                 &mut || {
                     checkpoints += 1;
                     Ok::<(), Error>(())
@@ -12028,6 +14081,7 @@ mod tests {
             RowId(7),
             SnapshotId(3),
             &[1.0, 0.0],
+            None,
             &mut || {
                 cancellation_checkpoints += 1;
                 if cancellation_checkpoints == 4 {
@@ -12078,7 +14132,7 @@ mod tests {
                 .unwrap();
 
             let actual = state
-                .score_visible_candidate(&index, RowId(9), SnapshotId(5), &query)
+                .score_visible_candidate(&index, RowId(9), SnapshotId(5), &query, None)
                 .unwrap()
                 .expect("the exact dormant identity is visible");
             assert_eq!(actual, expected);
@@ -13402,3 +15456,19 @@ mod tests {
 
 #[cfg(test)]
 mod transaction_visibility_tests;
+
+#[cfg(test)]
+#[path = "store/shared_payload_tests.rs"]
+mod shared_payload_tests;
+
+#[cfg(test)]
+#[path = "store/received_publication_accounting_tests.rs"]
+mod received_publication_accounting_tests;
+
+#[cfg(test)]
+#[path = "store/detached_copy_payload_tests.rs"]
+mod detached_copy_payload_tests;
+
+#[cfg(test)]
+#[path = "store/generation_selection_tests.rs"]
+mod generation_selection_tests;

@@ -20,7 +20,7 @@ pub fn validate_dml(
             let metas = db.relational_store().table_meta.read();
             let table_meta = metas
                 .get(&p.table)
-                .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+                .ok_or_else(|| db.missing_table_error(&p.table))?;
 
             // (2) Unknown-column check on every SET target.
             for (col_name, _) in &p.assignments {
@@ -63,7 +63,7 @@ pub fn validate_dml(
             let metas = db.relational_store().table_meta.read();
             let table_meta = metas
                 .get(&p.table)
-                .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+                .ok_or_else(|| db.missing_table_error(&p.table))?;
 
             // When no column list is provided, infer from table metadata.
             let columns: Vec<String> = if p.columns.is_empty() {

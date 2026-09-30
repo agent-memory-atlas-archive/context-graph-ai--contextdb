@@ -54,6 +54,32 @@ impl GraphStore {
         *reverse = publication.reverse_adj;
     }
 
+    pub fn publish_prepared_received_edge_types(
+        &self,
+        publication: PreparedGraphPublication,
+        affected_edge_types: &std::collections::HashSet<String>,
+    ) {
+        if affected_edge_types.is_empty() {
+            return;
+        }
+        let mut forward = self.forward_adj.write();
+        let mut reverse = self.reverse_adj.write();
+        for entries in forward.values_mut() {
+            entries.retain(|edge| !affected_edge_types.contains(&edge.edge_type));
+        }
+        forward.retain(|_, entries| !entries.is_empty());
+        for entries in reverse.values_mut() {
+            entries.retain(|edge| !affected_edge_types.contains(&edge.edge_type));
+        }
+        reverse.retain(|_, entries| !entries.is_empty());
+        for (node, mut entries) in publication.forward_adj {
+            forward.entry(node).or_default().append(&mut entries);
+        }
+        for (node, mut entries) in publication.reverse_adj {
+            reverse.entry(node).or_default().append(&mut entries);
+        }
+    }
+
     pub fn apply_inserts(&self, inserts: Vec<AdjEntry>) {
         self.apply_inserts_ref(&inserts);
     }

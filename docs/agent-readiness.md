@@ -18,7 +18,7 @@ this repository and its docs:
 | Query (state machine) | Drive a state-machine table through `PROPAGATE` transitions. |
 | Vector | Hybrid graph + vector queries against embedding columns. |
 | Sync | Stand up a hub, enroll two edges, and reach a correct KEEP-FIRST collision outcome. |
-| Diagnose | Recovery: diagnose/reset a store, and get a no-op migrate refused as expected. |
+| Diagnose | Recovery: diagnose a store and recreate it with reset. |
 | Retention | Operator lifecycle: retention windows and durable delete that survive sync and restart. |
 
 Every attempt is graded by executable post-conditions — process exit codes and the real

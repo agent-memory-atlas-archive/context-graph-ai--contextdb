@@ -513,6 +513,31 @@ fn a_declared_context_and_principal_hide_the_same_rows_a_writable_handle_hides()
 }
 
 #[test]
+fn indexed_counts_still_apply_declared_context_visibility() {
+    let fixture = declared_fixture();
+    let session = direct_session(
+        &fixture,
+        "context-count",
+        declaring(
+            Some(BTreeSet::from([fixture.allowed_context.clone()])),
+            None,
+            None,
+        ),
+    );
+    let answer = session
+        .execute(
+            &format!("SELECT COUNT(*) FROM {DECLARED_TABLE} WHERE context_id = $context"),
+            &HashMap::from([("context".to_owned(), Value::Uuid(fixture.foreign_context.0))]),
+        )
+        .expect("the restricted indexed count answers through row visibility");
+    assert_eq!(answer.rows, vec![vec![Value::Int64(0)]]);
+    assert!(
+        answer.trace.rows_examined > 1,
+        "an access-filtered count must retain the row-authenticating index path"
+    );
+}
+
+#[test]
 fn the_live_owner_route_answers_a_declaration_exactly_as_the_direct_route_does() {
     let fixture = declared_fixture();
     let scope_only = declaring(

@@ -607,6 +607,12 @@ fn new_membership_root_cannot_expose_half_applied_row_vector_commit() {
             .rows,
         vec![vec![Value::Int64(1), Value::Int64(0)]]
     );
+    let mut cursor = bounded::open_cursor(db.clone(), &request(vector_sql, bound.clone())).unwrap();
+    assert_eq!(
+        cursor.first_page.rows,
+        vec![vec![Value::Int64(1), Value::Int64(0)]]
+    );
+    cursor.cursor.close().unwrap();
     assert!(
         db.execute(
             "SELECT id FROM atomic_members WHERE revision >= 1",

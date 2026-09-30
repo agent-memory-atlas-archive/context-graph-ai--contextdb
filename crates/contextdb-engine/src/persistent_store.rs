@@ -5,11 +5,23 @@ use crate::database::{LocalSchemaStageRegistry, ReceivedSchemaStageRegistry};
 use crate::persistence::{
     FlushDataOptions, FlushDataSnapshots, RedbPersistence, SchemaDdlPersistence,
 };
+#[cfg(any(test, feature = "test-seams"))]
+use contextdb_core::Error;
 use contextdb_core::{Result, RowId, SnapshotId};
 use contextdb_tx::{WriteSet, WriteSetApplicator};
 use contextdb_vector::VectorPartitionRef;
 use std::collections::HashSet;
 use std::sync::Arc;
+
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static FAIL_NEXT_LOCAL_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn fail_next_local_apply_for_test() {
+    FAIL_NEXT_LOCAL_APPLY.with(|armed| armed.set(true));
+}
 
 pub struct PersistentCompositeStore {
     inner: CompositeStore,
@@ -110,8 +122,15 @@ impl PersistentCompositeStore {
                     .map(|trigger| trigger.take_staged_persistence_audits(lsn))
             })
             .unwrap_or_default();
+        #[cfg(feature = "test-seams")]
+        let mut stage_started = std::time::Instant::now();
         let table_meta = self.inner.relational.table_meta.read().clone();
-        let deleted_rows = self.inner.deleted_rows_snapshot_for_write_set(ws);
+        #[cfg(feature = "test-seams")]
+        crate::persistence::observe_append_stage(
+            crate::persistence::AppendStage::TableMetaClone,
+            &mut stage_started,
+        );
+        let deleted_rows = self.deleted_rows_snapshot_for_write_set(ws)?;
         let log_entries = self.inner.build_change_log_entries_with_snapshots(
             ws,
             Some(&table_meta),
@@ -137,6 +156,11 @@ impl PersistentCompositeStore {
         };
         let erasure_stages = self.inner.local_erasure_stages.lock();
         let erasure = ws.commit_lsn.and_then(|lsn| erasure_stages.get(&lsn));
+        #[cfg(feature = "test-seams")]
+        crate::persistence::observe_append_stage(
+            crate::persistence::AppendStage::WriteSetPreparation,
+            &mut stage_started,
+        );
         self.persistence.flush_data_with_logs_and_sink_events(
             ws,
             &log_entries,
@@ -161,10 +185,65 @@ impl PersistentCompositeStore {
         self.inner
             .apply_exact_with_log_entries(ws, log_entries, partition_mutations)
     }
+
+    /// Capture complete pre-delete bodies from the durable source.  The
+    /// in-memory relational image of a file-backed writer is intentionally a
+    /// lightweight directory; using it here would overwrite retained history
+    /// with that projection when persistence stamps `deleted_tx`.
+    fn deleted_rows_snapshot_for_write_set(
+        &self,
+        ws: &WriteSet,
+    ) -> Result<
+        Option<
+            std::collections::HashMap<
+                String,
+                std::collections::HashMap<RowId, contextdb_core::VersionedRow>,
+            >,
+        >,
+    > {
+        if ws.relational_deletes.is_empty() {
+            return Ok(None);
+        }
+        let metadata = self.inner.relational.table_meta.read();
+        let mut rows = std::collections::HashMap::<
+            String,
+            std::collections::HashMap<RowId, contextdb_core::VersionedRow>,
+        >::new();
+        for (table, row_id, deleted_tx) in &ws.relational_deletes {
+            if rows
+                .get(table)
+                .is_some_and(|by_id| by_id.contains_key(row_id))
+            {
+                continue;
+            }
+            let Some(meta) = metadata.get(table) else {
+                continue;
+            };
+            let snapshot = SnapshotId::from_raw_wire(deleted_tx.0.saturating_sub(1));
+            if let Some(row) = self
+                .persistence
+                .load_relational_row_by_id_at(table, meta, *row_id, snapshot)?
+            {
+                rows.entry(table.clone()).or_default().insert(*row_id, row);
+            }
+        }
+        drop(metadata);
+        if rows.is_empty() {
+            Ok(self.inner.deleted_rows_snapshot_for_write_set(ws))
+        } else {
+            Ok(Some(rows))
+        }
+    }
 }
 
 impl WriteSetApplicator for PersistentCompositeStore {
     fn apply(&self, ws: &WriteSet) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        if FAIL_NEXT_LOCAL_APPLY.with(|armed| armed.replace(false)) {
+            return Err(Error::Other(
+                "injected local durable commit failure".to_string(),
+            ));
+        }
         let registered_snapshots = self
             .inner
             .take_vector_partition_snapshot_stage(ws.commit_lsn);

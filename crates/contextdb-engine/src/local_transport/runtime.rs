@@ -5,11 +5,8 @@ use std::path::{Path, PathBuf};
 /// Owner-only permissions for the channel directory and channel.
 pub const OWNER_ONLY_MODE: u32 = 0o700;
 
-/// The single child of a runtime root that every contextdb runtime file lives
-/// in: the channel sockets, and the reader breadcrumb directories beside them.
-/// Which ROOT that child sits in differs by purpose -- a channel follows the
-/// runtime directory its deployment stated, a reader breadcrumb is always in
-/// the default per-user runtime location -- but the child's name never does.
+/// The owner-only child of a platform runtime root. A supplied channel
+/// directory is used as given.
 pub const RUNTIME_DIRECTORY_NAME: &str = "contextdb";
 
 /// Where one process keeps its local runtime files: the runtime root it was
@@ -59,9 +56,8 @@ impl RuntimeDirectory {
         &self.root
     }
 
-    /// The runtime directory: where this process's channel sockets live, and
-    /// where the reader breadcrumb directories of the runtime location this
-    /// value names sit beside them.
+    /// The runtime directory where this process's channel sockets live. If
+    /// selected for reader coordination, its registries live here too.
     pub fn path(&self) -> &Path {
         &self.directory
     }
@@ -500,12 +496,8 @@ fn resolve_runtime_layout_with_environment(
 /// carry the resolved value; re-deriving a directory from the root inside it
 /// is how a writer and the readers dialling it end up in different places.
 ///
-/// Reader BREADCRUMBS are a different question and this does not answer it.
-/// A supplied root is one deployment's statement about its own channel, and
-/// the writer that a direct reader blocks is started by somebody else -- very
-/// often a supervisor with nothing but the store path. So a breadcrumb always
-/// goes in the DEFAULT per-user runtime location, whatever root either side
-/// was given: one location, no flag for the two of them to disagree on.
+/// Reader coordination resolves separately and inventories every known
+/// candidate directory for the same physical database.
 pub fn runtime_directory_for_store(
     supplied: Option<&Path>,
     current_user: LocalUserIdentity,

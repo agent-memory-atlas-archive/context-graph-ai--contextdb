@@ -119,11 +119,13 @@ budget permits it; an `INDEXED` query refuses clearly instead of hiding the prob
 
 `SEARCH_MODE AUTO` is the declaration default. `AUTO` decides by count: below the column's
 effective threshold over the aggregate allowed set it answers exact when the active limits can
-pay and a typed refusal when they cannot; at or above that threshold it uses the maintained route.
+pay and a typed refusal when they cannot; at or above that threshold it admits indexed planning,
+then exact-compares each Context whose live count is at or below its resolved `EF_SEARCH` and uses
+the maintained graph for each larger Context before one global merge.
 `EXACT` examines every
 allowed stored vector or refuses when its active budget cannot pay for it — use it for an audit.
 `INDEXED` requires the maintained bounded route even for a small non-empty layout — use it for a
-live loop that must not trade index loss for a costly scan. <!-- enforced by: vector_search_mode_bounded_contract::auto_uses_the_aggregate_selected_scope_not_each_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible, vector_lazy_raw_residency_contract::auto_refuses_typed_when_the_exact_score_array_cannot_fit --> Override once per vector query:
+live loop that must not trade index loss for a costly scan. <!-- enforced by: vector_search_mode_bounded_contract::auto_admits_indexed_planning_by_aggregate_then_exact_compares_each_small_partition, vector_search_mode_bounded_contract::exact_override_is_exhaustive_across_partitions_and_matches_rust_and_bounded_reads, vector_search_mode_bounded_contract::indexed_small_nonempty_scope_refuses_until_maintenance_then_keeps_a_staged_delta_visible, vector_lazy_raw_residency_contract::auto_refuses_typed_when_the_exact_score_array_cannot_fit --> Override once per vector query:
 
 ```sql
 SELECT id FROM evidence
@@ -161,6 +163,12 @@ from the serving graph and its build revision. `EF_SEARCH` takes effect immediat
 breadth follows current query policy even if that build revision is older. Actual queries raise an
 explicit breadth only to `k`, or an omitted breadth to at least the profile and `10 * k`.
 <!-- enforced by: vector_policy_revision_publication_contract::online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_stale_publication, vector_policy_resolver_contract::declared_ef_search_reaches_graph_work_without_the_silent_compatibility_floor, vector_serving_merge_contract::query_policy_discloses_serving_snapshot_and_full_partition_search_breadth -->
+
+When `AUTO` chooses exhaustive comparison and a dormant raw partition cannot fit in memory,
+it can read one stored vector at a time and return the same exact answer. This does not switch
+it to indexed search. For the same unrestricted search, a writable handle explicitly using
+`EXACT` still requires its complete partition load to fit; use a sufficient memory declaration.
+<!-- enforced by: vector_lazy_raw_residency_contract::auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition -->
 
 ### Broad filters and recovery
 
@@ -386,7 +394,7 @@ depth is 10.
 - **Search routes to the column named in `ORDER BY`**, not to "the table's vector" — a two-vector
   table has two independent indexes.
 - **Vector lifecycle recovery uses inspection and maintenance**, as described in this recipe.
-  `contextdb migrate <path>` is only for a store diagnosed as legacy-format.
+  A store written by an earlier build is not read. Move it aside and create the store again.
 - **`PROPAGATE ON STATE <s> EXCLUDE VECTOR`** drops a row out of vector results when it reaches a
   state — the declarative way to stop invalidated rows from being retrieved.
 

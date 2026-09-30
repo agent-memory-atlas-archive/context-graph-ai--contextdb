@@ -23,7 +23,7 @@
 //!
 //! A store being created has no record at all yet — its companion is
 //! deliberately created late, only once the store proves readable and current,
-//! so that a refused or legacy root is left byte-for-byte alone. That ordering
+//! so that a refused or unsupported root is left byte-for-byte alone. That ordering
 //! is right and this file does not ask for it to change. What it asks is that
 //! the promise hold anyway: while a writer owns the store, no caller is told
 //! the store is unowned. Which hold anchors that stretch is the implementer's

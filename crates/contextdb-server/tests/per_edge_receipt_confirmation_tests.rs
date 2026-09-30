@@ -1,3 +1,4 @@
+#![allow(clippy::needless_update)] // Existing compatibility and test seam shape.
 //! Per-edge receipt confirmation.
 //!
 //! The defect these tests pin: the hub's received-up-to record is kept per
@@ -324,7 +325,11 @@ async fn status_for(
 ) -> (Vec<u8>, SyncStatusResponse) {
     let request_bytes = encode(
         MessageType::StatusRequest,
-        &SyncStatusRequest { incarnation },
+        &SyncStatusRequest {
+            incarnation,
+            refused_schema_unit_digests: Vec::new(),
+            ..Default::default()
+        },
     )
     .expect("encode status request");
     let transport = broker.client_as(node_id);
@@ -1494,9 +1499,9 @@ fn expect_fixb(ids: std::ops::Range<i64>) -> std::collections::BTreeSet<String> 
 struct ForwardPushThenDropAck {
     inner: Arc<dyn ClientTransport>,
     push_subject: String,
-    /// Test-only fault: the recovery pull after status confirmation fails once,
-    /// leaving the durable confirmation marker for the next ordinary push.
-    drop_first_pull: Option<Arc<AtomicBool>>,
+    /// Test-only fault: every recovery pull attempt fails, leaving the durable
+    /// confirmation marker for the next ordinary push.
+    drop_recovery_pull_attempts: Option<Arc<AtomicU64>>,
 }
 
 impl ClientTransport for ForwardPushThenDropAck {
@@ -1528,13 +1533,19 @@ impl ClientTransport for ForwardPushThenDropAck {
     ) -> TransportFuture<'a, Vec<u8>> {
         if subject == pull_subject(TENANT)
             && self
-                .drop_first_pull
+                .drop_recovery_pull_attempts
                 .as_ref()
-                .is_some_and(|drop| drop.swap(false, Ordering::SeqCst))
+                .is_some_and(|remaining| {
+                    remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                            count.checked_sub(1)
+                        })
+                        .is_ok()
+                })
         {
             return Box::pin(async {
                 Err(TransportError::Unreachable(
-                    "first status-confirmed recovery pull lost on the wire".to_string(),
+                    "status-confirmed recovery pull lost on the wire".to_string(),
                 ))
             });
         }
@@ -1549,13 +1560,19 @@ impl ClientTransport for ForwardPushThenDropAck {
     ) -> TransportFuture<'a, Vec<u8>> {
         if subject == pull_subject(TENANT)
             && self
-                .drop_first_pull
+                .drop_recovery_pull_attempts
                 .as_ref()
-                .is_some_and(|drop| drop.swap(false, Ordering::SeqCst))
+                .is_some_and(|remaining| {
+                    remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                            count.checked_sub(1)
+                        })
+                        .is_ok()
+                })
         {
             return Box::pin(async {
                 Err(TransportError::Unreachable(
-                    "first status-confirmed recovery pull lost on the wire".to_string(),
+                    "status-confirmed recovery pull lost on the wire".to_string(),
                 ))
             });
         }
@@ -1597,7 +1614,7 @@ fn landed_ack_lost_client(
         Arc::new(ForwardPushThenDropAck {
             inner: broker.client_as(node_id),
             push_subject: push_subject(TENANT),
-            drop_first_pull: None,
+            drop_recovery_pull_attempts: None,
         }),
         TenantId::from(TENANT),
         identity,
@@ -1615,7 +1632,7 @@ fn landed_ack_lost_with_recovery_pull_dropped_client(
         Arc::new(ForwardPushThenDropAck {
             inner: broker.client_as(node_id),
             push_subject: push_subject(TENANT),
-            drop_first_pull: Some(Arc::new(AtomicBool::new(true))),
+            drop_recovery_pull_attempts: Some(Arc::new(AtomicU64::new(5))),
         }),
         TenantId::from(TENANT),
         identity,

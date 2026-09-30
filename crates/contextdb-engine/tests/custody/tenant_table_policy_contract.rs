@@ -1,14 +1,14 @@
 //! The tenant declares its complete table policy before a writer creates governed tables.
 
 use contextdb_core::{
-    ConflictPolicy, Error, HistoryPolicy, RetainUnit, SyncDirection, TableMeta, TenantId, Value,
-    Wallclock,
+    ConflictPolicy, Error, HistoryPolicy, Incarnation, RetainUnit, SyncDirection, TableMeta,
+    TenantId, Value, Wallclock,
 };
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::DdlChange;
 use contextdb_server::protocol::{
     MessageType, PullResponse, WireDdlChange, WireDdlProvenance, canonical_ddl_provenance_digest,
-    decode, encode,
+    decode, encode, signed_ddl_author_for_test,
 };
 use contextdb_server::sync_client::ApplicationTablePolicyExpectation;
 use contextdb_server::transport::iroh::IrohServer;
@@ -180,6 +180,13 @@ fn declared_axes(meta: &TableMeta) -> DeclaredAxes {
 /// hubs must never manufacture this invalid policy.
 struct AdversarialBoundTablePull {
     inner: Arc<dyn ClientTransport>,
+    /// The hub's own key. Schema is refused outright unless the peer that
+    /// wrote it signed it, so this adversarial hub signs the declaration it
+    /// manufactures -- otherwise the unit never reaches the per-table policy
+    /// check this test is about.
+    author: Arc<FabricIdentity>,
+    author_incarnation: Incarnation,
+    tenant: String,
 }
 
 impl AdversarialBoundTablePull {
@@ -207,7 +214,7 @@ impl AdversarialBoundTablePull {
             rmp_serde::from_slice(&envelope.payload)
                 .map_err(|error| TransportError::Other(error.to_string()))?
         };
-        let ddl_lsn = response
+        let unrelated_row_lsn = response
             .changeset
             .rows
             .first()
@@ -215,6 +222,12 @@ impl AdversarialBoundTablePull {
             .ok_or_else(|| {
                 TransportError::Other("fixture requires the real unrelated hub row".to_string())
             })?;
+        let ddl_lsn = contextdb_core::Lsn(
+            unrelated_row_lsn
+                .0
+                .checked_add(1)
+                .expect("the synthetic DDL needs its own source position"),
+        );
         let ddl: WireDdlChange = DdlChange::CreateTable {
             name: "records".into(),
             columns: vec![
@@ -227,14 +240,28 @@ impl AdversarialBoundTablePull {
             composite_unique: Vec::new(),
         }
         .into();
-        let provenance = WireDdlProvenance {
+        let mut provenance = WireDdlProvenance {
             source_ddl_lsn: ddl_lsn,
             ordinal: 0,
             table: Some("records".into()),
             table_generation: Some(1),
             digest: canonical_ddl_provenance_digest(&ddl, ddl_lsn, 0, Some("records"), Some(1))
                 .map_err(|error| TransportError::Other(error.to_string()))?,
+            author: None,
+            unattested: false,
         };
+        provenance.author = Some(
+            signed_ddl_author_for_test(
+                &TenantId::from(self.tenant.as_str()),
+                &self.author,
+                self.author_incarnation,
+                &ddl,
+                &provenance,
+                // The injected create is its author's whole one-statement unit.
+                1,
+            )
+            .map_err(|error| TransportError::Other(error.to_string()))?,
+        );
         response.changeset.ddl.insert(0, ddl);
         response.changeset.ddl_lsn.insert(0, ddl_lsn);
         response.changeset.ddl_provenance.insert(0, provenance);
@@ -990,6 +1017,15 @@ async fn a_bound_edge_refuses_a_mismatching_local_or_arriving_declaration_per_ta
         edge.clone(),
         Arc::new(AdversarialBoundTablePull {
             inner: broker.client_as(&routed_edge_identity.node_id()),
+            author: Arc::new(
+                FabricIdentity::load_or_generate(&root.path().join("hub.db.fabric-identity.key"))
+                    .expect("the adversarial hub signs with its own key"),
+            ),
+            author_incarnation: hub
+                .db
+                .sync_incarnation(&TenantId::from(tenant))
+                .expect("the hub's own database life"),
+            tenant: tenant.to_string(),
         }),
         TenantId::from(tenant),
         routed_edge_identity,
@@ -1136,26 +1172,31 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
          itself: the operator's own clause set must stand, clause for clause"
     );
 
+    // The sender's `notes` declaration is its own one-statement transaction,
+    // so refusing that transaction whole refuses exactly that statement; the
+    // sender's later `notes` row was written under the refused declaration
+    // and is held behind it, while its peer table continues.
     assert_eq!(
         applied.conflicts.len(),
-        1,
-        "the arriving declaration is refused for that one table while its peer continues"
+        2,
+        "the refused declaration and the one row held behind it: {:?}",
+        applied.conflicts
     );
-    let refusal = &applied.conflicts[0];
-    let expected = Error::DeclaredPolicyPreserved {
-        table: "notes".into(),
-        clause: "conflict".into(),
-    }
-    .to_string();
-    assert_eq!(
-        refusal.reason.as_deref(),
-        Some(expected.as_str()),
-        "arriving DDL reports DeclaredPolicyPreserved for notes.conflict"
+    assert_whole_unit_refusal(
+        &applied.conflicts[0],
+        "notes",
+        "conflict",
+        "SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        "SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
     );
+    assert_held_behind_refusal(&applied.conflicts[1], "notes");
     assert!(
-        refusal.table.is_none(),
-        "this refusal is about a table's policy, not about one transmitted row, and \
-         the sender's accounting must be able to tell the two apart"
+        hub.db
+            .execute("SELECT body FROM notes", &p())
+            .unwrap()
+            .rows
+            .is_empty(),
+        "the held row did not install"
     );
 
     assert_eq!(
@@ -1216,29 +1257,41 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
     stranger_db
         .execute("INSERT INTO ordinary_install VALUES (1)", &p())
         .unwrap();
-    let response = within(stranger.push()).await.unwrap();
-    assert_eq!(response.conflicts.len(), 1);
+    let hub_schema_before = hub_schema(&hub.db);
+    let response = within(stranger.push())
+        .await
+        .expect("a refused transaction is an answer to its author, not a failed connection");
+    // Authenticated received DDL is never installed as
+    // a proper subset of what its author signed. The stranger's ONE
+    // transaction restates the declared `records` differently, so the whole
+    // transaction is refused -- `ordinary_install` rides with it -- and its
+    // next unit, a row for the table that transaction would have created,
+    // is held back behind it rather than failing the connection.
     assert_eq!(
-        response.conflicts[0].reason.as_deref(),
-        Some(
-            Error::DeclaredPolicyPreserved {
-                table: "records".into(),
-                clause: "direction".into()
-            }
-            .to_string()
-            .as_str()
-        )
+        response.conflicts.len(),
+        2,
+        "one typed refusal for the transaction and one hold for its next unit: {:?}",
+        response.conflicts
     );
+    assert_whole_unit_refusal(
+        &response.conflicts[0],
+        "records",
+        "direction",
+        ROOT_CLAUSES,
+        "SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+    );
+    assert_held_behind_refusal(&response.conflicts[1], "ordinary_install");
     assert!(hub.db.table_meta("records").is_none());
-    assert_eq!(shown(&hub.db, "SHOW TENANT TABLE POLICY"), declared);
-    assert_eq!(
-        hub.db
-            .execute("SELECT * FROM ordinary_install", &p())
-            .unwrap()
-            .rows
-            .len(),
-        1
+    assert!(
+        hub.db.table_meta("ordinary_install").is_none(),
+        "no statement of the refused transaction installed"
     );
+    assert_eq!(
+        hub_schema(&hub.db),
+        hub_schema_before,
+        "the refused transaction left the receiver's schema log exactly as it was"
+    );
+    assert_eq!(shown(&hub.db, "SHOW TENANT TABLE POLICY"), declared);
     within(stranger.shutdown()).await;
     let legitimate_db = Arc::new(Database::open(root.path().join("legitimate.db")).unwrap());
     let legitimate = edge_client(
@@ -1299,6 +1352,677 @@ async fn a_declared_local_policy_is_preserved_against_arriving_ddl_and_an_undecl
         1
     );
     within(legitimate.shutdown()).await;
+
+    within(client.shutdown()).await;
+    hub.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// A declared local policy against an authored transaction. The receiver's
+// explicit declaration is immutable
+// once bound, and the arriving transaction is authenticated and immutable
+// too: the receiver never installs a proper subset of it. An arriving
+// statement that restates the declared policy exactly installs as any other
+// statement does; one that restates it differently refuses the WHOLE
+// transaction -- never the rest of the batch or the connection -- and the
+// author's later units follow the per-table holdback.
+
+/// The receiver's schema as its durable DDL log holds it: every statement,
+/// with the commit position it installed at.
+fn hub_schema(db: &Database) -> Vec<(contextdb_core::Lsn, DdlChange)> {
+    let log = db.changes_since(contextdb_core::Lsn(0));
+    log.ddl_lsn.into_iter().zip(log.ddl).collect()
+}
+
+/// A whole-transaction refusal names the held table, the receiver's own
+/// declared policy, the policy that arrived, and says the local declaration
+/// cannot be changed from here, so the author -- not a retry -- recovers.
+fn assert_whole_unit_refusal(
+    conflict: &contextdb_engine::sync_types::Conflict,
+    table: &str,
+    clause: &str,
+    local_policy: &str,
+    arriving_policy: &str,
+) {
+    let reason = conflict
+        .reason
+        .as_deref()
+        .unwrap_or_else(|| panic!("the refusal of {table} carries its reason: {conflict:?}"));
+    assert_eq!(
+        reason,
+        Error::DeclaredPolicyPreserved {
+            table: table.into(),
+            clause: clause.into(),
+            local_policy: local_policy.into(),
+            arriving_policy: arriving_policy.into(),
+        }
+        .to_string(),
+        "the refusal is the typed whole-transaction refusal for {table}.{clause}"
+    );
+    assert!(
+        reason.contains(&format!("'{table}'")),
+        "the refusal names the table {table}: {reason}"
+    );
+    assert!(
+        reason.contains(&format!("local policy {local_policy};")),
+        "the refusal states the receiver's own declared policy ({local_policy}): {reason}"
+    );
+    assert!(
+        reason.contains(&format!("arriving policy {arriving_policy};")),
+        "the refusal states the policy the author sent ({arriving_policy}): {reason}"
+    );
+    assert!(
+        reason.contains("immutable once bound")
+            && reason.contains("whole authored transaction is refused"),
+        "the refusal says the local declaration cannot change and the whole transaction is \
+         refused, so recovery is at the author's side: {reason}"
+    );
+    assert!(
+        conflict.table.is_none() && conflict.mutation_kind.is_none(),
+        "a schema refusal is not a row conflict, and the sender's accounting must tell them apart"
+    );
+}
+
+/// A later unit held back behind a refused transaction says so and names the
+/// table it is held on.
+fn assert_held_behind_refusal(conflict: &contextdb_engine::sync_types::Conflict, table: &str) {
+    let reason = conflict
+        .reason
+        .as_deref()
+        .unwrap_or_else(|| panic!("the hold on {table} carries its reason: {conflict:?}"));
+    assert!(
+        reason.contains(&format!("'{table}' is held back")),
+        "the hold names the table {table}: {reason}"
+    );
+    assert!(
+        conflict.table.is_none() && conflict.mutation_kind.is_none(),
+        "a hold is not a row conflict: {conflict:?}"
+    );
+}
+
+/// Everything a refused transaction must leave untouched at the receiver:
+/// its application schema log, which tables exist, the declared table's
+/// clause set, and every receipt and progress marker it keeps for the
+/// author. The hub's own contact bookkeeping (`work_node_contacts`, written
+/// whenever any peer connects) is the receiver's record of the connection,
+/// not of the transaction, so it is left out.
+#[derive(Debug, PartialEq)]
+struct ReceiverImage {
+    schema: Vec<(contextdb_core::Lsn, DdlChange)>,
+    tables: Vec<(String, bool)>,
+    declared: DeclaredAxes,
+    applied_from_author: Option<contextdb_core::Lsn>,
+    watermarks: (contextdb_core::Lsn, contextdb_core::Lsn),
+}
+
+fn receiver_image(db: &Database, tenant: &str, author_node: &str) -> ReceiverImage {
+    let tenant = TenantId::from(tenant);
+    ReceiverImage {
+        schema: hub_schema(db)
+            .into_iter()
+            .filter(|(_, ddl)| {
+                !matches!(ddl, DdlChange::CreateTable { name, .. } if name == "work_node_contacts")
+            })
+            .collect(),
+        tables: ["notes", "sidecar", "unrelated"]
+            .iter()
+            .map(|table| (table.to_string(), db.table_meta(table).is_some()))
+            .collect(),
+        declared: declared_axes(&db.table_meta("notes").expect("the declared table")),
+        applied_from_author: db
+            .persisted_sync_applied_push_watermark_for_node(&tenant, author_node)
+            .expect("read the receipt the receiver keeps for the author"),
+        watermarks: db
+            .persisted_sync_watermarks(&tenant)
+            .expect("read the receiver's sync progress"),
+    }
+}
+
+// Condition 1: an identical restatement is an ordinary statement.
+#[tokio::test]
+async fn an_identical_restatement_of_a_declared_local_policy_installs_with_the_rest_of_its_transaction()
+ {
+    let _clock = Wallclock::test_clock_guard(|| T0);
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let tenant = "identical-restatement";
+    let hub = start_hub(root.path(), "hub", tenant).await;
+    hub.db
+        .execute(
+            "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) \
+             SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            &p(),
+        )
+        .expect("the receiver declares its own policy");
+    let declared_before = declared_axes(&hub.db.table_meta("notes").unwrap());
+    let local_schema = hub_schema(&hub.db);
+
+    let edge_identity = root.path().join("edge.db.fabric-identity.key");
+    let edge = Arc::new(Database::open(root.path().join("edge.db")).expect("open the author"));
+    edge.execute("BEGIN", &p()).unwrap();
+    edge.execute(
+        "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) \
+         SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        &p(),
+    )
+    .expect("the author restates exactly the receiver's declared policy");
+    edge.execute(
+        "CREATE TABLE sidecar (id UUID PRIMARY KEY, body TEXT)",
+        &p(),
+    )
+    .expect("and creates a sibling in the same transaction");
+    edge.execute("COMMIT", &p()).unwrap();
+    edge.execute(
+        "INSERT INTO sidecar (id, body) VALUES ($id, $body)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(uuid::Uuid::new_v4())),
+            ("body".to_string(), Value::Text("after the schema".into())),
+        ]),
+    )
+    .unwrap();
+
+    let client = edge_client(&edge, &hub.ticket, &edge_identity, tenant);
+    let applied = within(client.push()).await.expect("the push lands");
+    assert!(
+        applied.conflicts.is_empty(),
+        "an identical restatement is not a conflict: {:?}",
+        applied.conflicts
+    );
+    assert_eq!(
+        declared_axes(&hub.db.table_meta("notes").unwrap()),
+        declared_before,
+        "the declared policy stands, clause for clause"
+    );
+    assert_eq!(
+        hub.db
+            .execute("SELECT body FROM sidecar", &p())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("after the schema".into())]],
+        "the sibling statement installed with its transaction and took its row"
+    );
+    let schema = hub_schema(&hub.db);
+    assert_eq!(
+        schema[..local_schema.len()],
+        local_schema[..],
+        "the receiver's own declaration is still first in its log"
+    );
+    // The receiver records its own contact bookkeeping in the log too; the
+    // author's transaction is the pair of creates for its two tables.
+    let received = schema[local_schema.len()..]
+        .iter()
+        .filter(|(_, ddl)| {
+            matches!(ddl, DdlChange::CreateTable { name, .. } if name == "notes" || name == "sidecar")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        received
+            .iter()
+            .map(|(_, ddl)| match ddl {
+                DdlChange::CreateTable { name, .. } => name.as_str(),
+                other => panic!("only the author's creates are selected: {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        vec!["notes", "sidecar"],
+        "the whole authored transaction installed, in the author's order"
+    );
+    assert!(
+        received.iter().all(|(lsn, _)| *lsn == received[0].0),
+        "as one commit: {received:?}"
+    );
+
+    within(client.shutdown()).await;
+    hub.stop().await;
+}
+
+// Conditions 2-4 through the push door: one authored transaction per request.
+#[tokio::test]
+async fn a_differing_restatement_refuses_its_whole_transaction_leaving_no_schema_receipt_or_progress_and_later_units_follow_the_holdback()
+ {
+    let _clock = Wallclock::test_clock_guard(|| T0);
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let tenant = "whole-unit-policy-refusal";
+    let hub = start_hub(root.path(), "hub", tenant).await;
+    hub.db
+        .execute(
+            "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) \
+             SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            &p(),
+        )
+        .expect("the receiver declares its own policy");
+
+    let edge_identity = root.path().join("edge.db.fabric-identity.key");
+    let author_node = contextdb_server::FabricIdentity::load_or_generate(&edge_identity)
+        .expect("the author's identity")
+        .node_id();
+    let edge = Arc::new(Database::open(root.path().join("edge.db")).expect("open the author"));
+    edge.execute("BEGIN", &p()).unwrap();
+    edge.execute(
+        "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) \
+         SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+        &p(),
+    )
+    .expect("the author restates the declared table with a different conflict policy");
+    edge.execute(
+        "CREATE TABLE sidecar (id UUID PRIMARY KEY, body TEXT)",
+        &p(),
+    )
+    .expect("and creates a sibling in the same transaction");
+    edge.execute("COMMIT", &p()).unwrap();
+
+    let before = receiver_image(&hub.db, tenant, &author_node);
+    let client = edge_client(&edge, &hub.ticket, &edge_identity, tenant);
+    let refused = within(client.push())
+        .await
+        .expect("a refused transaction is an answer to its author, not a failed connection");
+    assert_eq!(
+        receiver_image(&hub.db, tenant, &author_node),
+        before,
+        "the refused transaction installed nothing -- not its sibling table either -- and no \
+         receipt or progress marker claims it was applied"
+    );
+    assert_eq!(
+        refused.conflicts.len(),
+        1,
+        "the one transaction is refused once: {:?}",
+        refused.conflicts
+    );
+    assert_whole_unit_refusal(
+        &refused.conflicts[0],
+        "notes",
+        "conflict",
+        "SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        "SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+    );
+    assert_eq!(refused.applied_rows, 0);
+    let refused_outcomes = client.refused_schema_units_for_test();
+    assert_eq!(refused_outcomes.len(), 1, "one durable REFUSED outcome");
+    assert_eq!(refused_outcomes[0].table, "notes");
+    assert_eq!(refused_outcomes[0].author_node_id, author_node);
+
+    within(client.shutdown()).await;
+    hub.stop().await;
+    let hub = start_hub(root.path(), "hub", tenant).await;
+    assert_eq!(
+        receiver_image(&hub.db, tenant, &author_node),
+        before,
+        "after a restart the refused transaction has left nothing behind"
+    );
+
+    // A row on the refused table is held behind the refused transaction,
+    // while an unrelated table keeps moving on the same connection.
+    let held_note_id = uuid::Uuid::new_v4();
+    edge.execute(
+        "INSERT INTO notes (id, body) VALUES ($id, $body)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(held_note_id)),
+            (
+                "body".to_string(),
+                Value::Text("waits behind the refusal".into()),
+            ),
+        ]),
+    )
+    .unwrap();
+    edge.execute(
+        "CREATE TABLE unrelated (id UUID PRIMARY KEY, body TEXT)",
+        &p(),
+    )
+    .unwrap();
+    edge.execute(
+        "INSERT INTO unrelated (id, body) VALUES ($id, $body)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(uuid::Uuid::new_v4())),
+            ("body".to_string(), Value::Text("keeps moving".into())),
+        ]),
+    )
+    .unwrap();
+    let client = edge_client(&edge, &hub.ticket, &edge_identity, tenant);
+    let next = within(client.push())
+        .await
+        .expect("units after a refused transaction do not fail the connection");
+    // The durable REFUSED outcome prevents a re-offer. Only the later row
+    // reports a transient hold, while the unrelated transaction installs.
+    assert_eq!(
+        next.conflicts.len(),
+        1,
+        "one held row and no repeated refusal: {:?}",
+        next.conflicts
+    );
+    assert_held_behind_refusal(&next.conflicts[0], "notes");
+    assert_eq!(
+        client.refused_schema_units_for_test(),
+        refused_outcomes,
+        "the author reads the same durable refusal after the hub restarts"
+    );
+    assert!(
+        hub.db.table_meta("sidecar").is_none(),
+        "the held table was never created"
+    );
+    assert_eq!(
+        hub.db
+            .execute("SELECT body FROM unrelated", &p())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("keeps moving".into())]],
+        "an unrelated unit on the same connection installed"
+    );
+    assert_eq!(
+        declared_axes(&hub.db.table_meta("notes").unwrap()),
+        before.declared,
+        "the declared policy still stands"
+    );
+    assert!(
+        hub.db
+            .execute("SELECT body FROM notes", &p())
+            .unwrap()
+            .rows
+            .is_empty(),
+        "the held row is not installed before correction"
+    );
+    // Once a later unit is receipted, the hub's status covers the author's
+    // stream and nothing refused or held is offered again.
+    let settled = within(client.push()).await.expect("a quiet push");
+    assert!(
+        settled.conflicts.is_empty(),
+        "nothing is re-offered once a later unit is receipted: {:?}",
+        settled.conflicts
+    );
+    assert!(hub.db.table_meta("sidecar").is_none());
+
+    edge.execute("ALTER TABLE notes SET SYNC CONFLICT KEEP FIRST", &p())
+        .expect("the author corrects the policy in a later unit");
+    let corrected = within(client.push()).await.expect("push the correction");
+    assert!(
+        corrected.conflicts.is_empty(),
+        "the correction accepts and releases the held row: {:?}",
+        corrected.conflicts
+    );
+    assert!(
+        hub.db
+            .persisted_sync_applied_push_watermark_for_node(&TenantId::from(tenant), &author_node)
+            .unwrap()
+            .is_some_and(|lsn| Some(lsn) > before.applied_from_author),
+        "only the later correction earns an applied receipt"
+    );
+    assert_eq!(
+        hub.db
+            .execute("SELECT id, body FROM notes", &p())
+            .unwrap()
+            .rows,
+        vec![vec![
+            Value::Uuid(held_note_id),
+            Value::Text("waits behind the refusal".into()),
+        ]],
+        "the earlier held row replays exactly once after correction"
+    );
+
+    within(client.shutdown()).await;
+    hub.stop().await;
+}
+
+// Conditions 2 and 4 through the pull door: many authored transactions in one
+// transport batch.
+#[tokio::test]
+async fn a_refused_transaction_in_a_pulled_batch_leaves_its_unrelated_siblings_installing_and_holds_its_tables()
+ {
+    let _clock = Wallclock::test_clock_guard(|| T0);
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let tenant = "whole-unit-refusal-in-a-batch";
+    let hub = start_hub(root.path(), "hub", tenant).await;
+    // The author's transactions, in order: one restating `notes` with a
+    // policy the receiver declared differently, plus a sibling table; then an
+    // unrelated table; a row on it; a row on the sibling; another unrelated row.
+    hub.db.execute("BEGIN", &p()).unwrap();
+    hub.db
+        .execute(
+            "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) \
+             SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+            &p(),
+        )
+        .unwrap();
+    hub.db
+        .execute(
+            "CREATE TABLE sidecar (id UUID PRIMARY KEY, body TEXT)",
+            &p(),
+        )
+        .unwrap();
+    hub.db.execute("COMMIT", &p()).unwrap();
+    hub.db
+        .execute("CREATE TABLE memos (id UUID PRIMARY KEY, body TEXT)", &p())
+        .unwrap();
+    for (table, body) in [
+        ("memos", "first memo"),
+        ("sidecar", "sidecar row"),
+        ("memos", "second memo"),
+    ] {
+        hub.db
+            .execute(
+                &format!("INSERT INTO {table} (id, body) VALUES ($id, $body)"),
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(uuid::Uuid::new_v4())),
+                    ("body".to_string(), Value::Text(body.into())),
+                ]),
+            )
+            .unwrap();
+    }
+
+    let edge_identity = root.path().join("edge.db.fabric-identity.key");
+    let edge = Arc::new(Database::open(root.path().join("edge.db")).expect("open the receiver"));
+    edge.execute(
+        "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) \
+         SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        &p(),
+    )
+    .expect("the receiving edge declares its own policy");
+    let declared_before = declared_axes(&edge.table_meta("notes").unwrap());
+
+    let client = edge_client(&edge, &hub.ticket, &edge_identity, tenant);
+    let applied = within(client.pull_default())
+        .await
+        .expect("a refused transaction does not fail the batch it arrived in");
+    assert_eq!(
+        applied.conflicts.len(),
+        2,
+        "the refused transaction, and the one later unit on its tables: {:?}",
+        applied.conflicts
+    );
+    assert_whole_unit_refusal(
+        &applied.conflicts[0],
+        "notes",
+        "conflict",
+        "SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        "SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+    );
+    assert_held_behind_refusal(&applied.conflicts[1], "sidecar");
+    assert!(
+        edge.table_meta("sidecar").is_none(),
+        "no statement of the refused transaction installed"
+    );
+    assert_eq!(
+        declared_axes(&edge.table_meta("notes").unwrap()),
+        declared_before,
+        "the receiver's declared policy stands"
+    );
+    let mut memos = edge
+        .execute("SELECT body FROM memos", &p())
+        .expect("the unrelated sibling transaction installed")
+        .rows;
+    memos.sort_by_key(|row| format!("{row:?}"));
+    assert_eq!(
+        memos,
+        vec![
+            vec![Value::Text("first memo".into())],
+            vec![Value::Text("second memo".into())],
+        ],
+        "every unrelated unit in the batch installed, including the one after the held unit"
+    );
+
+    within(client.shutdown()).await;
+    hub.stop().await;
+}
+
+// A refused alteration of a table the receiver already holds must keep
+// holding that table's dependent data on every later page and across a
+// restart -- not only inside the call that refused it -- while an unrelated
+// unit keeps installing.
+#[tokio::test]
+async fn a_refused_alteration_of_an_existing_table_holds_its_later_pages_across_restart_while_unrelated_units_install()
+ {
+    let _clock = Wallclock::test_clock_guard(|| T0);
+    let root = tempfile::tempdir().expect("temporary test directory");
+    let tenant = "existing-table-refusal-holds";
+    let hub = start_hub(root.path(), "hub", tenant).await;
+    hub.db
+        .execute(
+            "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) \
+             SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            &p(),
+        )
+        .unwrap();
+
+    let edge_path = root.path().join("edge.db");
+    let edge_identity = root.path().join("edge.db.fabric-identity.key");
+    let edge = Arc::new(Database::open(&edge_path).expect("open the receiver"));
+    edge.execute(
+        "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) \
+         SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        &p(),
+    )
+    .expect("the receiving edge declares the same policy for itself");
+    let client = edge_client(&edge, &hub.ticket, &edge_identity, tenant);
+    let first = within(client.pull_default()).await.expect("first page");
+    assert!(
+        first.conflicts.is_empty(),
+        "the identical declaration installs: {:?}",
+        first.conflicts
+    );
+
+    // The author alters the table: a conflict policy that differs from the
+    // edge's own declaration, then a new column (whose restated policy
+    // carries the same difference).
+    hub.db
+        .execute("ALTER TABLE notes SET SYNC CONFLICT KEEP LATEST", &p())
+        .unwrap();
+    hub.db
+        .execute("ALTER TABLE notes ADD COLUMN tag TEXT", &p())
+        .unwrap();
+    let refused = within(client.pull_default())
+        .await
+        .expect("the refused alteration is an answer, not a failed pull");
+    assert_eq!(refused.conflicts.len(), 2, "{:?}", refused.conflicts);
+    for conflict in &refused.conflicts {
+        assert_whole_unit_refusal(
+            conflict,
+            "notes",
+            "conflict",
+            "SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            "SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+        );
+    }
+    let columns = |db: &Database| {
+        db.table_meta("notes")
+            .unwrap()
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        columns(&edge),
+        vec!["id", "body"],
+        "nothing of it installed"
+    );
+    // The hold is inspectable: which peer, which table, and the refusal the
+    // author must act on.
+    let held = edge
+        .policy_held_received_tables()
+        .expect("read the receiver's holds");
+    assert_eq!(held.len(), 1, "one table is held: {held:?}");
+    assert_eq!(held[0].table, "notes");
+    assert_eq!(
+        held[0].source_node_id, hub.node_id,
+        "held against the hub it came from"
+    );
+    assert!(!held[0].creation_refused, "the held table exists here");
+    assert_eq!(
+        Some(held[0].refusal.as_str()),
+        refused.conflicts[0].reason.as_deref(),
+        "the hold carries the typed refusal the author has to act on"
+    );
+
+    // Restart the receiver between pages.
+    within(client.shutdown()).await;
+    drop(client);
+    let edge = match Arc::try_unwrap(edge) {
+        Ok(db) => db,
+        Err(_) => panic!("the edge store has no other owner before its restart"),
+    };
+    edge.close().expect("close the edge");
+    drop(edge);
+    let edge = Arc::new(Database::open(&edge_path).expect("reopen the receiver"));
+    assert_eq!(
+        edge.policy_held_received_tables()
+            .expect("read the receiver's holds after a restart"),
+        held,
+        "the hold survives the restart"
+    );
+
+    // A later page: a row written under the refused alteration, and an
+    // unrelated table with its row.
+    hub.db
+        .execute(
+            "INSERT INTO notes (id, body, tag) VALUES ($id, $body, $tag)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid::Uuid::new_v4())),
+                (
+                    "body".to_string(),
+                    Value::Text("written under the alteration".into()),
+                ),
+                ("tag".to_string(), Value::Text("new column".into())),
+            ]),
+        )
+        .unwrap();
+    hub.db
+        .execute("CREATE TABLE memos (id UUID PRIMARY KEY, body TEXT)", &p())
+        .unwrap();
+    hub.db
+        .execute(
+            "INSERT INTO memos (id, body) VALUES ($id, $body)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid::Uuid::new_v4())),
+                ("body".to_string(), Value::Text("unrelated".into())),
+            ]),
+        )
+        .unwrap();
+    let client = edge_client(&edge, &hub.ticket, &edge_identity, tenant);
+    let later = within(client.pull_default())
+        .await
+        .expect("a later page after a refusal does not fail");
+    assert_eq!(
+        later.conflicts.len(),
+        1,
+        "only the dependent row is held: {:?}",
+        later.conflicts
+    );
+    assert_held_behind_refusal(&later.conflicts[0], "notes");
+    assert!(
+        edge.execute("SELECT body FROM notes", &p())
+            .unwrap()
+            .rows
+            .is_empty(),
+        "the row that depends on the refused alteration stays unapplied"
+    );
+    assert_eq!(columns(&edge), vec!["id", "body"]);
+    assert_eq!(
+        edge.execute("SELECT body FROM memos", &p()).unwrap().rows,
+        vec![vec![Value::Text("unrelated".into())]],
+        "the unrelated unit installs"
+    );
+    assert_eq!(
+        edge.policy_held_received_tables().unwrap(),
+        held,
+        "the table stays held until the author corrects its transaction"
+    );
 
     within(client.shutdown()).await;
     hub.stop().await;

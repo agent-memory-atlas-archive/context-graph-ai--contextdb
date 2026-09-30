@@ -1471,6 +1471,7 @@ fn stable_read_failure_vocabulary_round_trips_every_legal_shape() {
             ReadFailureKind::DeclaredPrincipalRefused,
             // Constrained custody inspection is an explicit read refusal.
             ReadFailureKind::ConstrainedHandleInspectionRefused,
+            ReadFailureKind::AuthoritativeErasure,
         ]
     );
     for kind in ReadFailureKind::ALL {

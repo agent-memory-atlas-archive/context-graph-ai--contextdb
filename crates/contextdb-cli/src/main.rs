@@ -31,11 +31,6 @@ use contextdb_server::exit_codes::exit_code_for;
 // contract took it off.
 #[derive(Subcommand)]
 enum Operation {
-    /// Bring a legacy-format store forward in place, backing up the original first.
-    Migrate {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        arguments: Vec<String>,
-    },
     /// Recreate a wedged or corrupt store from scratch. Destructive; needs `--force`.
     Reset {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -73,7 +68,6 @@ impl Operation {
     /// the registry publishes, so the tree and the discovery list cannot drift.
     fn spelling(&self) -> &'static str {
         match self {
-            Operation::Migrate { .. } => "migrate",
             Operation::Reset { .. } => "reset",
             Operation::Diagnose { .. } => "diagnose",
             Operation::Snapshot { .. } => "snapshot",
@@ -85,8 +79,7 @@ impl Operation {
 
     fn arguments(&self) -> &[String] {
         match self {
-            Operation::Migrate { arguments }
-            | Operation::Reset { arguments }
+            Operation::Reset { arguments }
             | Operation::Diagnose { arguments }
             | Operation::Snapshot { arguments }
             | Operation::Inspect { arguments }

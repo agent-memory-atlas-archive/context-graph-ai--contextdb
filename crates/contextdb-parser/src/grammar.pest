@@ -40,6 +40,8 @@ stmt = _{
     | show_disk_limit
     | set_maintenance_poll_interval
     | show_maintenance_poll_interval
+    | set_vector_serving_cache
+    | show_vector_serving_cache
     | select_stmt
 }
 
@@ -75,6 +77,15 @@ set_maintenance_poll_interval = {
 show_maintenance_poll_interval = { ^"SHOW" ~ ^"MAINTENANCE_POLL_INTERVAL" }
 maintenance_poll_interval_value = { integer ~ maintenance_poll_interval_unit }
 maintenance_poll_interval_unit = { ^"MILLISECONDS" | ^"SECONDS" }
+set_vector_serving_cache = {
+    ^"SET" ~ ^"VECTOR_SERVING_CACHE"
+    ~ ("'" ~ vector_serving_cache_value ~ "'" | vector_serving_cache_value)
+}
+show_vector_serving_cache = { ^"SHOW" ~ ^"VECTOR_SERVING_CACHE" }
+// A bare byte count is accepted so that `0` reaches the engine's plain refusal
+// instead of dying as a grammar error; `size_with_unit` is tried first so a
+// suffixed size still parses as one.
+vector_serving_cache_value = { ^"none" | size_with_unit | integer }
 size_with_unit = { ASCII_DIGIT+ ~ ("G" | "M" | "K") }
 
 begin_stmt = { ^"BEGIN" }
@@ -195,7 +206,7 @@ foreign_key_table_constraint = {
 }
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
-alter_action = { alter_column_action | add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_history_action | set_sync_conflict_action | set_sync_direction_action }
+alter_action = { alter_column_action | add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_history_action | set_maintain_count_action | set_sync_conflict_action | set_sync_direction_action }
 alter_column_action = {
     ^"ALTER"
     ~ ^"COLUMN"
@@ -210,6 +221,7 @@ alter_column_set_consolidation = { ^"SET" ~ ^"CONSOLIDATION" ~ (^"DEFAULT" | con
 set_retain_action = { ^"SET" ~ ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 drop_retain_action = { ^"DROP" ~ ^"RETAIN" }
 set_history_action = { ^"SET" ~ history_option }
+set_maintain_count_action = { ^"SET" ~ maintain_count_option }
 set_sync_conflict_action = { ^"SET" ~ sync_conflict_option }
 set_sync_direction_action = { ^"SET" ~ sync_direction_option }
 add_column_action = { ^"ADD" ~ (^"COLUMN")? ~ column_def }
@@ -330,6 +342,7 @@ fk_propagation_clause = {
 
 table_option = {
     immutable_option
+    | maintain_count_option
     | state_machine_option
     | dag_option
     | propagate_edge_option
@@ -389,6 +402,20 @@ sync_two_way = { ^"TWO" ~ ^"WAY" }
 sync_conflict_option = { ^"SYNC" ~ ^"CONFLICT" ~ (conflict_keep_first | conflict_keep_latest) }
 conflict_keep_first = { ^"KEEP" ~ ^"FIRST" }
 conflict_keep_latest = { ^"KEEP" ~ ^"LATEST" }
+// Which index-prefix counts the engine keeps current on every write to this
+// table. A count is keyed by an ordered column list, not by an index, so two
+// indexes that share leading columns name one count here. An absent clause
+// means NONE: the engine maintains no prefix count and an undeclared
+// `COUNT(*)` is answered exactly from the index range instead.
+maintain_count_option = {
+    ^"MAINTAIN" ~ ^"COUNT"
+    ~ (maintain_count_all | maintain_count_none | maintain_count_default
+       | maintain_count_list ~ ("," ~ maintain_count_list)*)
+}
+maintain_count_all = { ^"ALL" ~ ^"PREFIXES" }
+maintain_count_none = { ^"NONE" }
+maintain_count_default = { ^"DEFAULT" }
+maintain_count_list = { "(" ~ indexed_column ~ ("," ~ indexed_column)* ~ ")" }
 immutable_option = { ^"IMMUTABLE" }
 state_machine_option = { (^"STATE_MACHINE" | (^"STATE" ~ ^"MACHINE")) ~ "(" ~ state_machine_entries ~ ")" }
 state_machine_entries = { state_machine_entry ~ ("," ~ state_machine_entry)* }
@@ -537,13 +564,16 @@ and_op = @{ ^"AND" ~ !ident_char }
 unary_bool_expr = { not_op* ~ comparison_expr }
 not_op = @{ ^"NOT" ~ !ident_char }
 
-comparison_expr = { additive_expr ~ comparison_suffix? }
+comparison_expr = { (row_value | additive_expr) ~ comparison_suffix? }
+// ISO SQL row-value constructor. Two or more elements, so it can never be read
+// as a parenthesised scalar expression.
+row_value = { "(" ~ expr ~ ("," ~ expr)+ ~ ")" }
 comparison_suffix = { between_suffix | in_suffix | like_suffix | is_null_suffix | cmp_suffix }
 cmp_suffix = { cmp_op ~ additive_expr }
 cmp_op = { "=" | "!=" | "<>" | "<=" | ">=" | "<" | ">" }
 between_suffix = { not_op? ~ ^"BETWEEN" ~ additive_expr ~ ^"AND" ~ additive_expr }
 in_suffix = { not_op? ~ ^"IN" ~ "(" ~ in_contents ~ ")" }
-in_contents = { select_core | expr ~ ("," ~ expr)* }
+in_contents = { select_core | row_value ~ ("," ~ row_value)* | expr ~ ("," ~ expr)* }
 like_suffix = { not_op? ~ ^"LIKE" ~ additive_expr }
 is_null_suffix = { ^"IS" ~ not_op? ~ ^"NULL" }
 

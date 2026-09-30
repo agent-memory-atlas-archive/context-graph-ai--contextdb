@@ -1745,9 +1745,9 @@ fn t15_apply_changes_b1_cron_cross_thread() {
 
 // ============================================================================
 // t15b_apply_changes_non_row_shapes_b1_cron_cross_thread
-// B1 gate is content-independent: empty, edge-only, vector-only, valid DDL-only,
-// and malformed-ddl-lsn changesets must all fail before apply_changes inspects
-// or validates them.
+// Cross-thread cron callback refusal is content-independent: empty, edge-only,
+// vector-only, valid DDL-only, and malformed-ddl-lsn changesets must all fail
+// before apply_changes inspects or validates them.
 // ============================================================================
 #[test]
 #[serial]
@@ -1827,9 +1827,8 @@ fn t16_apply_changes_cross_db_trigger_independent() {
 
 // ============================================================================
 // t16b_apply_changes_non_row_shapes_b2_trigger_cross_thread
-// B2 gate is content-independent: empty, edge-only, vector-only, valid DDL-only,
-// and malformed-ddl-lsn changesets must all fail before apply_changes inspects
-// or validates them.
+// A trigger callback active on another database must not cause callback refusal
+// for empty, edge-only, vector-only, valid DDL-only, or malformed-ddl-lsn changesets.
 // ============================================================================
 #[test]
 #[serial]

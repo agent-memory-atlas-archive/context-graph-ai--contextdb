@@ -97,6 +97,9 @@ First declare it with `contextdb --write hub.db`; then call the edge's
 For tenant-governed event tables, declare policy on the hub, bind it through the edge's authenticated
 `SyncClient`, and install matching DDL before recording units. Register each manifest in its root's
 write transaction. Manifests use the ordinary push and its existing oversized-unit staging transport.
+Every committed column travels with its row, including a large body the edge store keeps on disk
+rather than in memory.
+<!-- enforced by: delivery_manifest_contract::a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_staging_path_and_is_never_served_to_a_pulling_peer -->
 A durable outcome, rather than a push watermark, ends that unit's pending obligation; fetch recovers
 lost acknowledgements without applying rows again. Refused rows stay on the edge and their diagnostic
 keys identify them.

@@ -3,8 +3,8 @@
 use crate::Database;
 use crate::database::{ExplainOutput, QueryTrace};
 use crate::sync_types::Conflict;
-use contextdb_core::Value;
 use contextdb_core::table_meta::{ColumnType, TableMeta};
+use contextdb_core::{Result, Value};
 use std::fmt::Write;
 
 /// Render a column type as a DDL token.
@@ -98,6 +98,39 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
         write!(&mut buf, " {clause}").unwrap();
     }
     buf.push_str(";\n");
+    // Plain `.schema` leaves an undeclared default silent. Verbose mode states
+    // the resolved value and the indexes that maintain each count. Its SQL
+    // comments leave the declaration parseable.
+    if verbose {
+        let effective = crate::maintained_counts::effective_maintained_counts(meta);
+        writeln!(
+            &mut buf,
+            "-- effective {}{}",
+            effective.declared_clause(),
+            if meta.maintained_counts.is_none() {
+                " (engine default; this table declared none)"
+            } else {
+                ""
+            }
+        )
+        .unwrap();
+        if let contextdb_core::MaintainedCounts::Lists(lists) = &effective {
+            for list in lists {
+                let indexes = crate::maintained_counts::indexes_leading_with(meta, list);
+                writeln!(
+                    &mut buf,
+                    "-- MAINTAIN COUNT ({}) is maintained by: {}",
+                    contextdb_core::render_maintained_count_columns(list),
+                    if indexes.is_empty() {
+                        "no index".to_string()
+                    } else {
+                        indexes.join(", ")
+                    }
+                )
+                .unwrap();
+            }
+        }
+    }
     for decl in &meta.indexes {
         if !verbose && decl.kind == contextdb_core::IndexKind::Auto {
             continue;
@@ -123,6 +156,62 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
         .unwrap();
     }
     buf
+}
+
+/// A table's `.schema --verbose` rendering, including the half that needs the
+/// STORE rather than the schema: how many distinct prefix values each
+/// maintained count currently holds.
+///
+/// This is the entry point `.schema --verbose` uses when it has a database in
+/// hand. [`render_table_meta_verbose`] remains for callers that hold only a
+/// `TableMeta`; it renders everything except the stored-value counts.
+pub fn render_table_meta_verbose_with_counts(db: &Database, table: &str) -> Result<String> {
+    let mut rendered = match db.table_meta(table) {
+        Some(meta) => render_table_meta_verbose(table, &meta),
+        None => return Err(contextdb_core::Error::TableNotFound(table.to_string())),
+    };
+    rendered.push_str(&render_maintained_count_inventory(db, table)?);
+    Ok(rendered)
+}
+
+/// What each of a table's maintained index-prefix counts currently costs to
+/// keep: the column list, the indexes whose writes keep it current, and how
+/// many distinct prefix values are stored for it right now.
+///
+/// Empty for a table that maintains nothing. A store that cannot be read is an
+/// error rather than a report of zero.
+fn render_maintained_count_inventory(db: &Database, table: &str) -> Result<String> {
+    let Some(meta) = db.table_meta(table) else {
+        return Ok(String::new());
+    };
+    let effective = crate::maintained_counts::effective_maintained_counts(&meta);
+    let lists = match &effective {
+        contextdb_core::MaintainedCounts::Lists(lists) => lists.clone(),
+        contextdb_core::MaintainedCounts::AllPrefixes => {
+            crate::maintained_counts::every_maintained_prefix(&meta)
+        }
+        contextdb_core::MaintainedCounts::None => Vec::new(),
+    };
+    let mut out = String::new();
+    for list in lists {
+        let stored = db.stored_maintained_count_values(table, &list)?;
+        writeln!(
+            &mut out,
+            "-- MAINTAIN COUNT ({}) holds {} stored prefix value(s), maintained by: {}",
+            contextdb_core::render_maintained_count_columns(&list),
+            stored,
+            {
+                let indexes = crate::maintained_counts::indexes_leading_with(&meta, &list);
+                if indexes.is_empty() {
+                    "no index".to_string()
+                } else {
+                    indexes.join(", ")
+                }
+            }
+        )
+        .unwrap();
+    }
+    Ok(out)
 }
 
 /// Render the route receipt from an ordinary relational `.explain`: the plan
@@ -158,6 +247,12 @@ pub fn render_explain_trace(trace: &QueryTrace) -> String {
     }
     if trace.sort_elided {
         out.push_str("  sort_elided: true\n");
+    }
+    // Exactly one read path can consume a maintained index-prefix count, and
+    // both answers to it are exact. This line is how a consumer tells which
+    // one it got, and what DDL would change that.
+    if let Some(maintained_count) = &trace.maintained_count {
+        writeln!(&mut out, "  {maintained_count}").unwrap();
     }
     if let Some(vector_search) = &trace.vector_search {
         writeln!(&mut out, "{vector_search}").unwrap();

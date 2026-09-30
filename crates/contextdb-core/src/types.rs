@@ -308,16 +308,141 @@ mod json_as_string {
     }
 }
 
-/// How many copies of a row's values a store keeps.
+/// How many copies of a row's values the TABLE keeps: one, the row version in
+/// the table's own vector.
 ///
-/// A row's values are retained a SECOND time whenever a column is indexed --
-/// the index tree is keyed by a whole clone of the value -- and a vector
-/// column's value is kept once by the row and once by the vector store.
-/// Measured against the allocator: two bytes held for every payload byte
-/// written, at both sites. An index can be created long after the rows exist,
-/// so the charge cannot wait to find out which columns will be indexed; the
-/// row boundary charges both retentions from the start.
-pub const ROW_VALUE_RETENTIONS: usize = 2;
+/// This used to be two, and the second copy stood for "an index tree is keyed
+/// by a whole clone of the value". Counted against the structures, that guess
+/// was wrong in both directions. It was far too small for a table with more
+/// than one index -- the cg `events` table declares nine, each cloning the
+/// columns it keys on, so its context and connector columns are held ten times
+/// over -- and too large for a table with none, which keeps its values exactly
+/// once. Every index clone is now charged against the index that makes it, per
+/// declared index and per key column ([`retained_index_posting_bytes`]), so a
+/// CREATE INDEX that adds a tenth clone is charged for it and a table with no
+/// index is charged for what it actually holds. A vector column's second copy
+/// is the vector store's, charged where that store makes it.
+pub const ROW_VALUE_RETENTIONS: usize = 1;
+
+/// What the relational store keeps BESIDE the row version, for every row it
+/// holds, regardless of how wide the row is.
+///
+/// Four side maps, none of which appears in the row's own bytes and none of
+/// which is proportional to the row's content. Counted against the structures
+/// on 2026-09-19, for a store holding cg-shaped event rows:
+///
+/// * `row_positions` -- one hashed entry per live row, whose key is the table
+///   name and the row id. 57 B counted; 82 B allowed here, because hashbrown
+///   rounds the bucket count to a power of two and a table half past a growth
+///   holds twice its settled share.
+/// * `row_version_positions` -- one hashed entry per row id, whose value is a
+///   heap `Vec` that allocates room for four positions the first time one is
+///   filed. 109 B counted, 146 B allowed.
+/// * `sync_source_lsns` and `sync_source_kinds` -- one inner entry each per
+///   row on a table that syncs. Zero on a local import, and charged anyway:
+///   a synced row must not be the one that escapes the limit. 36 B each.
+///
+/// The table-name copy each of the two position maps keeps is charged
+/// separately by [`retained_row_side_map_bytes`], because it is the one part
+/// of this that depends on which table the row is in.
+pub const ROW_SIDE_MAP_BYTES: usize = 82 + 146 + 36 + 36;
+
+/// The slot the table's own `Vec<VersionedRow>` keeps for one row, with the
+/// slack a doubling vector carries: half of a grown vector's slots are empty,
+/// so a row's slot costs up to twice the struct. It is the row's header, not
+/// its values -- those are charged by their own estimate -- and nothing else
+/// charged it.
+pub const ROW_VERSION_SLOT_BYTES: usize = 2 * std::mem::size_of::<VersionedRow>();
+
+/// What the relational store keeps for one row of `table` besides the row's
+/// own values: its slot in the table's vector ([`ROW_VERSION_SLOT_BYTES`]),
+/// the four side maps ([`ROW_SIDE_MAP_BYTES`]) and the copy of the table name
+/// that `row_positions` and `row_version_positions` each keep in their key.
+///
+/// Nesting those two maps by table -- the shape `sync_source_lsns` and
+/// `sync_source_kinds` already use -- would remove both name copies instead of
+/// charging them; it is worth about 72 B of the 14,833 B one cg event holds,
+/// and it is a change to sixty call sites inside the relational store, so this
+/// charges them.
+pub fn retained_row_side_map_bytes(table: &str) -> usize {
+    ROW_SIDE_MAP_BYTES
+        .saturating_add(ROW_VERSION_SLOT_BYTES)
+        .saturating_add(table.len().saturating_mul(2))
+}
+
+/// What holds ONE index posting besides the clone of its key: the map slot it
+/// is filed in and the posting list under it.
+///
+/// An ordered index files the posting in a `BTreeMap`, whose key and value
+/// slots and share of the node header come to 64 B; an exact-only index files
+/// it in a hashed bucket, which comes to about 114 B. Both then allocate a
+/// posting list with room for four postings -- 128 B -- the first time a
+/// posting lands on that key. This is the larger of the two shapes, so neither
+/// under-charges.
+pub const INDEX_POSTING_SLOT_BYTES: usize = 114 + 128;
+
+/// The fixed exact-probe filter an exact-only index allocates: a bitmap that
+/// answers "this key is definitely not here" without touching the map.
+///
+/// It is 64 KiB per index, it does not shrink, and it is held for the life of
+/// the index. Only an index that files EXACT postings -- an automatic
+/// constraint index over a single column -- ever marks or probes one; an
+/// ordered index used to allocate one anyway and could never read it, which is
+/// 393,216 B on one cg-shaped `events` table, and no longer does. What remains
+/// is allocated when the index is created and charged with the table's schema
+/// at the same moment, so a CREATE INDEX that adds an exact index is charged
+/// for its filter and a DROP gives back exactly what the CREATE took.
+///
+/// It is now VISIBLE to a declared limit, which it was not before: a store
+/// with a 4 KiB limit declaring one table with a primary key was holding 64
+/// KiB and reporting room. Whether a fixed 64 KiB negative-probe bitmap in
+/// front of an identity-hashed map is the right size is a read-path question
+/// this charge does not answer; it only stops the bytes being invisible.
+pub const EXACT_PROBE_FILTER_BYTES: usize = 64 * 1024;
+
+/// What one index posting for this row costs the store.
+///
+/// An index keeps a WHOLE clone of every value it keys on, filed under its own
+/// slot, for every row. That clone is the retention `ROW_VALUE_RETENTIONS`
+/// used to stand in for with a flat doubling of the row; charging it against
+/// the index that makes it is what lets the charge follow the schema -- nine
+/// indexes cost nine clones, none costs none, and a CREATE INDEX over an
+/// existing table is charged for the postings it builds because the same
+/// figure is what the table projection re-computes under the new schema.
+///
+/// A column the row does not carry still takes a slot in the key, as a NULL.
+pub fn retained_index_posting_bytes(
+    values: &HashMap<ColName, Value>,
+    index: &crate::table_meta::IndexDecl,
+) -> usize {
+    index.columns.iter().fold(
+        INDEX_POSTING_SLOT_BYTES.saturating_add(
+            index
+                .columns
+                .len()
+                .saturating_mul(std::mem::size_of::<DirectedValue>()),
+        ),
+        |bytes, (column, _)| {
+            bytes.saturating_add(
+                values
+                    .get(column)
+                    .map_or(Value::Null.estimated_bytes(), |value| {
+                        value.estimated_bytes()
+                    }),
+            )
+        },
+    )
+}
+
+/// What every declared index on `meta` costs the store for one row.
+pub fn retained_index_posting_bytes_for_meta(
+    values: &HashMap<ColName, Value>,
+    meta: &crate::table_meta::TableMeta,
+) -> usize {
+    meta.indexes.iter().fold(0usize, |bytes, index| {
+        bytes.saturating_add(retained_index_posting_bytes(values, index))
+    })
+}
 
 /// How many copies of an edge a store keeps.
 ///
@@ -405,9 +530,9 @@ impl Value {
     /// This is a PER-COPY number, and how many copies a store keeps is
     /// decided where the value is RETAINED, not here. Each retention boundary
     /// charges for the copies it keeps: `AdjEntry::estimated_bytes` charges
-    /// both adjacency directions of an edge, and a row's admission charges
-    /// `ROW_VALUE_RETENTIONS` copies because an index over a column keeps a
-    /// whole clone of the value. What those boundaries answer must never be
+    /// both adjacency directions of an edge, and a row's admission charges the
+    /// version the table keeps plus one clone for every index that keys on the
+    /// column. What those boundaries answer must never be
     /// smaller than what is held -- a number below the truth does not fail
     /// loudly, it quietly admits more than the operator allowed -- and never
     /// so far above it that a limit refuses work the machine could have done.
@@ -731,9 +856,10 @@ impl VersionedRow {
     /// What holding this row costs the process.
     ///
     /// The retention boundary for a row: its values are charged
-    /// `ROW_VALUE_RETENTIONS` copies, because an index over any of its
-    /// columns keeps a whole clone of the value and an index can be created
-    /// long after the row was written.
+    /// `ROW_VALUE_RETENTIONS` copies -- one, the version the table keeps.
+    /// What each declared index clones on top of that is charged against that
+    /// index by [`retained_index_posting_bytes`], which needs the table's
+    /// schema; this figure is the fallback for the sites that do not have it.
     pub fn estimated_bytes(&self) -> usize {
         64 + estimate_row_value_bytes(&self.values).saturating_mul(ROW_VALUE_RETENTIONS)
             + self.created_at.map(|_| 8).unwrap_or(0)

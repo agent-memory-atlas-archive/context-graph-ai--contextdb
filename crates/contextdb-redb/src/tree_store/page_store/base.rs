@@ -1,4 +1,4 @@
-use crate::tree_store::page_store::cached_file::WritablePage;
+use crate::tree_store::page_store::cached_file::{PageMemory, WritablePage};
 use crate::tree_store::page_store::page_manager::MAX_MAX_PAGE_ORDER;
 use std::cmp::Ordering;
 #[cfg(debug_assertions)]
@@ -106,6 +106,11 @@ impl PageNumber {
         }
     }
 
+    pub(crate) fn validated_from_le_bytes(bytes: [u8; 8]) -> Option<Self> {
+        let page = Self::from_le_bytes(bytes);
+        (page.page_order <= MAX_MAX_PAGE_ORDER).then_some(page)
+    }
+
     #[cfg(test)]
     pub(crate) fn to_order0(self) -> Vec<PageNumber> {
         let mut pages = vec![self];
@@ -177,14 +182,14 @@ pub(crate) trait Page {
 }
 
 pub struct PageImpl {
-    pub(super) mem: Arc<[u8]>,
+    pub(super) mem: PageMemory,
     pub(super) page_number: PageNumber,
     #[cfg(debug_assertions)]
     pub(super) open_pages: Arc<Mutex<HashMap<PageNumber, u64>>>,
 }
 
 impl PageImpl {
-    pub(crate) fn to_arc(&self) -> Arc<[u8]> {
+    pub(crate) fn to_arc(&self) -> PageMemory {
         self.mem.clone()
     }
 }
@@ -210,7 +215,7 @@ impl Drop for PageImpl {
 
 impl Page for PageImpl {
     fn memory(&self) -> &[u8] {
-        self.mem.as_ref()
+        &self.mem
     }
 
     fn get_page_number(&self) -> PageNumber {
@@ -271,10 +276,20 @@ impl Drop for PageMut<'_> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) enum PageHint {
     None,
     Clean,
+    /// This page belongs to a retained external snapshot. B-tree readers
+    /// validate each page against the checksum carried by its root or parent
+    /// before exposing records from it.
+    Verified,
+}
+
+impl PageHint {
+    pub(crate) fn verifies_path(self) -> bool {
+        matches!(self, Self::Verified)
+    }
 }
 
 pub(crate) enum PageTrackerPolicy {

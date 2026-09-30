@@ -23,6 +23,7 @@ libc = "0.2.174"
 logging = ["dep:log"]
 cache_metrics = []
 test-seams = []
+contextdb-internal = []
 
 [dev-dependencies]
 bincode = "2.0.1"
@@ -59,3 +60,7 @@ host_endian_bytes = "deny"
 [package.metadata.upstream]
 version = "4.1.0"
 registry-checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+
+[[test]]
+name = "open_with_backend_contract"
+path = "tests/open_with_backend_contract.rs"

@@ -745,8 +745,8 @@ fn cp06_table_level_column_immutable_syntax_rejected() {
 }
 
 // ============================================================================
-// SC01 — bincode legacy payloads no longer silently default trailing fields.
-// Pre-v0.4.0 eight-field ColumnDef bincode payloads must fail to decode with
+// SC01 — short bincode payloads no longer silently default trailing fields.
+// Eight-field ColumnDef bincode payloads must fail to decode with
 // a structured error, not silently decode as immutable=false. JSON / map-keyed
 // paths continue to honor serde(default) on the field.
 // ============================================================================
@@ -784,7 +784,7 @@ fn sc01_bincode_legacy_column_def_payload_fails_loudly() {
     let bytes = bincode::serde::encode_to_vec(&old, bincode::config::standard())
         .expect("old-shape ColumnDef must encode with bincode");
 
-    // The new decoder refuses legacy payloads. No silent default of `immutable`.
+    // The new decoder refuses short payloads. No silent default of `immutable`.
     let result: std::result::Result<(contextdb_core::ColumnDef, usize), _> =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard());
     assert!(

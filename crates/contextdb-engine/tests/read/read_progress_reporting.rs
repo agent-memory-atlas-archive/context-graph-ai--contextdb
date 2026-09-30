@@ -2,11 +2,10 @@
 //!
 //! A caller waiting on one blocking call cannot tell a read that is working
 //! from a read that is wedged, and the difference matters most on exactly the
-//! reads that take long enough to worry about: a large store being opened, a
-//! scan walking many rows to find few. So a caller may hand a session an
-//! observer and be told what the read has done so far -- store bytes loaded
-//! while the store is being opened, then rows, bytes, items and milliseconds
-//! while the answer is being assembled.
+//! reads that take long enough to worry about, such as a scan walking many
+//! rows to find few. So a caller may hand a session an observer and be told
+//! what the read has done while the answer is being assembled. Opening an
+//! on-demand reader authenticates its committed root without walking row bodies.
 //!
 //! What the observer is told is what had happened at the moment it was told:
 //! the report is made inline, on the thread running the read, and nothing
@@ -228,13 +227,12 @@ fn a_scan_reports_the_answer_it_has_assembled_while_it_is_still_assembling_it() 
 }
 
 #[test]
-fn opening_a_large_store_reports_the_bytes_it_has_loaded() {
+fn opening_a_large_store_loads_no_row_bodies_before_the_first_read() {
     let directory = tempfile::TempDir::new().expect("task-scoped progress directory");
     let path = directory.path().join("hydrating.db");
     seed_store(&path);
 
     let recorder = Arc::new(Recorder::default());
-    let this_thread = std::thread::current().id();
     let session = ReadSession::open_with_progress(
         &path,
         ReadSessionOptions::default(),
@@ -242,36 +240,24 @@ fn opening_a_large_store_reports_the_bytes_it_has_loaded() {
     )
     .expect("open the idle store with progress reporting");
 
-    let hydrating = recorder.of_phase(ReadPhase::Hydrating);
     assert!(
-        !hydrating.is_empty(),
-        "opening a store of more than a megabyte reports the load at least once"
+        recorder.of_phase(ReadPhase::Hydrating).is_empty(),
+        "opening retains the authenticated root and directories without loading the large row body"
     );
-    for (progress, thread) in recorder.reports() {
-        assert_eq!(
-            progress.phase,
-            ReadPhase::Hydrating,
-            "opening runs no statement"
-        );
-        assert_eq!(
-            thread, this_thread,
-            "hydration reports on the opening thread"
-        );
-        assert_eq!(progress.rows, 0, "a hydrating read has assembled no rows");
-        assert_eq!(
-            progress.bytes, 0,
-            "a hydrating read has assembled no answer"
-        );
-        assert_eq!(
-            progress.total_bytes, None,
-            "a total that would have to be estimated is reported as absent, not guessed"
-        );
-    }
-    assert_reporting_cadence(&hydrating, |progress| progress.loaded_bytes);
-    let last = hydrating.last().expect("at least one report");
-    assert!(
-        last.loaded_bytes >= 1024 * 1024,
-        "the reported load covers the store that was actually read: {last:?}"
+
+    let answered = session
+        .execute(
+            "SELECT marker, payload FROM progress_rows WHERE id = $id",
+            &HashMap::from([("id".to_owned(), Value::Int64(NEEDLES[2]))]),
+        )
+        .expect("the on-demand point read answers within the unchanged read budget");
+    assert_eq!(
+        answered.rows,
+        vec![vec![
+            Value::Text("needle".to_owned()),
+            Value::Text(payload(NEEDLES[2]))
+        ]],
+        "the root-only open still serves the requested public row from its authenticated page"
     );
 
     drop(session);

@@ -1,4 +1,4 @@
-//! The `migrate` / `reset` / `diagnose` / `snapshot` / `inspect` / `purge`
+//! The `reset` / `diagnose` / `snapshot` / `inspect` / `purge`
 //! store-maintenance subcommands.
 //!
 //! Dispatch happens BEFORE the existing REPL's `clap` parsing (see
@@ -9,211 +9,11 @@
 
 use crate::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 use contextdb_engine::Database;
-#[cfg(feature = "test-seams")]
-use contextdb_engine::database::MigrationBoundary;
-use contextdb_engine::database::{MigrationFailureStage, MigrationReceipt, SnapshotInspector};
+use contextdb_engine::database::SnapshotInspector;
 use contextdb_engine::persistence::RedbPersistence;
 use contextdb_engine::sync_types::NaturalKey;
 use contextdb_engine::work_ledger::BlobHash;
-use std::path::{Path, PathBuf};
-
-/// Test-only coordination at the real migration replacement boundaries.
-/// The seam observes and pauses the production operation; it never acquires
-/// or substitutes for either the source-store guard or a competing writer.
-#[cfg(feature = "test-seams")]
-#[doc(hidden)]
-pub mod migration_replacement_test_scaffold {
-    use std::collections::VecDeque;
-    use std::sync::{Condvar, Mutex, OnceLock};
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MigrationReplacementBoundary {
-        SourceGuardAcquired,
-        TemporaryStoreOpened,
-        TemporaryStoreImported,
-        SourceStoreSealed,
-        TemporaryStoreBuilt,
-        TemporaryStoreDurablyPreparedAndOwned,
-        BeforeAtomicSwap,
-        AfterAtomicSwap,
-        TemporaryCompanionCleaned,
-        BeforeFinalGuardRelease,
-    }
-
-    impl MigrationReplacementBoundary {
-        pub const ALL: [Self; 10] = [
-            Self::SourceGuardAcquired,
-            Self::TemporaryStoreOpened,
-            Self::TemporaryStoreImported,
-            Self::SourceStoreSealed,
-            Self::TemporaryStoreBuilt,
-            Self::TemporaryStoreDurablyPreparedAndOwned,
-            Self::BeforeAtomicSwap,
-            Self::AfterAtomicSwap,
-            Self::TemporaryCompanionCleaned,
-            Self::BeforeFinalGuardRelease,
-        ];
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MigrationReplacementEvent {
-        Checkpoint(MigrationReplacementBoundary),
-        CompletedAfterGuardRelease,
-        FinishedBeforeExpectedCheckpoint {
-            expected: MigrationReplacementBoundary,
-        },
-        UnexpectedCheckpoint {
-            expected: MigrationReplacementBoundary,
-            actual: MigrationReplacementBoundary,
-        },
-    }
-
-    #[derive(Debug, Default)]
-    struct MigrationReplacementState {
-        armed: bool,
-        expected: VecDeque<MigrationReplacementBoundary>,
-        reached: Option<MigrationReplacementBoundary>,
-        released: bool,
-        finished: bool,
-        unexpected: Option<(MigrationReplacementBoundary, MigrationReplacementBoundary)>,
-    }
-
-    static MIGRATION_REPLACEMENT: OnceLock<(Mutex<MigrationReplacementState>, Condvar)> =
-        OnceLock::new();
-
-    // The migration's two irreversible filesystem steps -- the atomic swap
-    // and the generated companion's removal -- belong to the engine door that
-    // performs them, and so do the injectors that make them fail. They are
-    // named here so a proof written against this command keeps reaching for
-    // them where it always did.
-    pub use contextdb_engine::database::migration_fault_seam::{
-        FinalRenameFaultGuard, TemporaryCompanionCleanupFaultGuard,
-        TemporaryCompanionCleanupFaultObservation, arm_final_rename_failure_for_test,
-        arm_temporary_companion_cleanup_failure_for_test,
-    };
-
-    fn migration_replacement() -> &'static (Mutex<MigrationReplacementState>, Condvar) {
-        MIGRATION_REPLACEMENT.get_or_init(|| {
-            (
-                Mutex::new(MigrationReplacementState::default()),
-                Condvar::new(),
-            )
-        })
-    }
-
-    pub fn arm_migration_replacement_sequence_for_test() {
-        let (state, _) = migration_replacement();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(
-            !state.armed,
-            "migration replacement sequence is already armed"
-        );
-        *state = MigrationReplacementState {
-            armed: true,
-            expected: MigrationReplacementBoundary::ALL.into_iter().collect(),
-            reached: None,
-            released: false,
-            finished: false,
-            unexpected: None,
-        };
-    }
-
-    pub fn next_migration_replacement_event_for_test() -> MigrationReplacementEvent {
-        let (state, changed) = migration_replacement();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        loop {
-            if let Some((expected, actual)) = state.unexpected.take() {
-                *state = MigrationReplacementState::default();
-                changed.notify_all();
-                return MigrationReplacementEvent::UnexpectedCheckpoint { expected, actual };
-            }
-            if let Some(boundary) = state.reached {
-                return MigrationReplacementEvent::Checkpoint(boundary);
-            }
-            if state.finished {
-                let event = match state.expected.front().copied() {
-                    Some(expected) => {
-                        MigrationReplacementEvent::FinishedBeforeExpectedCheckpoint { expected }
-                    }
-                    None => MigrationReplacementEvent::CompletedAfterGuardRelease,
-                };
-                *state = MigrationReplacementState::default();
-                changed.notify_all();
-                return event;
-            }
-            state = changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-    }
-
-    pub fn release_migration_replacement_checkpoint_for_test() {
-        let (state, changed) = migration_replacement();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let reached = state
-            .reached
-            .take()
-            .expect("migration replacement checkpoint was not reached");
-        assert_eq!(state.expected.pop_front(), Some(reached));
-        state.released = true;
-        changed.notify_all();
-    }
-
-    pub fn finish_migration_replacement_sequence_for_test() {
-        let (state, changed) = migration_replacement();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.armed {
-            state.finished = true;
-            changed.notify_all();
-        }
-    }
-
-    pub fn cancel_migration_replacement_sequence_for_test() {
-        let (state, changed) = migration_replacement();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *state = MigrationReplacementState::default();
-        changed.notify_all();
-    }
-
-    pub(crate) fn migration_replacement_checkpoint_for_test(
-        boundary: MigrationReplacementBoundary,
-    ) {
-        let (state, changed) = migration_replacement();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !state.armed {
-            return;
-        }
-        let Some(expected) = state.expected.front().copied() else {
-            return;
-        };
-        if expected != boundary {
-            state.unexpected = Some((expected, boundary));
-            changed.notify_all();
-            return;
-        }
-        state.reached = Some(boundary);
-        state.released = false;
-        changed.notify_all();
-        while state.armed && !state.released {
-            state = changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        state.released = false;
-    }
-}
+use std::path::Path;
 
 /// If `raw_args[1]` names one of the store-maintenance subcommands, run its
 /// handler and return the process exit code to use. `None` means "not one
@@ -231,7 +31,6 @@ pub fn dispatch_if_subcommand(raw_args: &[String]) -> Option<i32> {
 /// here, so the two surfaces cannot disagree about which words exist.
 pub fn run_operational(name: &str, args: &[String]) -> Option<i32> {
     match name {
-        "migrate" => Some(run_migrate(args)),
         "reset" => Some(run_reset(args)),
         "diagnose" => Some(run_diagnose(args)),
         "snapshot" => Some(run_snapshot(args)),
@@ -541,7 +340,7 @@ fn copy_migration_backup(source: &Path, destination: &Path) -> std::io::Result<u
     if source_path_before.file_type().is_symlink() || !source_path_before.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "migration source is not a direct regular file",
+            "backup source is not a direct regular file",
         ));
     }
     let mut source_options = std::fs::OpenOptions::new();
@@ -555,7 +354,7 @@ fn copy_migration_backup(source: &Path, destination: &Path) -> std::io::Result<u
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "migration source changed while its backup was opened",
+            "backup source changed while it was opened",
         ));
     }
     #[cfg(unix)]
@@ -568,7 +367,7 @@ fn copy_migration_backup(source: &Path, destination: &Path) -> std::io::Result<u
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "migration source inode changed while its backup was opened",
+                "backup source inode changed while it was opened",
             ));
         }
     }
@@ -598,7 +397,7 @@ fn copy_migration_backup(source: &Path, destination: &Path) -> std::io::Result<u
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "migration source size or type changed while its backup was copied",
+                    "backup source size or type changed while it was copied",
                 ));
             }
             #[cfg(unix)]
@@ -611,7 +410,7 @@ fn copy_migration_backup(source: &Path, destination: &Path) -> std::io::Result<u
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "migration source inode changed while its backup was copied",
+                        "backup source inode changed while it was copied",
                     ));
                 }
             }
@@ -628,7 +427,7 @@ fn copy_migration_backup(source: &Path, destination: &Path) -> std::io::Result<u
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "migration backup path changed while it was published",
+                    "backup path changed while it was published",
                 ));
             }
             #[cfg(unix)]
@@ -646,7 +445,7 @@ fn copy_migration_backup(source: &Path, destination: &Path) -> std::io::Result<u
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "migration backup inode changed while it was published",
+                        "backup inode changed while it was published",
                     ));
                 }
             }
@@ -679,215 +478,6 @@ fn copy_migration_backup(source: &Path, destination: &Path) -> std::io::Result<u
             Err(error)
         }
     }
-}
-
-/// `contextdb migrate <path>` — migrate a legacy-format store in place:
-/// back up the original untouched, read every row/edge/vector/DDL statement
-/// out of it via the engine's own legacy-tolerant loader, write it into a
-/// fresh current-format root, then atomically swap it in. Refuses (leaving
-/// the path untouched) on a store that is already current-format, and on any
-/// failure before the atomic swap.
-fn run_migrate(args: &[String]) -> i32 {
-    let Some(path_str) = positional_path(args) else {
-        eprintln!("Error: migrate requires a database path");
-        return EXIT_USAGE;
-    };
-    // Resolve the source once. Every lock, backup, temporary sibling, swap,
-    // publication, and message below uses this exact identity, so a symlink
-    // spelling cannot coordinate one pathname and replace another.
-    let path = match std::fs::canonicalize(Path::new(path_str)) {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("Error: '{}' could not be migrated: {err}", path_str);
-            return EXIT_ERROR;
-        }
-    };
-
-    // Detect: is this already current-format, or genuinely legacy? Uses a
-    // read-only handle (`RedbPersistence::is_legacy_format_store`) rather
-    // than a normal `Database::open` — opening a redb file read-write
-    // performs a housekeeping write on every open regardless of any
-    // application transaction, which would violate "a refused migrate must
-    // never modify the store it declined to touch" for an already-current
-    // root, and would silently perturb the legacy root's bytes before the
-    // backup below is even taken.
-    match RedbPersistence::is_legacy_format_store(&path) {
-        Ok(false) => {
-            eprintln!(
-                "Error: '{}' is already current-format; there is nothing to migrate.",
-                path.display()
-            );
-            return EXIT_ERROR;
-        }
-        Ok(true) => {
-            // Confirmed legacy — proceed below.
-        }
-        Err(err) => {
-            eprintln!("Error: '{}' could not be migrated: {err}", path.display());
-            return EXIT_ERROR;
-        }
-    }
-
-    // Never overwrite a prior backup. A symlink at this name counts as an
-    // existing destination and is never followed or replaced.
-    let mut backup_name = path.as_os_str().to_os_string();
-    backup_name.push(".bak");
-    let backup_path = PathBuf::from(backup_name);
-    match std::fs::symlink_metadata(&backup_path) {
-        Ok(_) => {
-            eprintln!(
-                "Error: a backup already exists at '{}'; migrate refuses to overwrite it. Move or \
-                 remove it first if it is no longer needed.",
-                backup_path.display()
-            );
-            return EXIT_ERROR;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            eprintln!(
-                "Error: backup destination '{}' could not be inspected: {error}",
-                backup_path.display()
-            );
-            return EXIT_ERROR;
-        }
-    }
-
-    // This migration-only source owns the original companion guard and an
-    // exclusive lock on the exact old-store descriptor without opening Redb
-    // writable yet. The first source read consumes that same descriptor into
-    // Redb after the untouched backup; no pathname-global reentrancy or
-    // unlock/reopen gap is involved.
-    let legacy_db = match Database::open_legacy_for_migration(&path) {
-        Ok(db) => db,
-        Err(err) => {
-            eprintln!("Error: '{}' could not be migrated: {err}", path.display());
-            return EXIT_ERROR;
-        }
-    };
-    #[cfg(feature = "test-seams")]
-    migration_replacement_test_scaffold::migration_replacement_checkpoint_for_test(
-        migration_replacement_test_scaffold::MigrationReplacementBoundary::SourceGuardAcquired,
-    );
-
-    // Copy only after exclusive migration ownership is established and
-    // before writable Redb hydration can perform open-time housekeeping.
-    // By this point the source pathname may already have been unlinked or
-    // replaced -- the guard, not the name, is what this migration owns. The
-    // backup therefore reads through the descriptor locked when the guard
-    // was acquired and never resolves the source pathname again.
-    #[cfg(unix)]
-    let backup_result = legacy_db
-        .copy_locked_source_to(&backup_path)
-        .map_err(|err| err.to_string());
-    #[cfg(not(unix))]
-    let backup_result = copy_migration_backup(&path, &backup_path).map_err(|err| err.to_string());
-    if let Err(err) = backup_result {
-        let _ = legacy_db.close();
-        eprintln!(
-            "Error: failed to write a backup at '{}' before migrating '{}': {err}",
-            backup_path.display(),
-            path.display()
-        );
-        return EXIT_ERROR;
-    }
-    // Opening the fresh current-format root, importing every row, copying
-    // keyless-table current state, durably recording and preparing the exact
-    // target, swapping it into place, dropping the generated companion and
-    // releasing both guards is the engine's one door, and so is deciding what
-    // gets published and where: the door republishes the validated source at
-    // its own pathname, names its own target, and reads the source's own
-    // keyless rows. This command renders whichever phase the door reports and
-    // receives a receipt; it never holds a handle onto the store being built,
-    // and never performs the swap that publishes it. A test build watches the
-    // door's boundaries through the engine's own observation seam; a
-    // production build installs nothing.
-    #[cfg(feature = "test-seams")]
-    contextdb_engine::database::migration_boundary_seam::install_boundary_observer_for_test(
-        std::sync::Arc::new(|boundary: MigrationBoundary| {
-            use migration_replacement_test_scaffold::MigrationReplacementBoundary as ScaffoldBoundary;
-            let mapped = match boundary {
-                MigrationBoundary::TemporaryStoreOpened => ScaffoldBoundary::TemporaryStoreOpened,
-                MigrationBoundary::TemporaryStoreImported => {
-                    ScaffoldBoundary::TemporaryStoreImported
-                }
-                MigrationBoundary::SourceStoreSealed => ScaffoldBoundary::SourceStoreSealed,
-                MigrationBoundary::TemporaryStoreBuilt => ScaffoldBoundary::TemporaryStoreBuilt,
-                MigrationBoundary::TemporaryStoreDurablyPreparedAndOwned => {
-                    ScaffoldBoundary::TemporaryStoreDurablyPreparedAndOwned
-                }
-                MigrationBoundary::BeforeAtomicSwap => ScaffoldBoundary::BeforeAtomicSwap,
-                MigrationBoundary::AfterAtomicSwap => ScaffoldBoundary::AfterAtomicSwap,
-                MigrationBoundary::TemporaryCompanionCleaned => {
-                    ScaffoldBoundary::TemporaryCompanionCleaned
-                }
-                MigrationBoundary::BeforeFinalGuardRelease => {
-                    ScaffoldBoundary::BeforeFinalGuardRelease
-                }
-            };
-            migration_replacement_test_scaffold::migration_replacement_checkpoint_for_test(mapped);
-        }),
-    );
-
-    let migrated = legacy_db.migrate_in_place();
-    #[cfg(feature = "test-seams")]
-    contextdb_engine::database::migration_boundary_seam::clear_boundary_observer_for_test();
-    let receipt = match migrated {
-        Ok(receipt) => receipt,
-        Err(err) => {
-            match err.stage() {
-                MigrationFailureStage::BeforeSwap => eprintln!(
-                    "Error: '{}' has a backup at '{}', but {err}",
-                    path.display(),
-                    backup_path.display()
-                ),
-                MigrationFailureStage::AtSwap => eprintln!(
-                    "Error: migrating '{}' failed at the final swap: {err}. The store is \
-                     unchanged and still usable, its pre-migration backup is at '{}', and every \
-                     artifact the migration generated has been removed.",
-                    path.display(),
-                    backup_path.display()
-                ),
-                MigrationFailureStage::AfterSwap => eprintln!(
-                    "Error: '{}' was migrated, but replacement publication or final source close \
-                     failed: {err}",
-                    path.display()
-                ),
-            }
-            return EXIT_ERROR;
-        }
-    };
-    let MigrationReceipt {
-        applied_rows,
-        keyless_rows_copied,
-        keyless_table_receipts,
-    } = receipt;
-
-    let message = if keyless_rows_copied > 0 {
-        let mut lines = vec![format!(
-            "migrated '{}' in place ({applied_rows} rows from changeset + {keyless_rows_copied} \
-             keyless-table rows from current state); the pre-migration store is backed up at '{}'.",
-            path.display(),
-            backup_path.display()
-        )];
-        for (table_name, copied) in &keyless_table_receipts {
-            if *copied > 0 {
-                lines.push(format!(
-                    "  - keyless table '{table_name}': {copied} row(s) copied from current \
-                     state (current-state-only; a changeset cannot carry a keyless row)."
-                ));
-            }
-        }
-        lines.join("\n")
-    } else {
-        format!(
-            "migrated '{}' in place ({applied_rows} rows applied); the pre-migration store is \
-             backed up at '{}'.",
-            path.display(),
-            backup_path.display()
-        )
-    };
-    println!("{}", message);
-    EXIT_OK
 }
 
 /// `contextdb reset <path> --force` — recreate a wedged/corrupt store
@@ -996,8 +586,8 @@ fn run_purge(args: &[String]) -> i32 {
 
 /// `contextdb diagnose <path>` — report what is salvageable/diagnosable in
 /// a store (which format marker it carries, whether the schema layout is
-/// current or legacy), without modifying a healthy one. Uses the same
-/// detection `migrate` does (`RedbPersistence::is_legacy_format_store`),
+/// current or incompatible), without modifying a healthy one. Uses
+/// `RedbPersistence::is_legacy_format_store`,
 /// which reads through a read-only handle rather than a normal
 /// `Database::open` — a plain read-write open performs a housekeeping write
 /// on every open regardless of any application transaction, which would
@@ -1025,11 +615,8 @@ fn run_diagnose(args: &[String]) -> i32 {
         }
         Ok(true) => {
             println!(
-                "diagnose: '{}' is a legacy-format store (its on-disk schema layout predates this \
-                 release), not corrupt.\nThis report is diagnosis, not a schema-level \
-                 in-place repair; a healthy store is not modified. \
-                 Run `contextdb migrate {}` to migrate it in place.",
-                path.display(),
+                "diagnose: '{}' was written by an earlier build. This store is not read. \
+                 Move it aside and create the store again.",
                 path.display()
             );
             EXIT_ERROR

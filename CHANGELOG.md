@@ -4,6 +4,15 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Added.** `Database::register_transactional_trigger_callback` is the documented
+  name for transactional trigger handlers; `register_trigger_callback` remains available.
+- **Added.** Post-commit sink delivery reports uncertain outcomes through
+  `SinkError::OutcomeUncertain`; `.events status` exposes the `uncertain` count.
+- **Added.** `MAINTAIN COUNT` declares which count prefixes are kept up to date.
+- **Added.** Synced `DROP COLUMN` and `RENAME COLUMN` replay their explicit authored changes.
+- **Behavior change.** The default F32 `EF_SEARCH` is narrower for layouts of
+  5,000 vectors or fewer.
+
 - **Fixed.** A dotted command with an unknown trailing argument, including
   `.sync status --json`, is refused with that command's usage text and a
   non-zero exit. Plain `.sync status` is unchanged.
@@ -34,8 +43,7 @@ Earlier versions: see git tags.
 - **Sync compatibility.** This release emits and accepts sync **protocol 7**. When a later release
   adds schema vocabulary, a peer that cannot read it holds back only the table that declares it,
   with a diagnostic naming the table, capability, and node to upgrade, while other tables keep
-  syncing. The supported skew window is the current protocol plus the two previous released
-  protocols.
+  syncing. Sync envelopes using any protocol other than the current version are refused.
 
 - **Distribution and maintenance.** The engine's registry dependency is the maintained
   `contextdb-redb` 4.1.0 package, retaining library name `redb`, published before the engine.
@@ -140,9 +148,8 @@ Earlier versions: see git tags.
   `.schema` answers under `schema`. There is no `--all` flag and no row cap to disable: a result
   publishes complete or refuses with `owner_limit_exceeded` under the declared
   `--read-result-rows` / `--read-result-bytes` ceilings, and the refusal carries the
-  `.cursor open` command that pages it. Diagnosis and format upgrades go through the sanctioned
-  `contextdb diagnose <path>` and one-door `contextdb migrate <path>` surface; the old repair
-  guidance is gone.
+  `.cursor open` command that pages it. `contextdb diagnose <path>` reports a
+  store written by an earlier build without modifying it.
 - **Removed.** The `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` environment override for the same-DB
   trigger deadlock guard is gone; no environment variable adjusts it anymore, matching the
   environment-is-not-a-behavior-surface convention. The guard keeps its fixed 60-second default.
@@ -231,9 +238,8 @@ Earlier versions: see git tags.
   author identity, and hub acceptance position; and `PushResponse` gains the
   structured authority-refusal error. A peer speaking a different protocol version is
   refused loudly on push, pull, and the status exchange — no rows move and no
-  watermark advances on either side — with a message naming the remedy
-  (upgrade both ends). A mixed fleet simply stops syncing until every
-  participant is on the same release; nothing is lost, because neither side's
+  watermark advances on either side — with a message naming the required protocol.
+  Sync resumes when participants use the same protocol version; nothing is lost, because neither side's
   watermark ever advances against a refused exchange.
 - **Behavior change (semantic correction).** `LatestWins` conflict resolution
   no longer compares two machines' unrelated write clocks. Previously, the
@@ -297,7 +303,7 @@ Earlier versions: see git tags.
 - **Changed.** Version cleanup (`Database::compact_currency_versions`) and retention (`Database::run_pruning_cycle`) now remove exactly the row versions, change-log entries, and (for cleanup) attached vector copies being reclaimed in bounded, point-removal redb transactions, instead of rewriting every surviving row, vector, and change-log entry of the database on every pass. Cost is proportional to what is reclaimed, not to the size of the database. The commit index is trimmed candidate-only in the same pass rather than left to grow forever. Cleanup eligibility is now driven by each table's declared `HISTORY CURRENT ONLY`, not a hardcoded table-name list — any table may opt in.
 - **Behavior change.** An arriving `AlterTable` (a declaration change received over sync) now starts the maintenance loop on the receiving machine immediately, without waiting for the next process restart — this also fixes a `RETAIN` window arriving on an existing table via sync, which previously would not begin pruning until reopen.
 - **Fixed.** The engine's maintenance-cycle receipt line moved from `println!` to a structured `tracing::info!`, so an embedding consumer no longer sees engine text on its own stdout.
-- **Fixed.** `contextdb-core::TableMeta`'s hand-written positional decoder now genuinely tolerates an on-disk payload written before `conflict_policy`/`history_policy` existed (decoding the missing fields as undeclared) instead of hard-failing — the fix is scoped to those two newest fields; a payload predating `indexes` (or, for `ColumnDef`, predating `immutable`) still refuses to load, unchanged, since silently defaulting either of those would be a safety regression.
+- **Fixed.** `contextdb-core::TableMeta`'s positional decoder defaults absent `conflict_policy` and `history_policy` tail fields to undeclared. Required positional fields still refuse truncation: missing `indexes`, or a `ColumnDef` missing `immutable`, cannot silently acquire defaults. Store opening separately enforces the required format and schema layout.
 - **Breaking.** `contextdb-tx`'s `TxManager` is renamed `TransactionManager`.
 - **Breaking.** `contextdb-server`'s `BlobService` is renamed `BlobStore`, and `WorkerConfig`'s `blob_service` field is renamed `blob_store`.
 - **Breaking.** `contextdb_cli`'s `repl` module is now private. Consumers import `run`, `OutputOptions`, and the `EXIT_*` constants from the crate root (`contextdb_cli::{run, OutputOptions, EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_INTERRUPTED_PUSH_UNCONFIRMED}`) instead of `contextdb_cli::repl`.

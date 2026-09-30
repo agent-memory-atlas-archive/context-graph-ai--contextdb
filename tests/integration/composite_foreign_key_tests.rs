@@ -1743,9 +1743,12 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
         "ALTER TABLE wire round trip must preserve structured constraints"
     );
 
+    // A table DDL record that lacks the structured constraint fields is a
+    // short record, not a declaration without keys: both codecs refuse it, so
+    // no reader can turn a missing field into "this table has no foreign key".
     #[derive(serde::Serialize)]
     #[allow(dead_code, clippy::enum_variant_names)]
-    enum LegacyDdlChange {
+    enum ShortDdlChange {
         CreateTable {
             name: String,
             columns: Vec<(String, String)>,
@@ -1760,90 +1763,29 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
             constraints: Vec<String>,
         },
     }
-    let legacy = LegacyDdlChange::CreateTable {
-        name: "legacy".into(),
-        columns: Vec::new(),
-        constraints: Vec::new(),
-    };
-    let legacy_bytes = rmp_serde::to_vec_named(&legacy).unwrap();
-    let decoded_legacy: DdlChange = rmp_serde::from_slice(&legacy_bytes).unwrap();
-    match decoded_legacy {
-        DdlChange::CreateTable {
-            foreign_keys,
-            composite_foreign_keys,
-            composite_unique,
-            ..
-        } => {
-            assert!(
-                foreign_keys.is_empty()
-                    && composite_foreign_keys.is_empty()
-                    && composite_unique.is_empty()
-            );
-        }
-        _ => unreachable!(),
-    }
-    let legacy_bincode =
-        bincode::serde::encode_to_vec(&legacy, bincode::config::standard()).unwrap();
-    let (decoded_legacy, _): (DdlChange, usize) =
-        bincode::serde::decode_from_slice(&legacy_bincode, bincode::config::standard()).unwrap();
-    match decoded_legacy {
-        DdlChange::CreateTable {
-            foreign_keys,
-            composite_foreign_keys,
-            composite_unique,
-            ..
-        } => {
-            assert!(
-                foreign_keys.is_empty()
-                    && composite_foreign_keys.is_empty()
-                    && composite_unique.is_empty(),
-                "legacy bincode DDL log decode must default new structured fields"
-            );
-        }
-        _ => unreachable!(),
-    }
-
-    let legacy_alter = LegacyDdlChange::AlterTable {
-        name: "legacy".into(),
-        columns: Vec::new(),
-        constraints: Vec::new(),
-    };
-    let legacy_bytes = rmp_serde::to_vec_named(&legacy_alter).unwrap();
-    let decoded_legacy: DdlChange = rmp_serde::from_slice(&legacy_bytes).unwrap();
-    match decoded_legacy {
-        DdlChange::AlterTable {
-            foreign_keys,
-            composite_foreign_keys,
-            composite_unique,
-            ..
-        } => {
-            assert!(
-                foreign_keys.is_empty()
-                    && composite_foreign_keys.is_empty()
-                    && composite_unique.is_empty()
-            );
-        }
-        _ => unreachable!(),
-    }
-    let legacy_bincode =
-        bincode::serde::encode_to_vec(&legacy_alter, bincode::config::standard()).unwrap();
-    let (decoded_legacy, _): (DdlChange, usize) =
-        bincode::serde::decode_from_slice(&legacy_bincode, bincode::config::standard()).unwrap();
-    match decoded_legacy {
-        DdlChange::AlterTable {
-            foreign_keys,
-            composite_foreign_keys,
-            composite_unique,
-            ..
-        } => {
-            assert!(
-                foreign_keys.is_empty()
-                    && composite_foreign_keys.is_empty()
-                    && composite_unique.is_empty(),
-                "legacy bincode ALTER DDL log decode must default new structured fields"
-            );
-        }
-        _ => unreachable!(),
+    for short in [
+        ShortDdlChange::CreateTable {
+            name: "short".into(),
+            columns: Vec::new(),
+            constraints: Vec::new(),
+        },
+        ShortDdlChange::AlterTable {
+            name: "short".into(),
+            columns: Vec::new(),
+            constraints: Vec::new(),
+        },
+    ] {
+        let named = rmp_serde::to_vec_named(&short).unwrap();
+        assert!(
+            rmp_serde::from_slice::<DdlChange>(&named).is_err(),
+            "a table DDL record without its structured constraint fields is refused"
+        );
+        let packed = bincode::serde::encode_to_vec(&short, bincode::config::standard()).unwrap();
+        assert!(
+            bincode::serde::decode_from_slice::<DdlChange, _>(&packed, bincode::config::standard())
+                .is_err(),
+            "a table DDL record without its structured constraint fields is refused"
+        );
     }
 }
 

@@ -5,7 +5,7 @@ use crate::tree_store::btree_base::{
 use crate::tree_store::btree_mutator::DeletionResult::{
     DeletedBranch, DeletedLeaf, PartialBranch, PartialLeaf, Subtree,
 };
-use crate::tree_store::page_store::{Page, PageImpl, PageMut};
+use crate::tree_store::page_store::{Page, PageImpl, PageMemory, PageMut};
 use crate::tree_store::{
     AccessGuardMutInPlace, BtreeHeader, PageHint, PageNumber, PageTrackerPolicy, RawLeafBuilder,
     TransactionalMemory,
@@ -25,7 +25,7 @@ enum DeletionResult {
     DeletedLeaf,
     // A leaf with fewer entries than desired
     PartialLeaf {
-        page: Arc<[u8]>,
+        page: PageMemory,
         deleted_pair: usize,
     },
     // A branch page subtree with fewer children than desired.
@@ -39,13 +39,53 @@ enum DeletionResult {
     DeletedBranch(PageNumber, Checksum),
 }
 
+// A bounded separator keeps its source-window charge until the parent has
+// copied the key into its allocated branch page.
+enum InsertionKey {
+    Owned(Vec<u8>),
+    #[cfg(feature = "contextdb-internal")]
+    Window(PageMemory),
+}
+
+impl From<Vec<u8>> for InsertionKey {
+    fn from(key: Vec<u8>) -> Self {
+        Self::Owned(key)
+    }
+}
+
+impl std::ops::Deref for InsertionKey {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(key) => key,
+            #[cfg(feature = "contextdb-internal")]
+            Self::Window(key) => key,
+        }
+    }
+}
+
+impl InsertionKey {
+    fn split_key(bytes: &[u8], source: Option<&Self>) -> Self {
+        #[cfg(feature = "contextdb-internal")]
+        if let Some(Self::Window(window)) = source
+            && std::ptr::eq(bytes, &raw const **window)
+        {
+            return Self::Window(window.clone());
+        }
+        #[cfg(not(feature = "contextdb-internal"))]
+        let _ = source;
+        Self::Owned(bytes.to_vec())
+    }
+}
+
 struct InsertionResult<'a, V: Value + 'static> {
     // the new root page
     new_root: PageNumber,
     // checksum of the root page
     root_checksum: Checksum,
     // Following sibling, if the root had to be split
-    additional_sibling: Option<(Vec<u8>, PageNumber, Checksum)>,
+    additional_sibling: Option<(InsertionKey, PageNumber, Checksum)>,
     // The inserted value for .insert_reserve() to use
     inserted_value: AccessGuardMutInPlace<'a, V>,
     // The previous value, if any
@@ -63,7 +103,7 @@ pub(crate) struct MutateHelper<'a, 'b, K: Key, V: Value> {
     _lifetime: PhantomData<&'a ()>,
 }
 
-impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
+impl<'a, 'b, K: Key + 'static, V: Value> MutateHelper<'a, 'b, K, V> {
     pub(crate) fn new(
         root: &'b mut Option<BtreeHeader>,
         mem: Arc<TransactionalMemory>,
@@ -107,9 +147,13 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
             let mut allocated = self.allocated.lock().unwrap();
             if !self.mem.free_if_uncommitted(page_number, &mut allocated) {
                 self.freed.push(page_number);
+                #[cfg(feature = "test-seams")]
+                crate::commit_work::note_freed_page();
             }
         } else {
             self.freed.push(page_number);
+            #[cfg(feature = "test-seams")]
+            crate::commit_work::note_freed_page();
         }
     }
 
@@ -191,7 +235,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         }) = *self.root
         {
             let result = self.insert_helper(
-                self.mem.get_page(p, PageHint::None)?,
+                p,
                 checksum,
                 K::as_bytes(key).as_ref(),
                 V::as_bytes(value).as_ref(),
@@ -243,11 +287,77 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
 
     fn insert_helper(
         &mut self,
-        page: PageImpl,
+        page_number: PageNumber,
         page_checksum: Checksum,
         key: &[u8],
         value: &[u8],
     ) -> Result<InsertionResult<'a, V>> {
+        // Preserve the existing singleton split without faulting its unrelated
+        // value. Restrict this ordering shortcut to the built-in byte key.
+        #[cfg(feature = "contextdb-internal")]
+        if std::any::TypeId::of::<K>() == std::any::TypeId::of::<&[u8]>()
+            && let Some(layout) = super::bounded_bytes::singleton(
+                &self.mem,
+                page_number,
+                PageHint::None,
+                K::fixed_width(),
+                V::fixed_width(),
+            )?
+        {
+            let ordering = super::bounded_bytes::compare_key(
+                &self.mem,
+                page_number,
+                layout.key.clone(),
+                key,
+                PageHint::None,
+            )?;
+            let separator = match ordering {
+                std::cmp::Ordering::Less => Some(InsertionKey::Owned(key.to_vec())),
+                std::cmp::Ordering::Greater
+                    if super::btree_base::RawBranchBuilder::required_bytes(
+                        1,
+                        layout.key.len(),
+                        K::fixed_width(),
+                    ) <= self.mem.get_page_size() =>
+                {
+                    Some(InsertionKey::Window(self.mem.get_page_window(
+                        page_number,
+                        layout.key,
+                        PageHint::None,
+                    )?))
+                }
+                _ => None,
+            };
+            if let Some(separator) = separator {
+                let mut builder = LeafBuilder::new(
+                    &self.mem,
+                    &self.allocated,
+                    1,
+                    K::fixed_width(),
+                    V::fixed_width(),
+                );
+                builder.push(key, value);
+                let new_page = builder.build()?;
+                let new_root = new_page.get_page_number();
+                let offset =
+                    LeafAccessor::new(new_page.memory(), K::fixed_width(), V::fixed_width())
+                        .offset_of_first_value();
+                let (new_root, root_checksum, sibling, sibling_checksum) =
+                    if ordering == std::cmp::Ordering::Less {
+                        (new_root, DEFERRED, page_number, page_checksum)
+                    } else {
+                        (page_number, page_checksum, new_root, DEFERRED)
+                    };
+                return Ok(InsertionResult {
+                    new_root,
+                    root_checksum,
+                    additional_sibling: Some((separator, sibling, sibling_checksum)),
+                    inserted_value: AccessGuardMutInPlace::new(new_page, offset, value.len()),
+                    old_value: None,
+                });
+            }
+        }
+        let page = self.mem.get_page(page_number, PageHint::None)?;
         let node_mem = page.memory();
         Ok(match node_mem[0] {
             LEAF => {
@@ -277,7 +387,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                             new_root: new_page_number,
                             root_checksum: DEFERRED,
                             additional_sibling: Some((
-                                key.to_vec(),
+                                key.to_vec().into(),
                                 page.get_page_number(),
                                 page_checksum,
                             )),
@@ -289,7 +399,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                         Ok(InsertionResult {
                             new_root: page.get_page_number(),
                             root_checksum: page_checksum,
-                            additional_sibling: Some((split_key, new_page_number, DEFERRED)),
+                            additional_sibling: Some((split_key.into(), new_page_number, DEFERRED)),
                             inserted_value: guard,
                             old_value: None,
                         })
@@ -383,6 +493,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                             Some(AccessGuard::with_arc_page(arc, start..end))
                         } else {
                             self.freed.push(page_number);
+                            #[cfg(feature = "test-seams")]
+                            crate::commit_work::note_freed_page();
                             Some(AccessGuard::with_page(page, start..end))
                         }
                     } else {
@@ -418,6 +530,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                             Some(AccessGuard::with_arc_page(arc, start..end))
                         } else {
                             self.freed.push(page_number);
+                            #[cfg(feature = "test-seams")]
+                            crate::commit_work::note_freed_page();
                             Some(AccessGuard::with_page(page, start..end))
                         }
                     } else {
@@ -452,7 +566,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     InsertionResult {
                         new_root: new_page_number,
                         root_checksum: DEFERRED,
-                        additional_sibling: Some((split_key, new_page_number2, DEFERRED)),
+                        additional_sibling: Some((split_key.into(), new_page_number2, DEFERRED)),
                         inserted_value: guard,
                         old_value: existing_value,
                     }
@@ -462,12 +576,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 let accessor = BranchAccessor::new(&page, K::fixed_width());
                 let (child_index, child_page) = accessor.child_for_key::<K>(key);
                 let child_checksum = accessor.child_checksum(child_index).unwrap();
-                let sub_result = self.insert_helper(
-                    self.mem.get_page(child_page, PageHint::None)?,
-                    child_checksum,
-                    key,
-                    value,
-                )?;
+                let sub_result = self.insert_helper(child_page, child_checksum, key, value)?;
 
                 // Skip-path: if child page number and checksum haven't changed,
                 // no branch update is needed. This avoids redundant get_page_mut +
@@ -553,11 +662,18 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
 
                 let result = if builder.should_split() {
                     let (new_page1, split_key, new_page2) = builder.build_split()?;
+                    let split_key = InsertionKey::split_key(
+                        split_key,
+                        sub_result
+                            .additional_sibling
+                            .as_ref()
+                            .map(|(key, _, _)| key),
+                    );
                     InsertionResult {
                         new_root: new_page1.get_page_number(),
                         root_checksum: DEFERRED,
                         additional_sibling: Some((
-                            split_key.to_vec(),
+                            split_key,
                             new_page2.get_page_number(),
                             DEFERRED,
                         )),
@@ -712,6 +828,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
             // Won't be freed until the end of the transaction, so returning the page
             // in the AccessGuard below is still safe
             self.freed.push(page.get_page_number());
+            #[cfg(feature = "test-seams")]
+            crate::commit_work::note_freed_page();
             Some(AccessGuard::with_page(page, start..end))
         };
         Ok((result, guard))
@@ -831,14 +949,30 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
 
                 let merge_with = if child_index == 0 { 1 } else { child_index - 1 };
                 debug_assert!(merge_with < accessor.count_children());
-                let merge_with_page = self
-                    .mem
-                    .get_page(accessor.child_page(merge_with).unwrap(), PageHint::None)?;
-                let merge_with_accessor =
-                    LeafAccessor::new(merge_with_page.memory(), K::fixed_width(), V::fixed_width());
-
-                let single_large_value = merge_with_accessor.num_pairs() == 1
-                    && merge_with_accessor.total_length() >= self.mem.get_page_size();
+                let merge_with_number = accessor.child_page(merge_with).unwrap();
+                #[cfg(feature = "contextdb-internal")]
+                let bounded_singleton = super::bounded_bytes::singleton(
+                    &self.mem,
+                    merge_with_number,
+                    PageHint::None,
+                    K::fixed_width(),
+                    V::fixed_width(),
+                )?
+                .is_some();
+                #[cfg(not(feature = "contextdb-internal"))]
+                let bounded_singleton = false;
+                let merge_with_page = if bounded_singleton {
+                    None
+                } else {
+                    Some(self.mem.get_page(merge_with_number, PageHint::None)?)
+                };
+                let merge_with_accessor = merge_with_page.as_ref().map(|page| {
+                    LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width())
+                });
+                let single_large_value = bounded_singleton
+                    || merge_with_accessor.as_ref().is_some_and(|leaf| {
+                        leaf.num_pairs() == 1 && leaf.total_length() >= self.mem.get_page_size()
+                    });
                 // Don't try to merge or rebalance, if the sibling contains a single large value
                 if single_large_value {
                     let mut child_builder = LeafBuilder::new(
@@ -863,6 +997,9 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     return Ok((result, found));
                 }
 
+                let merge_with_page = merge_with_page.unwrap();
+                let merge_with_accessor =
+                    LeafAccessor::new(merge_with_page.memory(), K::fixed_width(), V::fixed_width());
                 for i in 0..accessor.count_children() {
                     if i == child_index {
                         continue;

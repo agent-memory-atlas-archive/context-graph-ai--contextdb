@@ -105,9 +105,8 @@ impl SyncDirection {
 /// into two different enums.
 ///
 /// Applications can name only `KEEP FIRST` and `KEEP LATEST`. The private
-/// storage enum retains the historical four-slot binary layout so an existing
-/// database still decodes, but role-relative arbitration is not constructible
-/// through this public type.
+/// storage enum has four binary discriminants, but role-relative arbitration
+/// is not constructible through this public type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConflictPolicy(StoredConflictPolicy);
 
@@ -279,6 +278,101 @@ pub struct TableMeta {
     /// Explicit spelling, when present; the effective default is AFTER OUTCOME.
     #[serde(default)]
     pub edge_discard: Option<EdgeDiscardMode>,
+    /// Which index-prefix counts this table DECLARED the engine keeps current
+    /// on every write, when it declared anything at all. `None` means the
+    /// declaration named none and the table gets
+    /// [`DEFAULT_MAINTAINED_COUNTS`]. Kept as an option rather than collapsed
+    /// to the default so `.schema` renders back exactly what was written.
+    #[serde(default)]
+    pub maintained_counts: Option<MaintainedCounts>,
+}
+
+/// Which index-prefix counts the engine maintains on every write to a table.
+///
+/// A count is keyed by `(table, ordered column list, prefix values)` and never
+/// by index, so two indexes that share leading columns name ONE count here.
+/// `Lists` names each maintained column list exactly; `AllPrefixes` maintains
+/// every prefix of every declared index; `None` maintains nothing and leaves
+/// every `COUNT(*)` to the ordinary index-range aggregate, which answers the
+/// identical number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaintainedCounts {
+    None,
+    AllPrefixes,
+    Lists(Vec<Vec<(String, SortDirection)>>),
+}
+
+/// What a table that declared no `MAINTAIN COUNT` clause gets: no maintained
+/// index-prefix count at all. An undeclared
+/// `COUNT(*)` still answers EXACTLY, through the ordinary index-range
+/// aggregate inside the statement's declared limits, and `.explain` names the
+/// `ALTER TABLE ... SET MAINTAIN COUNT (...)` that would make it O(1).
+pub const DEFAULT_MAINTAINED_COUNTS: MaintainedCounts = MaintainedCounts::None;
+
+impl MaintainedCounts {
+    /// The declared clause, rendered back exactly as it was written.
+    pub fn declared_clause(&self) -> String {
+        match self {
+            Self::None => "MAINTAIN COUNT NONE".to_string(),
+            Self::AllPrefixes => "MAINTAIN COUNT ALL PREFIXES".to_string(),
+            Self::Lists(lists) => format!(
+                "MAINTAIN COUNT {}",
+                lists
+                    .iter()
+                    .map(|columns| format!("({})", render_maintained_count_columns(columns)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::None | Self::AllPrefixes => 16,
+            Self::Lists(lists) => lists.iter().fold(16usize, |acc, columns| {
+                acc.saturating_add(
+                    24 + columns
+                        .iter()
+                        .map(|(column, _)| 24 + column.len() * 16)
+                        .sum::<usize>(),
+                )
+            }),
+        }
+    }
+}
+
+/// One maintained-count column list as DDL text. `ASC` is the default and is
+/// spelled as silence; `DESC` is always written, so the text re-parses to the
+/// same list.
+pub fn render_maintained_count_columns(columns: &[(String, SortDirection)]) -> String {
+    columns
+        .iter()
+        .map(|(column, direction)| match direction {
+            SortDirection::Asc => render_sql_identifier(column),
+            SortDirection::Desc => format!("{} DESC", render_sql_identifier(column)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One identifier as DDL text: bare when the grammar's own `ident` rule
+/// accepts it, double-quoted otherwise, so rendered DDL re-parses to the
+/// identifier it was rendered from. A name that already contains a double
+/// quote has it doubled, which is what `quoted_ident` reads back.
+pub fn render_sql_identifier(name: &str) -> String {
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if plain {
+        name.to_owned()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
 }
 
 /// Whether a decode error on a trailing, defaultable field is genuinely "the
@@ -303,10 +397,9 @@ pub struct TableMeta {
 ///
 /// This is a genuine ambiguity, not a false positive waiting to happen: a
 /// stream truncated mid-field (real corruption) can ALSO manifest as
-/// `UnexpectedEnd`. The tradeoff deliberately favors backward compatibility
-/// (every trailing field this struct has ever grown must keep loading an
-/// older data root) over rejecting that rarer, indistinguishable corruption
-/// case -- matching the pre-existing (if previously unrealized) intent of
+/// `UnexpectedEnd`. The tradeoff deliberately accepts a missing trailing
+/// field in stored metadata over rejecting that rarer, indistinguishable corruption
+/// case -- matching the existing intent of
 /// every `.unwrap_or_default()` call on a trailing field here.
 fn is_bincode_tail_truncation<E: std::fmt::Display>(err: &E) -> bool {
     err.to_string().contains("UnexpectedEnd")
@@ -339,8 +432,8 @@ where
     }
 }
 
-// Custom `Deserialize` that tolerates prior on-disk `TableMeta` encoded
-// without the trailing `indexes` field (backward-compat).
+// Custom `Deserialize` that tolerates on-disk `TableMeta` encoded
+// without the trailing `indexes` field.
 impl<'de> serde::Deserialize<'de> for TableMeta {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -376,16 +469,12 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 // propagated decode error, which bincode always returns
                 // rather than the `Ok(None)` this pattern was written to
                 // assume — see `is_bincode_tail_truncation`'s doc comment).
-                // This is a DELIBERATE, pre-existing, tested floor (`pr02_
-                // legacy_table_meta_bincode_fails_loudly` /
-                // `table_meta_bincode_legacy_payload_without_indexes_fails_
-                // loudly`): a payload predating `indexes` is "too old" and
-                // must refuse to load rather than silently pretend a default
-                // shape, exactly as an old `ColumnDef` predating `immutable`
-                // must (`sc01_bincode_legacy_column_def_payload_fails_
-                // loudly`). Genuine short-tail TOLERANCE is scoped to ONLY
-                // the two NEWEST fields (`conflict_policy`, `history_policy`)
-                // below, which is the compatibility boundary these tests pin.
+                // A payload missing `indexes` must refuse to load, as must a
+                // ColumnDef missing `immutable`. Guards: `pr02_legacy_table_meta_
+                // bincode_fails_loudly`, `table_meta_bincode_legacy_payload_without_
+                // indexes_fails_loudly`, `sc01_bincode_legacy_column_def_payload_
+                // fails_loudly`. Only the supported tail fields below tolerate
+                // exhaustion; it cannot silently default a required field.
                 let dag_edge_types = seq.next_element::<Vec<String>>()?.unwrap_or_default();
                 let unique_constraints =
                     seq.next_element::<Vec<Vec<String>>>()?.unwrap_or_default();
@@ -407,12 +496,8 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     .next_element::<Option<RetainUnit>>()?
                     .unwrap_or_default();
                 let primary_key_columns = seq.next_element::<Vec<String>>()?.unwrap_or_default();
-                // The genuine short-tail tolerance: a payload that predates
-                // `conflict_policy` and/or `history_policy` (both newer than
-                // the `indexes` floor above) decodes cleanly with the
-                // missing ones reported as undeclared, matching the intent
-                // every OTHER `.unwrap_or_default()` above already stated
-                // but bincode never actually honored.
+                // Supported missing tail fields decode as undeclared. Required
+                // positional fields above must already have decoded successfully.
                 let mut tail_exhausted = false;
                 let conflict_policy =
                     decode_tail_field::<_, Option<ConflictPolicy>>(&mut seq, &mut tail_exhausted)?;
@@ -422,6 +507,10 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     decode_tail_field::<_, Option<Vec<String>>>(&mut seq, &mut tail_exhausted)?;
                 let edge_discard =
                     decode_tail_field::<_, Option<EdgeDiscardMode>>(&mut seq, &mut tail_exhausted)?;
+                let maintained_counts = decode_tail_field::<_, Option<MaintainedCounts>>(
+                    &mut seq,
+                    &mut tail_exhausted,
+                )?;
                 Ok(TableMeta {
                     columns,
                     immutable,
@@ -442,6 +531,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     history_policy,
                     delivery_manifest_tables,
                     edge_discard,
+                    maintained_counts,
                 })
             }
 
@@ -468,6 +558,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 let mut history_policy: Option<Option<HistoryPolicy>> = None;
                 let mut delivery_manifest_tables: Option<Option<Vec<String>>> = None;
                 let mut edge_discard: Option<Option<EdgeDiscardMode>> = None;
+                let mut maintained_counts: Option<Option<MaintainedCounts>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -494,6 +585,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                             delivery_manifest_tables = Some(map.next_value()?)
                         }
                         "edge_discard" => edge_discard = Some(map.next_value()?),
+                        "maintained_counts" => maintained_counts = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -521,6 +613,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     history_policy: history_policy.unwrap_or_default(),
                     delivery_manifest_tables: delivery_manifest_tables.unwrap_or_default(),
                     edge_discard: edge_discard.unwrap_or_default(),
+                    maintained_counts: maintained_counts.unwrap_or_default(),
                 })
             }
         }
@@ -545,6 +638,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
             "history_policy",
             "delivery_manifest_tables",
             "edge_discard",
+            "maintained_counts",
         ];
         deserializer.deserialize_struct("TableMeta", FIELDS, TableMetaVisitor)
     }
@@ -638,6 +732,20 @@ pub struct IndexDecl {
 }
 
 impl IndexDecl {
+    /// Whether this index files EXACT postings rather than ordered ones. An
+    /// automatic constraint index over a single column does; everything else
+    /// keeps the ordered tree and the current membership image instead.
+    /// `IndexStorage::new_automatic` decides it the same way, and a
+    /// compile-time check in `contextdb-relational` fails the build if the two
+    /// ever disagree.
+    pub fn is_exact_only(&self) -> bool {
+        self.kind == IndexKind::Auto && self.columns.len() == 1
+    }
+
+    /// What this DECLARATION costs. The index storage it brings with it is
+    /// separate -- see [`TableMeta::exact_probe_filter_bytes`] -- because the
+    /// two are multiplied by different things: a projection copies the
+    /// declaration while it builds, and never copies the filter.
     pub fn estimated_bytes(&self) -> usize {
         32 + self.name.len() * 16
             + self
@@ -778,7 +886,7 @@ pub const DEFAULT_VECTOR_CONSOLIDATION_TOMBSTONE_PERCENT: u32 = 10;
 
 // Hand-written `Deserialize` keeps the positional field order paired with the
 // derived serializer and gives map-based formats the declared field defaults.
-// The positional bincode compatibility floor is intentionally stricter; its
+// The positional bincode field requirements are stricter; their
 // exact boundary is documented in `visit_seq` below.
 impl<'de> serde::Deserialize<'de> for ColumnDef {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -813,16 +921,11 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let primary_key = seq
                     .next_element::<bool>()?
                     .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
-                // Every field from here on keeps the ORIGINAL hard-fail-on-
-                // missing behavior: this is `ColumnDef`'s OWN deliberate,
-                // pre-existing, tested floor
-                // (`sc01_bincode_legacy_column_def_payload_fails_loudly`) —
-                // silently defaulting `immutable` (or any field after it) to
-                // its zero value on a genuinely older payload would let a
-                // corrupt or pre-`immutable` payload pose as a non-immutable
-                // column, defeating the flag's own protection. Not touched
-                // by this compatibility rule: short-tail tolerance is scoped
-                // to `TableMeta.conflict_policy`/`history_policy` only.
+                // Missing positional fields propagate decoding errors
+                // (`sc01_bincode_legacy_column_def_payload_fails_loudly`).
+                // Defaulting an absent `immutable` flag would let a truncated
+                // payload pose as a non-immutable column. ColumnDef does not
+                // use TableMeta's supported-tail exhaustion rule.
                 let unique = seq.next_element::<bool>()?.unwrap_or_default();
                 let default = seq.next_element::<Option<String>>()?.unwrap_or_default();
                 let references = seq
@@ -1081,7 +1184,23 @@ impl VectorQuantization {
 }
 
 impl TableMeta {
-    pub fn estimated_bytes(&self) -> usize {
+    /// The fixed exact-probe bitmap every exact-only index storage on this
+    /// table allocates and keeps for as long as the index exists. Separate
+    /// from [`TableMeta::metadata_bytes`] because it is a durable retention,
+    /// not schema text: a staging reservation that copies the declaration
+    /// while it builds a projection must not multiply this as well.
+    pub fn exact_probe_filter_bytes(&self) -> usize {
+        self.indexes
+            .iter()
+            .filter(|index| index.is_exact_only())
+            .count()
+            .saturating_mul(crate::EXACT_PROBE_FILTER_BYTES)
+    }
+
+    /// What this table's schema itself costs, without the index storage it
+    /// brings. [`TableMeta::estimated_bytes`] is the two together, and is what
+    /// every charge and release of a whole table uses.
+    pub fn metadata_bytes(&self) -> usize {
         let columns_bytes = self.columns.iter().fold(0usize, |acc, column| {
             acc.saturating_add(column.estimated_bytes())
         });
@@ -1134,7 +1253,19 @@ impl TableMeta {
             + indexes_bytes
             + composite_foreign_key_bytes
             + self.default_ttl_seconds.map(|_| 8).unwrap_or(0)
+            + self
+                .maintained_counts
+                .as_ref()
+                .map(MaintainedCounts::estimated_bytes)
+                .unwrap_or(0)
             + 8
+    }
+
+    /// What holding this table costs: its schema and the index storage its
+    /// declarations allocate.
+    pub fn estimated_bytes(&self) -> usize {
+        self.metadata_bytes()
+            .saturating_add(self.exact_probe_filter_bytes())
     }
 }
 

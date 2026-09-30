@@ -60,3 +60,6 @@ mod owner_report_surface;
 mod owner_route_honors_declared_byte_budgets;
 #[path = "owner_read/owner_route_progress_and_cancellation.rs"]
 mod owner_route_progress_and_cancellation;
+#[cfg(target_os = "linux")]
+#[path = "owner_read/writable_open_drop_cycles_return_threads_and_memory.rs"]
+mod writable_open_drop_cycles_return_threads_and_memory;

@@ -2,8 +2,8 @@
 
 Repo-wide rules are in the [root `AGENTS.md`](../../AGENTS.md).
 
-**Purpose:** hold every table's versioned rows and index postings in memory and answer snapshot
-reads over them; this is the canonical row store — graph and vector state are derived from it.
+**Purpose:** hold versioned resident row images and index postings and answer snapshot reads;
+graph and vector state are derived from the canonical rows.
 
 ## Owns / must not own
 
@@ -13,15 +13,17 @@ visibility), prepared-then-published index membership (`prepare_memberships` →
 `publish_memberships`), retention-expiry preparation and publication, sync-source sidecars
 (`sync_source_lsn`, `SyncSourceKind`), whole-table replacement for received schemas
 (`PreparedRelationalPublication`), and index-only candidate derivation
-(`unauthorised_index_candidates`). `src/membership.rs` owns the immutable, path-copied index
-membership image readers hold, charged to a `ReadMemoryBudget`. `src/mem.rs` owns
+(`unauthorised_index_candidates`). `committed_directory_row_for_meta` keeps required columns
+resident; `committed_row_may_omit_columns` tells the engine when to rehydrate the exact durable
+version before sync or custody extraction. `src/membership.rs` owns the immutable, path-copied
+index membership image readers hold, charged to a `ReadMemoryBudget`. `src/mem.rs` owns
 `MemRelationalExecutor`: the `RelationalExecutor` implementation, the bounded cursors
 (`BoundedPhysicalCursor`, `BoundedIndexCursor`, `BoundedOrderedRowCursor`,
 `BoundedExactIndexCursor`), and the write-time checks it enforces — immutable tables refuse
 upsert and delete (`ImmutableTable`), and a declared state machine refuses an undeclared
 transition (`InvalidStateTransition`).
 
-Must not own: durability (the engine's `persistence.rs` writes redb; this crate is memory only),
+Must not own: durability (the engine's `persistence.rs` writes redb; this crate owns the resident image),
 the commit gate (the engine sequences prepare → durable commit → publish), authorization
 (`unauthorised_index_candidates` is explicitly not an authorization predicate — callers intersect
 it with their own scope and principal decision), SQL, or graph/vector structures.
@@ -39,6 +41,7 @@ it with their own scope and principal decision), SQL, or graph/vector structures
 
 | Invariant | Guard |
 |---|---|
+| A file-backed sender includes shed large columns in a manifested sync unit | `crates/contextdb-engine/tests/custody/delivery_manifest_contract.rs::a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_staging_path_and_is_never_served_to_a_pulling_peer` |
 | A snapshot sees only rows committed at or before it | `tests/relational_tests.rs::scan_respects_snapshot_visibility`, `::mvcc_snapshot_isolation` |
 | A rolled-back insert is never visible | `tests/relational_tests.rs::rollback_hides_inserted_rows` |
 | Upsert reports Insert / Update / NoOp exactly | `tests/relational_tests.rs::upsert_insert_update_noop` |
@@ -51,6 +54,7 @@ it with their own scope and principal decision), SQL, or graph/vector structures
 | A captured cursor keeps its membership image across later same-id changes | `crates/contextdb-engine/tests/engine_seams/snapshot_visible_posting_membership_contract.rs::captured_current_cursor_keeps_its_image_across_same_id_changes_and_cancellation` |
 | Current membership does not walk retired postings after replacements and reopen | `crates/contextdb-engine/tests/engine_seams/snapshot_visible_posting_membership_contract.rs::current_index_membership_does_not_walk_retained_true_postings_after_replacements_and_reopen` |
 | A deleted row's posting is tombstoned (its key, including any partition key, is kept and `deleted_tx` stamped — never dropped), so an older snapshot still finds it | `crates/contextdb-engine/tests/engine_seams/snapshot_visible_posting_membership_contract.rs::retired_partitions_keep_old_exact_membership_after_moves_delete_and_reopen` |
+| Declared maintained counts survive restart and sync and answer from stored counts | `crates/contextdb-engine/tests/engine_seams/declaring_a_count_on_a_table_with_rows_is_atomic_and_charged.rs::a_maintained_count_survives_restart_and_checkpoint_restore`; `crates/contextdb-server/tests/authenticated_sync_contract_tests.rs::a_maintained_count_declaration_crosses_sync_or_holds_back_its_table` |
 
 ## Where a change lives
 
@@ -59,6 +63,8 @@ it with their own scope and principal decision), SQL, or graph/vector structures
 | A new write-time row rule that needs only the table's `TableMeta` | `src/mem.rs` insert/upsert/delete path, with a typed `contextdb_core::Error`. |
 | A new index kind or posting layout | `IndexStorage` in `src/store.rs`, plus `membership.rs` if readers hold it. |
 | A new bounded cursor shape | `src/mem.rs`; its memory charge goes through `ReadMemoryBudget`, never an uncharged buffer. |
+| Which row columns remain resident | `store.rs::committed_directory_row_for_meta` and `committed_row_may_omit_columns`; outbound rehydration belongs to engine `database.rs` and `database/custody_store.rs`. |
+| Maintained counts and their declaration, installation, and committed-image reads | Engine `executor.rs`, `database.rs`, `persistence.rs`, and `executor/bounded.rs`; see the engine guide. This crate must not own the count store or read policy. Guarded by `crates/contextdb-engine/tests/engine_seams/declaring_a_count_on_a_table_with_rows_is_atomic_and_charged.rs::declaring_a_count_on_a_table_with_rows_is_correct_immediately` and `crates/contextdb-server/tests/authenticated_sync_contract_tests.rs::a_maintained_count_declaration_crosses_sync_or_holds_back_its_table`. |
 | Anything that must survive restart | Engine `persistence.rs` — this crate only mirrors durable state. |
 
 ## Fast test

@@ -3,7 +3,9 @@
 //! This module owns no execution behavior.  It is a thin conversion layer to
 //! the crate-private bounded-kernel entrance in the parent module.
 
-pub use super::bounded::{ContinuationBytes, PENDING_INDEX_RUNS};
+pub use super::bounded::{
+    ContinuationBytes, PENDING_INDEX_RUNS, take_vector_candidate_identity_decisions_for_test,
+};
 use super::{
     BoundedCursorHandle, BoundedExecutionError, BoundedExecutionProbe, BoundedExecutionTelemetry,
     BoundedSourceTouch, BoundedWorkSource, close_bounded_cursor, execute_bounded,
@@ -50,9 +52,17 @@ impl BoundedReadRequest {
 /// the injected clock or cancel the supplied token without a blocking wait.
 pub trait ExecutionProbe: Send + Sync {
     fn after_snapshot_registration(&self) {}
+    /// The actual immutable MVCC identity already registered by this operation.
+    /// Test observation only; no digest, snapshot acquisition or protocol field.
+    fn registered_snapshot_for_test(&self, _snapshot: contextdb_core::SnapshotId) {}
     fn after_source_capture(&self) {}
     fn before_work(&self, source: TestWorkSource, completed_work: u64);
     fn before_source_touch(&self, _touch: TestSourceTouch, _completed_items: u64) {}
+    fn after_hnsw_residual_rejection(
+        &self,
+        _event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
+    ) {
+    }
     fn before_temporary_reservation(
         &self,
         _source: TestWorkSource,
@@ -73,6 +83,16 @@ pub trait ExecutionProbe: Send + Sync {
 struct ProbeAdapter(Arc<dyn ExecutionProbe>);
 
 impl BoundedExecutionProbe for ProbeAdapter {
+    fn after_hnsw_residual_rejection(
+        &self,
+        event: contextdb_vector::hnsw::HnswResidualRejectionEvent,
+    ) {
+        self.0.after_hnsw_residual_rejection(event);
+    }
+    fn registered_snapshot_for_test(&self, snapshot: contextdb_core::SnapshotId) {
+        self.0.registered_snapshot_for_test(snapshot);
+    }
+
     fn after_snapshot_registration(&self) {
         self.0.after_snapshot_registration();
     }

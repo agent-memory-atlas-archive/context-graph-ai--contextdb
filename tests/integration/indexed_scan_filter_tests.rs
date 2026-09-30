@@ -2210,13 +2210,13 @@ fn pr01_index_survives_reopen() {
 }
 
 // ============================================================================
-// PR02 — REGRESSION GUARD — legacy TableMeta without `indexes` field decodes
+// PR02 — REGRESSION GUARD — TableMeta without `indexes` field decodes
 // cleanly via `#[serde(default)]` on the new field. With indexed-scan support in place,
 // this test passes; it guards against a future removal of the serde default.
 // ============================================================================
 #[test]
 fn pr02_legacy_table_meta_bincode_fails_loudly() {
-    // Post-fix #6: legacy bincode payloads without the `indexes` field
+    // Post-fix #6: short bincode payloads without the `indexes` field
     // must fail to decode rather than silently default. JSON/map-keyed
     // paths continue to honor serde(default) on the new field.
     use serde::{Deserialize, Serialize};
@@ -4422,7 +4422,7 @@ fn sync_ddl_createtable_regenerates_auto_indexes_on_peer() {
 }
 
 // ============================================================================
-// Step-6 fix #6 — bincode legacy payloads do not silently decode. JSON paths
+// Step-6 fix #6 — short bincode payloads do not silently decode. JSON paths
 // continue to honor serde(default).
 // ============================================================================
 #[test]

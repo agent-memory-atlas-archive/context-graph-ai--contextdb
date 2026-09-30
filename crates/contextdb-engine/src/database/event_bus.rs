@@ -4,8 +4,16 @@ use std::cell::Cell;
 const EVENT_TYPES_CONFIG_KEY: &str = "__event_bus_event_types";
 const SINKS_CONFIG_KEY: &str = "__event_bus_sinks";
 const ROUTES_CONFIG_KEY: &str = "__event_bus_routes";
+pub(crate) const NEXT_ACTION_ID_CONFIG_KEY: &str = "__event_bus_next_action_id";
+pub(crate) const UNCERTAIN_COUNT_CONFIG_PREFIX: &str = "__event_bus_uncertain_count.";
+pub(crate) const UNCONFIRMED_COUNT_CONFIG_PREFIX: &str = "__event_bus_unconfirmed_count.";
 pub(crate) const MAX_SINK_QUEUE_DEPTH: usize = 100_000;
 const SINK_DISPATCH_BATCH: usize = 1024;
+// A durable marker written before calling an external sink. A pending marked
+// entry has an unconfirmed effect even if the process died before the handler
+// returned or its outcome could be recorded.
+const UNCONFIRMED_ATTEMPT: u32 = 1 << 31;
+const ATTEMPT_COUNT_MASK: u32 = !UNCONFIRMED_ATTEMPT;
 
 type SinkCallback = Arc<dyn Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync>;
 
@@ -13,6 +21,9 @@ pub(crate) struct EventBusState {
     definitions: Mutex<EventBusDefinitions>,
     callbacks: RwLock<HashMap<String, SinkRegistration>>,
     queues: Mutex<HashMap<String, VecDeque<SinkQueueEntry>>>,
+    /// Entries a committed read image counted but left in the store. Always
+    /// empty on a writable handle, which loads its queues.
+    unloaded_queue_depths: Mutex<HashMap<String, u64>>,
     /// Stops new queue checkouts while an authoritative-purge snapshot is
     /// owned through its future durable commit and direct swap. Mutations take
     /// this state before queue locks; an in-flight user callback is the one
@@ -28,6 +39,8 @@ pub(crate) struct EventBusState {
     wait_lock: Mutex<()>,
     waiters: Condvar,
     next_queue_id: AtomicU64,
+    #[cfg(any(test, feature = "test-seams"))]
+    queue_capacity_for_test: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,14 +91,132 @@ struct PersistedRouteWhereIn {
     values: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct SinkQueueEntry {
     pub(crate) id: u64,
     pub(crate) event: SinkEvent,
     pub(crate) row_id: RowId,
     pub(crate) attempts: u32,
-    #[serde(default)]
     gate: EventGateSnapshot,
+}
+
+impl Serialize for SinkQueueEntry {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct HumanEntry<'a> {
+            id: u64,
+            event: &'a SinkEvent,
+            row_id: &'a RowId,
+            attempts: u32,
+            gate: &'a EventGateSnapshot,
+        }
+        #[derive(Serialize)]
+        struct SavedEvent<'a> {
+            event_type: &'a str,
+            table: &'a str,
+            row_values: &'a HashMap<String, Value>,
+            severity: &'a str,
+            at_lsn: Lsn,
+        }
+        #[derive(Serialize)]
+        struct SavedEntry<'a> {
+            id: u64,
+            event: SavedEvent<'a>,
+            row_id: &'a RowId,
+            attempts: u32,
+            gate: &'a EventGateSnapshot,
+        }
+        if serializer.is_human_readable() {
+            HumanEntry {
+                id: self.id,
+                event: &self.event,
+                row_id: &self.row_id,
+                attempts: self.attempts,
+                gate: &self.gate,
+            }
+            .serialize(serializer)
+        } else {
+            SavedEntry {
+                id: self.id,
+                event: SavedEvent {
+                    event_type: &self.event.event_type,
+                    table: &self.event.table,
+                    row_values: &self.event.row_values,
+                    severity: &self.event.severity,
+                    at_lsn: self.event.at_lsn,
+                },
+                row_id: &self.row_id,
+                attempts: self.attempts,
+                gate: &self.gate,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SinkQueueEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct HumanEntry {
+            id: u64,
+            event: SinkEvent,
+            row_id: RowId,
+            attempts: u32,
+            #[serde(default)]
+            gate: EventGateSnapshot,
+        }
+        #[derive(Deserialize)]
+        struct SavedEvent {
+            event_type: String,
+            table: String,
+            row_values: HashMap<String, Value>,
+            severity: String,
+            at_lsn: Lsn,
+        }
+        #[derive(Deserialize)]
+        struct SavedEntry {
+            id: u64,
+            event: SavedEvent,
+            row_id: RowId,
+            attempts: u32,
+            #[serde(default)]
+            gate: EventGateSnapshot,
+        }
+        if deserializer.is_human_readable() {
+            let saved = HumanEntry::deserialize(deserializer)?;
+            let mut event = saved.event;
+            event.action_id = saved.id;
+            Ok(Self {
+                id: saved.id,
+                event,
+                row_id: saved.row_id,
+                attempts: saved.attempts,
+                gate: saved.gate,
+            })
+        } else {
+            let saved = SavedEntry::deserialize(deserializer)?;
+            Ok(Self {
+                id: saved.id,
+                event: SinkEvent {
+                    action_id: saved.id,
+                    event_type: saved.event.event_type,
+                    table: saved.event.table,
+                    row_values: saved.event.row_values,
+                    severity: saved.event.severity,
+                    at_lsn: saved.event.at_lsn,
+                },
+                row_id: saved.row_id,
+                attempts: saved.attempts,
+                gate: saved.gate,
+            })
+        }
+    }
 }
 
 #[derive(Default)]
@@ -94,24 +225,37 @@ struct QueueMutationState {
     mutation_blocked: bool,
     checked_out: HashSet<(String, u64)>,
     active_mutations: u64,
+    dispatcher_writes_closed: bool,
 }
 
 thread_local! {
     static EVENT_BUS_CALLBACK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static EVENT_BUS_CALLBACK_OWNER: Cell<usize> = const { Cell::new(0) };
 }
 
-struct EventBusCallbackGuard;
+struct EventBusCallbackGuard {
+    previous_owner: usize,
+}
 
 impl EventBusCallbackGuard {
-    fn enter() -> Self {
+    fn enter(event_bus: &Arc<EventBusState>) -> Self {
         EVENT_BUS_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
-        Self
+        let previous_owner =
+            EVENT_BUS_CALLBACK_OWNER.with(|owner| owner.replace(Arc::as_ptr(event_bus) as usize));
+        Self { previous_owner }
     }
 }
 
 impl Drop for EventBusCallbackGuard {
     fn drop(&mut self) {
+        EVENT_BUS_CALLBACK_OWNER.with(|owner| owner.set(self.previous_owner));
         EVENT_BUS_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+impl EventBusState {
+    pub(super) fn callback_active_on_current_thread(&self) -> bool {
+        EVENT_BUS_CALLBACK_OWNER.with(|owner| owner.get() == self as *const Self as usize)
     }
 }
 
@@ -194,6 +338,33 @@ impl Drop for QueueMutationLease {
 }
 
 impl EventBusState {
+    /// The current callback may have initiated close, so its acknowledgement
+    /// must be refused after the writer's final durable handoff. Every prior
+    /// dispatcher mutation finishes before this method returns.
+    fn close_dispatcher_queue_writes(&self) {
+        let mut state = self.queue_mutation_state.lock();
+        state.dispatcher_writes_closed = true;
+        while state.active_mutations != 0 {
+            self.queue_mutation_waiters.wait(&mut state);
+        }
+    }
+
+    fn begin_dispatcher_queue_mutation(&self) -> Result<QueueMutationLease> {
+        let mut state = self.queue_mutation_state.lock();
+        while state.mutation_blocked && !state.dispatcher_writes_closed {
+            self.queue_mutation_waiters.wait(&mut state);
+        }
+        if state.dispatcher_writes_closed {
+            return Err(Error::EventBusQueueQuiescent);
+        }
+        state.active_mutations = state.active_mutations.saturating_add(1);
+        drop(state);
+        Ok(QueueMutationLease {
+            state: self.queue_mutation_state.clone(),
+            waiters: self.queue_mutation_waiters.clone(),
+        })
+    }
+
     fn queue_checkout_guard(&self) -> parking_lot::MutexGuard<'_, QueueMutationState> {
         let mut state = self.queue_mutation_state.lock();
         while state.checkout_paused {
@@ -364,6 +535,8 @@ struct SinkRegistration {
 struct SinkMetricsState {
     delivered: u64,
     retried: u64,
+    uncertain: u64,
+    unconfirmed: u64,
     permanent_failures: u64,
     in_flight: u64,
     /// Queue entries pulled to the front and gate-evaluated by the dispatcher
@@ -394,15 +567,44 @@ struct EventBusResourceCleanup {
     sink: String,
     persistence: Option<Arc<RedbPersistence>>,
     open_registry_path: Option<PathBuf>,
+    close_completion: Option<(Arc<Mutex<CloseProgress>>, Arc<Condvar>, bool)>,
+    /// A dropped owner left its writer open so the dispatcher could record
+    /// the delivery it was making; the dispatcher makes the writer quiescent
+    /// once that acknowledgement is durable, before it lets go.
+    publish_quiescence: bool,
 }
 
 impl EventBusResourceCleanup {
     fn close(self) {
+        if self.publish_quiescence
+            && let Some(persistence) = &self.persistence
+        {
+            let published = persistence.make_writer_quiescent().and_then(|()| {
+                persistence.record_owner_read_status(OwnerReadStatus {
+                    state: OwnerServingState::NotServing,
+                    reason: Some(OwnerServingReason::ShutdownDraining),
+                })
+            });
+            if let Err(error) = published {
+                tracing::warn!(
+                    error = %error,
+                    "could not publish quiescent owner status after the last delivery"
+                );
+            }
+        }
         if let Some(persistence) = self.persistence {
             persistence.close();
         }
         if let Some(path) = self.open_registry_path {
             release_open_registry_path(&path);
+        }
+        if let Some((progress, changed, succeeded)) = self.close_completion {
+            *progress.lock() = if succeeded {
+                CloseProgress::Complete
+            } else {
+                CloseProgress::Idle
+            };
+            changed.notify_all();
         }
     }
 }
@@ -450,6 +652,7 @@ impl EventBusState {
             definitions: Mutex::new(EventBusDefinitions::default()),
             callbacks: RwLock::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
+            unloaded_queue_depths: Mutex::new(HashMap::new()),
             queue_mutation_state: Arc::new(Mutex::new(QueueMutationState::default())),
             queue_mutation_waiters: Arc::new(Condvar::new()),
             staged_for_persistence: Mutex::new(HashMap::new()),
@@ -461,11 +664,39 @@ impl EventBusState {
             wait_lock: Mutex::new(()),
             waiters: Condvar::new(),
             next_queue_id: AtomicU64::new(1),
+            #[cfg(any(test, feature = "test-seams"))]
+            queue_capacity_for_test: std::sync::atomic::AtomicUsize::new(MAX_SINK_QUEUE_DEPTH),
         }
     }
 
     fn allocate_queue_id(&self) -> u64 {
         self.next_queue_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_action_id(&self) -> u64 {
+        self.next_queue_id.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn ensure_queue_capacity(&self, events: &[PreparedSinkEvent]) -> Result<()> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let capacity = self.queue_capacity_for_test.load(Ordering::SeqCst);
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let capacity = MAX_SINK_QUEUE_DEPTH;
+        let queues = self.queues.lock();
+        let mut additions = HashMap::<&str, usize>::new();
+        for (sink, _) in events {
+            let count = additions.entry(sink.as_str()).or_default();
+            *count += 1;
+            if queues
+                .get(sink)
+                .map_or(0, VecDeque::len)
+                .saturating_add(*count)
+                > capacity
+            {
+                return Err(Error::Other(format!("sink queue is full: {sink}")));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn stage_sink_events_for_persistence(
@@ -548,8 +779,43 @@ impl Database {
         self.prepare_received_event_bus_publication_from_projection(definitions)
     }
 
+    pub(super) fn received_event_bus_projection_bytes(&self) -> Result<usize> {
+        let definitions = self.event_bus.definitions.lock();
+        let encoded = bincode::serde::encode_into_std_write(
+            &*definitions,
+            &mut std::io::sink(),
+            bincode::config::standard(),
+        )
+        .map_err(|error| Error::Other(format!("price received event definitions: {error}")))?;
+        let entries =
+            definitions.event_types.len() + definitions.sinks.len() + definitions.routes.len();
+        let filter_entries = definitions.routes.values().fold(0usize, |entries, route| {
+            entries.saturating_add(
+                route
+                    .where_in
+                    .as_ref()
+                    .map_or(0, |filter| filter.values.len()),
+            )
+        });
+        Ok(encoded
+            .saturating_add(entries.saturating_mul(512))
+            .saturating_add(filter_entries.saturating_mul(32)))
+    }
+
     pub(super) fn received_event_bus_projection(&self) -> EventBusDefinitions {
         self.event_bus.definitions.lock().clone()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(super) fn published_definition_names_for_test(
+        &self,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let definitions = self.event_bus.definitions.lock();
+        (
+            definitions.event_types.keys().cloned().collect(),
+            definitions.sinks.keys().cloned().collect(),
+            definitions.routes.keys().cloned().collect(),
+        )
     }
 
     /// Seed a detached received-schema adjudicator with the receiver's live
@@ -610,9 +876,10 @@ impl Database {
         }
         for (sink, entry) in received_events {
             let queue = queues.entry(sink).or_default();
-            if queue.len() == MAX_SINK_QUEUE_DEPTH {
-                queue.pop_front();
-            }
+            assert!(
+                queue.len() < MAX_SINK_QUEUE_DEPTH,
+                "committed sink queue capacity"
+            );
             queue.push_back(entry);
         }
         drop(queues);
@@ -657,12 +924,38 @@ impl Database {
         let _queue_mutation = self.event_bus.begin_queue_mutation();
         let mut queues = self.event_bus.queues.lock();
         queues.clear();
-        let mut max_id = 0u64;
+        let mut unloaded = self.event_bus.unloaded_queue_depths.lock();
+        unloaded.clear();
+        let mut max_id = source
+            .config_value::<u64>(NEXT_ACTION_ID_CONFIG_KEY)?
+            .unwrap_or(1)
+            .saturating_sub(1);
         for sink in sink_names {
-            let queue = source.sink_queue::<SinkQueueEntry>(&sink)?;
+            let uncertain = source
+                .config_value::<u64>(&format!("{UNCERTAIN_COUNT_CONFIG_PREFIX}{sink}"))?
+                .unwrap_or(0);
+            let unconfirmed = source
+                .config_value::<u64>(&format!("{UNCONFIRMED_COUNT_CONFIG_PREFIX}{sink}"))?
+                .unwrap_or(0);
+            let mut metrics = self.event_bus.metrics.lock();
+            let state = metrics.entry(sink.clone()).or_default();
+            state.uncertain = uncertain;
+            state.unconfirmed = unconfirmed;
+            drop(metrics);
+            if let Some(extent) = source.unloaded_sink_queue(&sink) {
+                max_id = max_id.max(extent.newest_id);
+                unloaded.insert(sink.clone(), extent.depth);
+                queues.insert(sink, VecDeque::new());
+                continue;
+            }
+            let mut queue = source.sink_queue::<SinkQueueEntry>(&sink)?;
+            for entry in &mut queue {
+                entry.event.action_id = entry.id;
+            }
             max_id = max_id.max(queue.iter().map(|entry| entry.id).max().unwrap_or(0));
             queues.insert(sink, queue.into());
         }
+        drop(unloaded);
         self.event_bus
             .next_queue_id
             .store(max_id.saturating_add(1).max(1), Ordering::SeqCst);
@@ -736,6 +1029,9 @@ impl Database {
     where
         F: Fn(&str) -> bool,
     {
+        if ddl.is_empty() {
+            return Ok(());
+        }
         let mut projected = self.event_bus.definitions.lock().clone();
         for change in ddl {
             Self::apply_event_bus_ddl_to_definitions_with_table_lookup(
@@ -1097,7 +1393,13 @@ impl Database {
         }
     }
 
-    /// Register or replace the in-process callback for a declared sink.
+    /// Register or replace the post-commit external delivery handler for a
+    /// declared sink. The durable queue survives a crash after commit and
+    /// retries the same `SinkEvent::action_id`. Receivers should deduplicate
+    /// that identity. If an acknowledgement is lost, return
+    /// `SinkError::OutcomeUncertain`; the queue stays pending and metrics expose
+    /// the uncertainty. The dispatcher cannot promise exactly-once effects at
+    /// an arbitrary endpoint.
     ///
     /// Sinks may be registered from owner or scoped handles. The handle's
     /// context and scope-label constraints, plus the resolved registration
@@ -1189,7 +1491,15 @@ impl Database {
             .lock()
             .get(sink)
             .map(|queue| queue.len() as u64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_add(
+                self.event_bus
+                    .unloaded_queue_depths
+                    .lock()
+                    .get(sink)
+                    .copied()
+                    .unwrap_or(0),
+            );
         let metrics = self
             .event_bus
             .metrics
@@ -1201,6 +1511,7 @@ impl Database {
             delivered: metrics.delivered,
             queued,
             retried: metrics.retried,
+            uncertain: metrics.uncertain.saturating_add(metrics.unconfirmed),
             permanent_failures: metrics.permanent_failures,
             examined: metrics.examined,
         }
@@ -1209,6 +1520,29 @@ impl Database {
     #[cfg(any(test, feature = "test-seams"))]
     pub fn sink_metrics_for_test(&self, sink: &str) -> SinkMetrics {
         self.sink_metrics(sink)
+    }
+
+    /// Test-only view of pending identities before dispatcher registration.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn pending_sink_action_ids_for_test(&self, sink: &str) -> Vec<u64> {
+        let _operation = self.assert_open_operation();
+        self.event_bus
+            .queues
+            .lock()
+            .get(sink)
+            .map(|queue| queue.iter().map(|entry| entry.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// Bound a test queue without constructing the production maximum of 100,000 actions.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn set_sink_queue_capacity_for_test(&self, capacity: usize) {
+        let _operation = self.assert_open_operation();
+        self.event_bus
+            .queue_capacity_for_test
+            .store(capacity, Ordering::SeqCst);
     }
 
     /// Point-in-time view of every declared event type, sink (with its
@@ -1452,21 +1786,6 @@ impl Database {
         }
     }
 
-    pub(super) fn prepare_received_sink_events_for_publication(
-        &self,
-        ws: &contextdb_tx::WriteSet,
-        publication: &PreparedEventBusPublication,
-        projected_rows: &HashMap<String, Vec<VersionedRow>>,
-        projected_tables: &HashMap<String, TableMeta>,
-    ) -> PreparedReceivedSinkEvents {
-        self.prepare_received_sink_events_from_projection(
-            ws,
-            &publication.definitions,
-            projected_rows,
-            projected_tables,
-        )
-    }
-
     fn append_received_sink_events_for_candidate(
         out: &mut Vec<PreparedSinkEvent>,
         definitions: &EventBusDefinitions,
@@ -1500,11 +1819,13 @@ impl Database {
                 if !route_matches(route, candidate.values) {
                     continue;
                 }
+                let action_id = *next_queue_id;
                 out.push((
                     route.sink.clone(),
                     SinkQueueEntry {
-                        id: *next_queue_id,
+                        id: action_id,
                         event: SinkEvent {
+                            action_id,
                             event_type: event_type.name.clone(),
                             table: candidate.table.to_string(),
                             severity: severity.clone(),
@@ -1554,7 +1875,9 @@ impl Database {
                 if !route_matches(route, candidate.values) {
                     continue;
                 }
+                let action_id = self.event_bus.allocate_queue_id();
                 let event = SinkEvent {
+                    action_id,
                     event_type: event_type.name.clone(),
                     table: candidate.table.to_string(),
                     severity: severity.clone(),
@@ -1564,7 +1887,7 @@ impl Database {
                 out.push((
                     route.sink.clone(),
                     SinkQueueEntry {
-                        id: self.event_bus.allocate_queue_id(),
+                        id: action_id,
                         event,
                         row_id: candidate.row_id,
                         attempts: 0,
@@ -1697,9 +2020,10 @@ impl Database {
         let mut queues = self.event_bus.queues.lock();
         for (sink, entry) in events {
             let queue = queues.entry(sink).or_default();
-            if queue.len() == MAX_SINK_QUEUE_DEPTH {
-                queue.pop_front();
-            }
+            assert!(
+                queue.len() < MAX_SINK_QUEUE_DEPTH,
+                "committed sink queue capacity"
+            );
             queue.push_back(entry);
         }
         drop(queues);
@@ -1713,6 +2037,19 @@ impl Database {
     }
 
     pub(super) fn stop_event_bus_threads(&self) -> EventBusThreadShutdown {
+        self.stop_event_bus_threads_with(false)
+    }
+
+    /// Stop dispatchers for a dropped owner. When the drop runs inside a sink
+    /// callback, nothing waits on the drop, so that dispatcher still records
+    /// the delivery it is making and only then makes the writer quiescent. A
+    /// callback-initiated `close` instead leaves its event queued for reopen:
+    /// close must freeze writes before it returns.
+    pub(super) fn stop_event_bus_threads_on_drop(&self) -> EventBusThreadShutdown {
+        self.stop_event_bus_threads_with(true)
+    }
+
+    fn stop_event_bus_threads_with(&self, dispatcher_acknowledges: bool) -> EventBusThreadShutdown {
         if !self.resource_owner {
             return EventBusThreadShutdown::AllJoined;
         }
@@ -1739,21 +2076,28 @@ impl Database {
                 let _ = handle.join();
             }
         }
+        let dispatcher_acknowledges = dispatcher_acknowledges && current_dispatcher.is_some();
+        if !dispatcher_acknowledges {
+            self.event_bus.close_dispatcher_queue_writes();
+        }
         if let Some((sink, handle)) = current_dispatcher {
             drop(handle);
-            self.defer_current_dispatcher_resource_cleanup(sink);
+            self.defer_current_dispatcher_resource_cleanup(sink, dispatcher_acknowledges);
             return EventBusThreadShutdown::DeferredResourceCleanup;
         }
         EventBusThreadShutdown::AllJoined
     }
 
-    fn defer_current_dispatcher_resource_cleanup(&self, sink: String) {
-        // The current dispatcher still has to ack the callback's event after
-        // Database::drop returns, so it closes file resources at loop exit.
+    fn defer_current_dispatcher_resource_cleanup(&self, sink: String, publish_quiescence: bool) {
+        // A callback-initiated close leaves its event queued for reopen; a
+        // callback-initiated drop records the delivery first. Either way the
+        // dispatcher owns the persistence resource until it exits.
         let cleanup = EventBusResourceCleanup {
             sink,
             persistence: self.persistence.clone(),
             open_registry_path: self.open_registry_path.lock().take(),
+            close_completion: None,
+            publish_quiescence,
         };
         let previous = self
             .event_bus
@@ -1764,6 +2108,19 @@ impl Database {
             previous.is_none(),
             "event bus resource cleanup was already deferred"
         );
+    }
+
+    pub(super) fn attach_deferred_close_completion(&self, succeeded: bool) -> bool {
+        let mut cleanup = self.event_bus.deferred_resource_cleanup.lock();
+        let Some(cleanup) = cleanup.as_mut() else {
+            return false;
+        };
+        cleanup.close_completion = Some((
+            Arc::clone(&self.close_progress),
+            Arc::clone(&self.close_changed),
+            succeeded,
+        ));
+        true
     }
 
     fn ensure_sink_dispatcher_running(&self, sink: &str) {
@@ -2048,22 +2405,98 @@ impl EventBusWorker {
                     }
                     break;
                 }
+                if entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
+                    if let Err(error) = self.transition_attempt(entry.id, false, true) {
+                        tracing::warn!(sink = %self.sink, action_id = entry.id, %error,
+                            "cannot durably reconcile an unconfirmed sink attempt");
+                        for pending in entries.iter().skip(entry_position) {
+                            self.event_bus
+                                .finish_checked_out_entry(&self.sink, pending.id);
+                        }
+                        self.wait(&shutdown, Duration::from_millis(50));
+                        continue 'dispatch;
+                    }
+                    self.event_bus
+                        .metrics
+                        .lock()
+                        .entry(self.sink.clone())
+                        .or_default()
+                        .uncertain += 1;
+                }
+                let attempts = match self.transition_attempt(entry.id, true, false) {
+                    Ok(attempts) => attempts,
+                    Err(error) => {
+                        tracing::warn!(sink = %self.sink, action_id = entry.id, %error,
+                            "cannot durably record sink attempt before delivery");
+                        for pending in entries.iter().skip(entry_position) {
+                            self.event_bus
+                                .finish_checked_out_entry(&self.sink, pending.id);
+                        }
+                        self.wait(&shutdown, Duration::from_millis(50));
+                        continue 'dispatch;
+                    }
+                };
                 examined_count = examined_count.saturating_add(1);
                 self.add_in_flight(1);
                 let callback = registration.callback.clone();
+                let mut event = entry.event.clone();
+                if event.action_id == 0 {
+                    event.action_id = entry.id;
+                }
                 let result = {
-                    let _callback = EventBusCallbackGuard::enter();
-                    catch_unwind(AssertUnwindSafe(|| callback(&entry.event)))
+                    let _callback = EventBusCallbackGuard::enter(&self.event_bus);
+                    catch_unwind(AssertUnwindSafe(|| callback(&event)))
                 };
                 self.add_in_flight(-1);
+                let result = match result {
+                    Ok(outcome) => outcome,
+                    Err(payload) => {
+                        let panic_message = panic_payload_to_string(payload);
+                        tracing::warn!(
+                            sink = %self.sink,
+                            action_id = event.action_id,
+                            panic_message = %panic_message,
+                            "sink callback panicked after delivery began"
+                        );
+                        Err(SinkError::OutcomeUncertain(panic_message))
+                    }
+                };
+                let uncertain_reason = match &result {
+                    Err(SinkError::OutcomeUncertain(reason)) => Some(reason.as_str()),
+                    _ => None,
+                };
+                if let Some(reason) = uncertain_reason {
+                    tracing::warn!(
+                        sink = %self.sink,
+                        action_id = event.action_id,
+                        reason,
+                        "sink delivery outcome uncertain; retrying with the same action identity"
+                    );
+                }
 
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(()) => {
                         delivered_count = delivered_count.saturating_add(1);
                         acked.push(entry.id);
                     }
-                    Ok(Err(SinkError::Transient(_))) => {
+                    Err(SinkError::Transient(_) | SinkError::OutcomeUncertain(_)) => {
                         let _ = self.ack_front_entries(&acked);
+                        let uncertain = uncertain_reason.is_some();
+                        match self.transition_attempt(entry.id, false, uncertain) {
+                            Ok(_) if uncertain => {
+                                self.event_bus
+                                    .metrics
+                                    .lock()
+                                    .entry(self.sink.clone())
+                                    .or_default()
+                                    .uncertain += 1;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!(sink = %self.sink, action_id = entry.id, %error,
+                                    "sink attempt remains durably unconfirmed for recovery");
+                            }
+                        }
                         // Same combined flush as the post-batch path: examined
                         // must ride along or transient retries undercount it
                         // (the retried entry itself counts again on re-examine
@@ -2073,8 +2506,10 @@ impl EventBusWorker {
                             permanent_failure_count,
                             examined_count,
                             1,
+                            0,
                         );
-                        let attempts = self.bump_attempts(entry.id).unwrap_or(entry.attempts + 1);
+                        self.event_bus
+                            .finish_checked_out_entry(&self.sink, entry.id);
                         let backoff = retry_backoff(attempts);
                         for pending in entries.iter().skip(entry_position + 1) {
                             self.event_bus
@@ -2083,25 +2518,20 @@ impl EventBusWorker {
                         self.wait(&shutdown, backoff);
                         continue 'dispatch;
                     }
-                    Ok(Err(SinkError::Permanent(_))) => {
-                        permanent_failure_count = permanent_failure_count.saturating_add(1);
-                        acked.push(entry.id);
-                    }
-                    Err(payload) => {
-                        let panic_message = panic_payload_to_string(payload);
-                        tracing::warn!(
-                            sink = %self.sink,
-                            entry_id = entry.id,
-                            panic_message = %panic_message,
-                            "sink callback panicked"
-                        );
+                    Err(SinkError::Permanent(_)) => {
                         permanent_failure_count = permanent_failure_count.saturating_add(1);
                         acked.push(entry.id);
                     }
                 }
             }
             let _ = self.ack_front_entries(&acked);
-            self.record_batch_outcome(delivered_count, permanent_failure_count, examined_count, 0);
+            self.record_batch_outcome(
+                delivered_count,
+                permanent_failure_count,
+                examined_count,
+                0,
+                0,
+            );
         }
         self.finish_deferred_resource_cleanup();
     }
@@ -2172,8 +2602,14 @@ impl EventBusWorker {
         permanent_failures: u64,
         examined: u64,
         retried: u64,
+        uncertain: u64,
     ) {
-        if delivered == 0 && permanent_failures == 0 && examined == 0 && retried == 0 {
+        if delivered == 0
+            && permanent_failures == 0
+            && examined == 0
+            && retried == 0
+            && uncertain == 0
+        {
             return;
         }
         let mut metrics = self.event_bus.metrics.lock();
@@ -2182,57 +2618,97 @@ impl EventBusWorker {
         state.permanent_failures += permanent_failures;
         state.examined += examined;
         state.retried += retried;
+        state.uncertain += uncertain;
     }
 
-    fn bump_attempts(&self, entry_id: u64) -> Result<u32> {
-        let result = {
-            let _queue_mutation = self.event_bus.begin_queue_mutation();
-            (|| -> Result<Option<SinkQueueEntry>> {
-                let mut queues = self.event_bus.queues.lock();
-                let Some(queue) = queues.get_mut(&self.sink) else {
-                    return Ok(None);
-                };
-                let Some(entry) = queue.front_mut().filter(|entry| entry.id == entry_id) else {
-                    return Ok(None);
-                };
-                let mut updated = entry.clone();
-                updated.attempts = updated.attempts.saturating_add(1);
-                persist_sink_queue_update(&self.persistence, &self.sink, None, Some(&updated))?;
-                entry.attempts = updated.attempts;
-                Ok(Some(updated))
-            })()
+    fn transition_attempt(&self, entry_id: u64, start: bool, uncertain: bool) -> Result<u32> {
+        let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
+        let mut queues = self.event_bus.queues.lock();
+        let entry = queues
+            .get_mut(&self.sink)
+            .and_then(|queue| queue.iter_mut().find(|entry| entry.id == entry_id))
+            .ok_or_else(|| Error::Other(format!("pending sink action disappeared: {entry_id}")))?;
+        let mut updated = entry.clone();
+        let attempts = updated.attempts & ATTEMPT_COUNT_MASK;
+        updated.attempts = if start {
+            if updated.attempts & UNCONFIRMED_ATTEMPT != 0 {
+                return Err(Error::Other(format!(
+                    "sink action has an unresolved attempt: {entry_id}"
+                )));
+            }
+            attempts.saturating_add(1).min(ATTEMPT_COUNT_MASK) | UNCONFIRMED_ATTEMPT
+        } else {
+            attempts
         };
-        self.event_bus
-            .finish_checked_out_entry(&self.sink, entry_id);
-        result.map(|updated| updated.map(|entry| entry.attempts).unwrap_or(1))
+        let was_unconfirmed = entry.attempts & UNCONFIRMED_ATTEMPT != 0;
+        let unconfirmed_delta = if start {
+            1
+        } else if was_unconfirmed {
+            -1
+        } else {
+            0
+        };
+        persist_sink_queue_update(
+            &self.persistence,
+            &self.sink,
+            None,
+            Some(&updated),
+            uncertain,
+            unconfirmed_delta,
+        )?;
+        entry.attempts = updated.attempts;
+        if start {
+            self.event_bus
+                .metrics
+                .lock()
+                .entry(self.sink.clone())
+                .or_default()
+                .unconfirmed += 1;
+        } else if was_unconfirmed {
+            let mut metrics = self.event_bus.metrics.lock();
+            let state = metrics.entry(self.sink.clone()).or_default();
+            state.unconfirmed = state.unconfirmed.saturating_sub(1);
+        }
+        Ok(attempts.max(1))
     }
 
     fn ack_front_entries(&self, entry_ids: &[u64]) -> Result<()> {
         if entry_ids.is_empty() {
             return Ok(());
         }
-        let result = {
-            let _queue_mutation = self.event_bus.begin_queue_mutation();
-            (|| -> Result<()> {
-                let mut queues = self.event_bus.queues.lock();
-                if let Some(queue) = queues.get_mut(&self.sink) {
-                    let removable = entry_ids
+        let result = (|| -> Result<()> {
+            let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
+            let mut queues = self.event_bus.queues.lock();
+            if let Some(queue) = queues.get_mut(&self.sink) {
+                let removable = entry_ids
+                    .iter()
+                    .copied()
+                    .zip(queue.iter())
+                    .take_while(|(id, entry)| *id == entry.id)
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>();
+                if !removable.is_empty() {
+                    let unconfirmed = queue
                         .iter()
-                        .copied()
-                        .zip(queue.iter())
-                        .take_while(|(id, entry)| *id == entry.id)
-                        .map(|(id, _)| id)
-                        .collect::<Vec<_>>();
-                    if !removable.is_empty() {
-                        persist_sink_queue_removals(&self.persistence, &self.sink, &removable)?;
-                        for _ in 0..removable.len() {
-                            queue.pop_front();
-                        }
+                        .take(removable.len())
+                        .filter(|entry| entry.attempts & UNCONFIRMED_ATTEMPT != 0)
+                        .count() as u64;
+                    persist_sink_queue_removals(
+                        &self.persistence,
+                        &self.sink,
+                        &removable,
+                        unconfirmed,
+                    )?;
+                    for _ in 0..removable.len() {
+                        queue.pop_front();
                     }
+                    let mut metrics = self.event_bus.metrics.lock();
+                    let state = metrics.entry(self.sink.clone()).or_default();
+                    state.unconfirmed = state.unconfirmed.saturating_sub(unconfirmed);
                 }
-                Ok(())
-            })()
-        };
+            }
+            Ok(())
+        })();
         for entry_id in entry_ids {
             self.event_bus
                 .finish_checked_out_entry(&self.sink, *entry_id);
@@ -2450,22 +2926,31 @@ fn persist_sink_queue_update(
     sink: &str,
     remove_id: Option<u64>,
     put: Option<&SinkQueueEntry>,
+    uncertain: bool,
+    unconfirmed_delta: i8,
 ) -> Result<()> {
     let Some(persistence) = persistence.as_ref() else {
         return Ok(());
     };
-    persistence.update_sink_queue_entry(sink, remove_id, put.map(|entry| (entry.id, entry)))
+    persistence.update_sink_queue_entry(
+        sink,
+        remove_id,
+        put.map(|entry| (entry.id, entry)),
+        uncertain,
+        unconfirmed_delta,
+    )
 }
 
 fn persist_sink_queue_removals(
     persistence: &Option<Arc<RedbPersistence>>,
     sink: &str,
     remove_ids: &[u64],
+    unconfirmed: u64,
 ) -> Result<()> {
     let Some(persistence) = persistence.as_ref() else {
         return Ok(());
     };
-    persistence.remove_sink_queue_entries(sink, remove_ids)
+    persistence.remove_sink_queue_entries(sink, remove_ids, unconfirmed)
 }
 
 fn retry_backoff(attempts: u32) -> Duration {
@@ -2480,5 +2965,80 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
         message.clone()
     } else {
         "non-string panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod saved_sink_entry_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn saved_queue_bytes_keep_the_legacy_event_shape_and_recover_the_action_id() {
+        #[derive(Serialize)]
+        struct OldEvent<'a> {
+            event_type: &'a str,
+            table: &'a str,
+            row_values: &'a HashMap<String, Value>,
+            severity: &'a str,
+            at_lsn: Lsn,
+        }
+        #[derive(Serialize)]
+        struct OldEntry<'a> {
+            id: u64,
+            event: OldEvent<'a>,
+            row_id: RowId,
+            attempts: u32,
+            gate: &'a EventGateSnapshot,
+        }
+        let entry = SinkQueueEntry {
+            id: 17,
+            event: SinkEvent {
+                action_id: 17,
+                event_type: "notice".into(),
+                table: "notifications".into(),
+                row_values: HashMap::new(),
+                severity: "warning".into(),
+                at_lsn: Lsn(9),
+            },
+            row_id: RowId(3),
+            attempts: 1,
+            gate: EventGateSnapshot::default(),
+        };
+        let old = OldEntry {
+            id: entry.id,
+            event: OldEvent {
+                event_type: &entry.event.event_type,
+                table: &entry.event.table,
+                row_values: &entry.event.row_values,
+                severity: &entry.event.severity,
+                at_lsn: entry.event.at_lsn,
+            },
+            row_id: entry.row_id,
+            attempts: entry.attempts,
+            gate: &entry.gate,
+        };
+        let old_bytes = bincode::serde::encode_to_vec(&old, bincode::config::standard()).unwrap();
+        assert_eq!(
+            bincode::serde::encode_to_vec(&entry, bincode::config::standard()).unwrap(),
+            old_bytes
+        );
+        let (decoded, _): (SinkQueueEntry, usize) =
+            bincode::serde::decode_from_slice(&old_bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded.event.action_id, 17);
+    }
+}
+
+#[cfg(test)]
+mod quiescent_queue_tests {
+    use super::*;
+
+    #[test]
+    fn dispatcher_queue_write_after_quiescence_has_a_typed_refusal() {
+        let database = Database::open_memory();
+        database.event_bus.close_dispatcher_queue_writes();
+        assert!(matches!(
+            database.event_bus.begin_dispatcher_queue_mutation(),
+            Err(Error::EventBusQueueQuiescent)
+        ));
     }
 }

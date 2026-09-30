@@ -16,13 +16,13 @@
 //!
 //! The ordering itself was never the problem, and these journeys do not ask for
 //! it to change. Proving the root before adopting a companion is what keeps a
-//! legacy or corrupt file byte-for-byte untouched when the open is refused.
+//! unsupported or corrupt file byte-for-byte untouched when the open is refused.
 //! What they ask is that the stretch be COVERED: a claim taken early enough to
 //! span it, carrying no record, saying nothing about serving.
 //!
 //! Which brings the second half, and it is not a detail. A claim taken before
 //! the store has been proven readable is a claim taken on files that turn out
-//! to be refusable — a legacy layout, a corrupt root, a file that is not a
+//! to be refusable — an unsupported layout, a corrupt root, a file that is not a
 //! store at all. Every one of those opens must leave the directory exactly as
 //! it found it. An operator who runs a writer against the wrong file and is
 //! correctly refused must not be left with a companion sitting beside that
@@ -446,7 +446,7 @@ fn a_root_the_writer_will_refuse_is_still_claimed_before_it_is_judged() {
     let outcome = writer
         .thread_result()
         .expect("the writer thread finishes")
-        .expect_err("a legacy root is refused, never opened");
+        .expect_err("an unsupported root is refused, never opened");
     assert!(
         !outcome.is_empty(),
         "the refusal names what was wrong with the root",

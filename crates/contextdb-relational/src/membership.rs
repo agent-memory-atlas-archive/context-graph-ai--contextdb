@@ -42,6 +42,23 @@ fn credit(budget: &Budget, bytes: usize) -> Result<Option<ReadCredit>> {
         .transpose()
 }
 
+/// What one image key costs: its own header, the directed slot per column and
+/// the clone each column's value keeps.
+fn key_bytes(key: &IndexKey) -> usize {
+    key.iter().fold(
+        std::mem::size_of::<Key>()
+            + 2 * std::mem::size_of::<usize>()
+            + key.len() * std::mem::size_of::<DirectedValue>(),
+        |bytes, value| {
+            let value = match value {
+                DirectedValue::Asc(v) => &v.0,
+                DirectedValue::Desc(v) => &v.0,
+            };
+            bytes.saturating_add(value.estimated_bytes())
+        },
+    )
+}
+
 fn height(link: &Link) -> u16 {
     link.as_ref().map_or(0, |n| n.height)
 }
@@ -231,18 +248,7 @@ impl MembershipImage {
             self.since = since;
             return Ok(());
         }
-        let bytes = key.iter().fold(
-            std::mem::size_of::<Key>()
-                + 2 * std::mem::size_of::<usize>()
-                + key.len() * std::mem::size_of::<DirectedValue>(),
-            |bytes, value| {
-                let value = match value {
-                    DirectedValue::Asc(v) => &v.0,
-                    DirectedValue::Desc(v) => &v.0,
-                };
-                bytes.saturating_add(value.estimated_bytes())
-            },
-        );
+        let bytes = key_bytes(key);
         let charge = credit(&self.budget, bytes)?;
         let key = Arc::new(Key {
             values: key.clone(),
@@ -258,6 +264,74 @@ impl MembershipImage {
         self.root = root;
         self.since = self.since.max(tx);
         Ok(())
+    }
+
+    /// What this image is holding, counted from the nodes themselves.
+    ///
+    /// Deliberately INDEPENDENT of [`key_bytes`], which is the arithmetic the
+    /// image charges itself on insert: an audit that called the charge's own
+    /// function would only prove that a function equals itself. This counts
+    /// each node allocation, and for each distinct key the key allocation, the
+    /// directed slot per key column at the `Vec`'s own capacity, and the clone
+    /// each column value owns -- the same rule the rest of
+    /// `RetainedStructureBytes` uses for an owned `Vec`.
+    pub fn counted_bytes(&self) -> usize {
+        fn counted_key_bytes(key: &IndexKey) -> usize {
+            key.iter().fold(
+                std::mem::size_of::<Key>()
+                    + 2 * std::mem::size_of::<usize>()
+                    + key
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<DirectedValue>()),
+                |bytes, value| {
+                    let value = match value {
+                        DirectedValue::Asc(v) => &v.0,
+                        DirectedValue::Desc(v) => &v.0,
+                    };
+                    bytes.saturating_add(value.estimated_bytes())
+                },
+            )
+        }
+        fn walk(link: &Link, bytes: &mut usize) {
+            let Some(node) = link else { return };
+            *bytes = bytes
+                .saturating_add(std::mem::size_of::<Node>() + 2 * std::mem::size_of::<usize>());
+            // One key is shared by every node that carries the same key
+            // identity, so it is counted where the node that owns the Arc
+            // strong count of one sits.
+            if Arc::strong_count(&node.key) == 1 {
+                *bytes = bytes.saturating_add(counted_key_bytes(&node.key.values));
+            }
+            walk(&node.left, bytes);
+            walk(&node.right, bytes);
+        }
+        let mut bytes = 0usize;
+        walk(&self.root, &mut bytes);
+        bytes
+    }
+
+    /// Visit each retained charge once, including keys shared by path copies.
+    #[doc(hidden)]
+    pub fn held_charge_bytes_for_test(&self, seen: &mut std::collections::HashSet<usize>) -> usize {
+        fn walk(link: &Link, seen: &mut std::collections::HashSet<usize>) -> usize {
+            let Some(node) = link else { return 0 };
+            if !seen.insert(Arc::as_ptr(node) as usize) {
+                return 0;
+            }
+            let mut bytes = node._credit.as_ref().map_or(0, ReadCredit::bytes_for_test);
+            if seen.insert(Arc::as_ptr(&node.key) as usize) {
+                bytes = bytes.saturating_add(
+                    node.key
+                        ._credit
+                        .as_ref()
+                        .map_or(0, ReadCredit::bytes_for_test),
+                );
+            }
+            bytes
+                .saturating_add(walk(&node.left, seen))
+                .saturating_add(walk(&node.right, seen))
+        }
+        walk(&self.root, seen)
     }
 
     /// Admit an image built by a detached loader before it is published.

@@ -143,6 +143,7 @@ fn received_migration(ddl: Vec<DdlChange>, include_row: bool) -> ReceivedSchemaF
                     table_generation,
                 )
                 .unwrap(),
+                author: None,
             }
         })
         .collect();
@@ -200,6 +201,7 @@ fn receipt() -> SyncApplyReceipt {
         incarnation: Incarnation(11),
         source_lsn: Lsn(90),
         dependency_complete: true,
+        hub_contact_ms: None,
     }
 }
 

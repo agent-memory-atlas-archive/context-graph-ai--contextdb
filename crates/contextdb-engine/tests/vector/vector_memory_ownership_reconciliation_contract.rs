@@ -267,6 +267,12 @@ macro_rules! receipt {
     };
 }
 
+fn logical_non_vector(db: &Database) -> usize {
+    receipt!(db)
+        .non_vector_total
+        .saturating_sub(db.__durable_writer_charged_bytes_for_test())
+}
+
 macro_rules! assert_same_receipt {
     ($actual:expr, $expected:expr, $message:literal) => {{
         let actual = &$actual;
@@ -443,6 +449,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
 
     let mut stable_reopen_receipt: Option<VectorMemoryOwnershipReceiptForTest> = None;
     let mut fresh_control_receipt: Option<VectorMemoryOwnershipReceiptForTest> = None;
+    let mut fresh_control_writer_retention: Option<usize> = None;
     // Independent of the accountant total: the fresh surviving-state
     // control's own physical row-version population, counted directly
     // through the same test seam used against the reopened store below.
@@ -498,6 +505,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
 
         if round == 0 {
             let before_embedding_receipt = receipt!(&db);
+            let before_writer_retention = db.__durable_writer_charged_bytes_for_test();
             // The store's own public per-vector byte size (never a literal
             // byte count): the production F32 quantization sizing.
             let one_vector_payload_bytes = contextdb_core::VectorQuantization::F32.storage_bytes(3);
@@ -548,6 +556,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             )
             .expect("replace alpha's vector atomically");
             let after_embedding_receipt = receipt!(&db);
+            let after_writer_retention = db.__durable_writer_charged_bytes_for_test();
             let after_physical_versions = db.__physical_version_count_for_test("ownership_items");
             assert_eq!(
                 after_embedding_receipt.raw_vector_bodies,
@@ -571,7 +580,12 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
                  the accountant"
             );
             assert_eq!(
-                after_embedding_receipt.non_vector_total, before_embedding_receipt.non_vector_total,
+                after_embedding_receipt
+                    .non_vector_total
+                    .saturating_sub(after_writer_retention),
+                before_embedding_receipt
+                    .non_vector_total
+                    .saturating_sub(before_writer_retention),
                 "an equal-shaped replacement leaves the retained non-vector charge \
                  unchanged: the superseded version's bytes are released at this same \
                  commit, exactly offsetting the new version's identical-size charge"
@@ -668,6 +682,8 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             drop(control);
             let control = open_with_accountant(&control_path, control_accountant.clone());
             fresh_control_receipt = Some(receipt!(&control));
+            fresh_control_writer_retention =
+                Some(control.__durable_writer_charged_bytes_for_test());
             assert_exact_reconciliation!(
                 &control,
                 control_accountant,
@@ -707,7 +723,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             // zero rows, so the retained-tombstone figure below isolates
             // only the incremental cost of the lineage's history, never the
             // schema's own standing overhead.
-            let lineage_baseline_non_vector_total = receipt!(&lineage).non_vector_total;
+            let lineage_baseline_non_vector_total = logical_non_vector(&lineage);
             insert(&lineage, "ownership_items", 0x101, "alpha", 0);
             lineage
                 .execute(
@@ -753,8 +769,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
                 "currency compaction prunes the isolated lineage's update-superseded versions, \
                  proving a real prune, even though the lineage ends in a delete"
             );
-            let lineage_retained_non_vector_bytes = receipt!(&lineage)
-                .non_vector_total
+            let lineage_retained_non_vector_bytes = logical_non_vector(&lineage)
                 .checked_sub(lineage_baseline_non_vector_total)
                 .expect(
                     "the retained tombstone's charge cannot be lower than the bare schema's \
@@ -784,6 +799,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             );
         let expected_reconciled_non_vector_total = expected_control
             .non_vector_total
+            .saturating_sub(fresh_control_writer_retention.expect("control writer retention was measured"))
             + retained_deleted_row_non_vector_bytes
                 .expect("the isolated deleted-row-lineage control's retained non-vector bytes were measured");
         if round == 0 {
@@ -798,8 +814,10 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
                 "the reopened HISTORY ALL store still physically holds the superseded history"
             );
             assert_eq!(
-                receipt!(&reopened).non_vector_total,
-                expected_control.non_vector_total,
+                logical_non_vector(&reopened),
+                expected_control.non_vector_total.saturating_sub(
+                    fresh_control_writer_retention.expect("control writer retention was measured")
+                ),
                 "reopen's logical non-vector charge equals the fresh control without \
                  needing a compaction loop -- the retained tombstone's bytes were already \
                  released at the commit that superseded or deleted them, so reopen does \
@@ -856,7 +874,8 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
              the retained tombstone is relational-row history, not vector-index state"
         );
         assert_eq!(
-            receipt.non_vector_total, expected_reconciled_non_vector_total,
+            logical_non_vector(&reopened),
+            expected_reconciled_non_vector_total,
             "the reopened store's non-vector charge reconciles to the control plus the \
              deleted row's permanently retained tombstone bytes; every engine-held copy is \
              charged, and a HISTORY ALL tombstone stays an engine-held copy forever"
@@ -918,7 +937,7 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             "two replacements leave the live row plus two retained historical copies \
              physically resident, distinct from a single-version table"
         );
-        let pinned_receipt = receipt!(&db);
+        let pinned_logical_non_vector = logical_non_vector(&db);
 
         // Exact per-snapshot visibility (docs/architecture.md:337): the held
         // pin's registered snapshot was taken before either UPDATE, so it can
@@ -975,9 +994,9 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             "the deferred pass physically removes exactly the one invisible intermediate \
              version, leaving the pin-visible version and the live row resident"
         );
-        let deferred_receipt = receipt!(&db);
+        let deferred_logical_non_vector = logical_non_vector(&db);
         assert_eq!(
-            deferred_receipt.non_vector_total, pinned_receipt.non_vector_total,
+            deferred_logical_non_vector, pinned_logical_non_vector,
             "pruning the pin-invisible intermediate version while the pin is held leaves the \
              retained non-vector charge unchanged: that version's bytes were already released \
              at the commit that superseded it, so physically removing it is a logical no-op \
@@ -1013,14 +1032,14 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             "the resident row-held F32 projection bytes of the retained historical copy \
              persist across a reopen, counted independently of the accountant"
         );
-        let reopened_receipt = receipt!(&db);
+        let reopened_logical_non_vector = logical_non_vector(&db);
         assert_eq!(
-            reopened_receipt.non_vector_total, deferred_receipt.non_vector_total,
+            reopened_logical_non_vector, deferred_logical_non_vector,
             "reopen charges the identical retained non-vector total for the one \
              still-deferred historical copy, not merely the live row"
         );
 
-        let before_release_compaction = receipt!(&db);
+        let before_release_logical_non_vector = logical_non_vector(&db);
         let release_report = db
             .compact_currency_versions()
             .expect("prune the released historical copy through the production door");
@@ -1036,9 +1055,9 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             1,
             "compaction physically removes exactly the one pruned historical copy, once"
         );
-        let after_release_compaction = receipt!(&db);
+        let after_release_logical_non_vector = logical_non_vector(&db);
         assert_eq!(
-            before_release_compaction.non_vector_total, after_release_compaction.non_vector_total,
+            before_release_logical_non_vector, after_release_logical_non_vector,
             "releasing the pin and compacting leaves the retained non-vector charge unchanged: \
              the one now-pruned historical copy's bytes were already released at the commit \
              that superseded it, so physically removing it is a logical no-op and never \
@@ -1063,8 +1082,8 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
              already-pruned physical version population"
         );
         assert_eq!(
-            receipt!(&db).non_vector_total,
-            after_release_compaction.non_vector_total,
+            logical_non_vector(&db),
+            after_release_logical_non_vector,
             "reopening again after the release-triggered compaction retains the exact same \
              retained non-vector figure"
         );
@@ -1259,6 +1278,7 @@ async fn received_image_replacement_is_idempotent_and_its_prepublication_failure
         vector(1),
     );
     let changed = receipt!(&edge);
+    let changed_writer_retention = edge.__durable_writer_charged_bytes_for_test();
     assert!(
         changed.raw_vector_bodies <= initial.raw_vector_bodies,
         "same-size replacement cannot retain old plus new raw vector bodies: initial={} changed={}",
@@ -1312,14 +1332,19 @@ async fn received_image_replacement_is_idempotent_and_its_prepublication_failure
         vector(1),
     );
     let repeated = receipt!(&edge);
+    let repeated_writer_retention = edge.__durable_writer_charged_bytes_for_test();
     assert_same_vector_owners!(
         repeated,
         changed,
         "repeating a changed image cannot grow a second ownership set"
     );
     assert_eq!(
-        repeated.non_vector_total,
-        changed.non_vector_total
+        repeated
+            .non_vector_total
+            .saturating_sub(repeated_writer_retention),
+        changed
+            .non_vector_total
+            .saturating_sub(changed_writer_retention)
             + (edge
                 .table_meta("received_items")
                 .expect("the received table is declared")
@@ -2511,6 +2536,7 @@ fn durable_purge_and_compaction_fault_journeys_reconcile_to_a_fresh_control() {
     drop(control);
     let control = open_with_accountant(&control_path, control_accountant.clone());
     let control_receipt = receipt!(&control);
+    let control_writer_retention = control.__durable_writer_charged_bytes_for_test();
     assert_exact_reconciliation!(
         &control,
         control_accountant,
@@ -2533,8 +2559,12 @@ fn durable_purge_and_compaction_fault_journeys_reconcile_to_a_fresh_control() {
         "the reopened HISTORY ALL store still physically holds bravo's superseded history"
     );
     assert_eq!(
-        receipt!(&reopened).non_vector_total,
-        control_receipt.non_vector_total,
+        receipt!(&reopened)
+            .non_vector_total
+            .saturating_sub(reopened.__durable_writer_charged_bytes_for_test()),
+        control_receipt
+            .non_vector_total
+            .saturating_sub(control_writer_retention),
         "reopen's logical non-vector charge equals the fresh control without needing a \
          compaction loop -- the retained history's bytes were already released at the \
          commit that superseded or deleted them, so reopen does not re-charge history \
@@ -2561,11 +2591,17 @@ fn durable_purge_and_compaction_fault_journeys_reconcile_to_a_fresh_control() {
         control_physical_versions,
         "compaction brings the reopened store to the control's physical version set"
     );
-    assert_same_receipt!(
+    assert_same_vector_owners!(
         receipt!(&reopened),
         control_receipt,
-        "once the retained history is physically pruned, the reopened store reconciles \
-         to the fresh surviving-state control"
+        "once the retained history is physically pruned, vector ownership matches the control"
+    );
+    assert_eq!(
+        logical_non_vector(&reopened),
+        control_receipt
+            .non_vector_total
+            .saturating_sub(control_writer_retention),
+        "after compaction, retained non-vector state matches the fresh control"
     );
     assert_exact_reconciliation!(
         &reopened,
@@ -2666,4 +2702,172 @@ fn rename_drop_and_database_drop_release_vector_owners_once_without_old_identity
         0,
         "all drop paths release exactly once"
     );
+}
+
+/// The consumer marks every passage searchable after each extraction pass.
+/// HISTORY ALL preserves those scalar/no-op versions; their immutable vector
+/// bytes have one resident allocation while directory memberships keep growing.
+#[test]
+#[serial]
+fn retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_write() {
+    let root = TempDir::new().expect("task-scoped retained journey store");
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    let db = open_with_accountant(
+        &root.path().join("retained-scalar.redb"),
+        accountant.clone(),
+    );
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    db.execute("CREATE TABLE passages (id UUID PRIMARY KEY, is_searchable BOOLEAN NOT NULL, embedding VECTOR(768) SEARCH_MODE INDEXED AUTO_INDEX_AT 1 CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 1))", &empty()).unwrap();
+    let mut embedding = vec![0.0; 768];
+    embedding[0] = 1.0;
+    for row in 1..=16 {
+        db.execute(
+            "INSERT INTO passages (id, is_searchable, embedding) VALUES ($id, false, $embedding)",
+            &params([
+                ("id", Value::Uuid(Uuid::from_u128(row))),
+                ("embedding", Value::Vector(embedding.clone())),
+            ]),
+        )
+        .unwrap();
+    }
+    let mut interval_snapshots = vec![db.snapshot()];
+    let mut graph_publications = 0usize;
+    let initial = receipt!(&db);
+    assert_eq!(initial.raw_vector_bodies, 16 * 768 * 4);
+    // Keep one fixed finite limit for all publication/maintenance/steady cycles.
+    db.set_memory_limit(Some(initial.accountant_total + 4 * 1024 * 1024))
+        .unwrap();
+    for cycle in 1..=64 {
+        db.execute("UPDATE passages SET is_searchable = true", &empty())
+            .unwrap();
+        interval_snapshots.push(db.snapshot());
+        let before = receipt!(&db);
+        eprintln!("retained-scalar cycle={cycle} phase=before-maintenance owners={before:?}");
+        let report = db.run_maintenance_cycle().unwrap();
+        assert_eq!(
+            report.vector.first_failure, None,
+            "each publication cycle must maintain its partition"
+        );
+        assert_eq!(report.vector.first_failure_details, None);
+        graph_publications += report.vector.built_partitions;
+        let after = receipt!(&db);
+        eprintln!("retained-scalar cycle={cycle} phase=after-maintenance owners={after:?}");
+        assert_eq!(before.raw_vector_bodies, initial.raw_vector_bodies);
+        assert_eq!(after.raw_vector_bodies, initial.raw_vector_bodies);
+        assert_eq!(after.temporary_workspace, 0);
+        assert_exact_reconciliation!(
+            &db,
+            accountant,
+            "retained scalar publication has exact disjoint owners"
+        );
+    }
+    assert!(
+        graph_publications >= 2,
+        "the declared low thresholds must publish maintained graphs across successive scalar updates"
+    );
+    assert!(
+        db.vector_store_for_test()
+            .partition_info(
+                &VectorIndexRef::new("passages", "embedding"),
+                &VectorPartitionKey::unpartitioned()
+            )
+            .unwrap()
+            .graph_available
+    );
+    let entries = db
+        .vector_store_for_test()
+        .entries_for_index(&VectorIndexRef::new("passages", "embedding"))
+        .unwrap();
+    assert_eq!(
+        entries.len(),
+        16 * 65,
+        "all historical vector memberships remain present"
+    );
+    let identities = entries
+        .iter()
+        .map(|entry| (entry.row_id, entry.created_tx, entry.deleted_tx, entry.lsn))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        identities.len(),
+        16 * 65,
+        "every retained interval has its distinct membership identity"
+    );
+    assert_eq!(interval_snapshots.len(), 65);
+    for snapshot in interval_snapshots {
+        let visible = entries
+            .iter()
+            .filter(|entry| {
+                entry.created_tx.0 <= snapshot.0
+                    && entry
+                        .deleted_tx
+                        .is_none_or(|deleted| deleted.0 > snapshot.0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible.len(),
+            16,
+            "each of all 65 retained snapshot intervals still resolves all passages"
+        );
+        assert!(visible.iter().all(|entry| entry.vector == embedding));
+    }
+    drop(entries);
+    // Complete the final publication's deterministic reclamation before the
+    // quiet-cycle control, without retaining a reader snapshot.
+    let settling = db.run_maintenance_cycle().unwrap();
+    assert_eq!(settling.vector.first_failure, None);
+    assert_eq!(settling.vector.first_failure_details, None);
+    assert_eq!(settling.vector.remaining_partitions, 0);
+    let quiet = receipt!(&db);
+    for cycle in 1..=8 {
+        let report = db.run_maintenance_cycle().unwrap();
+        assert_eq!(report.vector.first_failure, None);
+        assert_eq!(report.vector.first_failure_details, None);
+        assert_eq!(report.vector.built_partitions, 0);
+        assert_eq!(report.vector.remaining_partitions, 0);
+        let after = receipt!(&db);
+        eprintln!("retained-scalar steady={cycle} owners={after:?}");
+        assert_eq!(after.raw_vector_bodies, initial.raw_vector_bodies);
+        assert_same_receipt!(
+            after,
+            quiet,
+            "quiet cycles retain exactly the same ownership receipt"
+        );
+        assert_eq!(after.accountant_total, quiet.accountant_total);
+        assert_exact_reconciliation!(
+            &db,
+            accountant,
+            "steady maintenance has exact disjoint owners"
+        );
+    }
+    let mut distinct_embedding = vec![0.0; 768];
+    distinct_embedding[1] = 1.0;
+    db.execute(
+        "INSERT INTO passages (id, is_searchable, embedding) VALUES ($id, true, $embedding)",
+        &params([
+            ("id", Value::Uuid(Uuid::from_u128(17))),
+            ("embedding", Value::Vector(distinct_embedding.clone())),
+        ]),
+    )
+    .expect("the unchanged finite limit still admits a small write");
+    assert_eq!(receipt!(&db).raw_vector_bodies, 17 * 768 * 4);
+    let nearest = db
+        .execute(
+            "SELECT id FROM passages ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
+            &params([("query", Value::Vector(distinct_embedding))]),
+        )
+        .expect("the fixed finite limit still admits indexed search after a small write");
+    assert_eq!(
+        nearest.rows,
+        vec![vec![Value::Uuid(Uuid::from_u128(17))]],
+        "indexed search returns the distinct vector committed by the small foreground write"
+    );
+    assert_exact_reconciliation!(
+        &db,
+        accountant,
+        "the small write and indexed read leave exact owners"
+    );
+    db.close().unwrap();
+    drop(db);
+    assert_eq!(accountant.usage().used, 0);
+    assert_eq!(accountant.underflow_count_for_test(), 0);
 }

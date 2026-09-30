@@ -20,8 +20,8 @@ use crate::error::TransactionError;
 use crate::sealed::Sealed;
 use crate::transactions::{
     ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTree, DATA_ALLOCATED_TABLE,
-    DATA_FREED_TABLE, PageList, SYSTEM_FREED_TABLE, SystemTableDefinition,
-    TransactionIdWithPagination,
+    DATA_FREED_TABLE, ExternalSnapshotProvider, PageList, SYSTEM_FREED_TABLE,
+    SystemTableDefinition, TransactionIdWithPagination,
 };
 use crate::tree_store::file_backend::FileBackend;
 #[cfg(feature = "logging")]
@@ -309,6 +309,14 @@ impl TransactionGuard {
         }
     }
 
+    pub(crate) fn external(transaction_id: TransactionId) -> Self {
+        Self {
+            transaction_tracker: None,
+            transaction_id: Some(transaction_id),
+            write_transaction: false,
+        }
+    }
+
     pub(crate) fn id(&self) -> TransactionId {
         self.transaction_id.unwrap()
     }
@@ -424,11 +432,53 @@ impl ReadOnlyDatabase {
         Builder::new().open_read_only(path)
     }
 
+    /// Begin a checksum-verifying read at the exact user root captured when
+    /// this read-only database was established. The backend may be an open
+    /// descriptor whose pathname has since been replaced; this method never
+    /// consults that pathname or historical system-tree pages.
+    #[doc(hidden)]
+    pub fn begin_retained_read(
+        &self,
+        snapshot: crate::StorageSnapshotIdentity,
+    ) -> Result<ReadTransaction, TransactionError> {
+        let current = self.begin_read()?;
+        let actual = current.storage_snapshot_identity();
+        drop(current);
+        if actual != snapshot {
+            return Err(StorageError::Corrupted(
+                "retained read-only source does not match the requested snapshot root".to_owned(),
+            )
+            .into());
+        }
+        ReadTransaction::new_external(self.mem.clone(), snapshot)
+    }
+
+    /// Begin a checksum-verifying read at a root whose lifetime the caller
+    /// protects through an authenticated external snapshot registration.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn begin_external_read(
+        &self,
+        snapshot: crate::StorageSnapshotIdentity,
+    ) -> Result<ReadTransaction, TransactionError> {
+        ReadTransaction::new_external(self.mem.clone(), snapshot)
+    }
+
     fn new(
         file: Box<dyn StorageBackend>,
         page_size: usize,
         region_size: Option<u64>,
         cache_size: usize,
+    ) -> Result<Self, DatabaseError> {
+        Self::new_inner(file, page_size, region_size, cache_size, false)
+    }
+
+    fn new_inner(
+        file: Box<dyn StorageBackend>,
+        page_size: usize,
+        region_size: Option<u64>,
+        cache_size: usize,
+        external_read: bool,
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
@@ -441,21 +491,24 @@ impl ReadOnlyDatabase {
             region_size,
             cache_size,
             true,
+            external_read,
         )?;
         let mem = Arc::new(mem);
-        // If the last transaction used 2-phase commit and updated the allocator state table, then
-        // we can just load the allocator state from there. Otherwise, we need a full repair
-        if let Some(tree) = Database::get_allocator_state_table(&mem)? {
-            mem.load_allocator_state(&tree)?;
-        } else {
-            #[cfg(feature = "logging")]
-            warn!(
-                "Database {:?} not shutdown cleanly. Repair required",
-                &file_path
-            );
-            return Err(DatabaseError::RepairAborted);
+        // External readers use a registered user root. Allocator state may
+        // belong to a concurrently committing writer and is never consulted.
+        if !external_read {
+            if let Some(tree) = Database::get_allocator_state_table(&mem)? {
+                mem.load_allocator_state(&tree)?;
+            } else {
+                #[cfg(feature = "logging")]
+                warn!(
+                    "Database {:?} not shutdown cleanly. Repair required",
+                    &file_path
+                );
+                return Err(DatabaseError::RepairAborted);
+            }
         }
-
+        // This handle owns only its local read-transaction tracking.
         let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
         let db = Self {
             mem,
@@ -502,6 +555,9 @@ impl ReadOnlyDatabase {
 pub struct Database {
     mem: Arc<TransactionalMemory>,
     transaction_tracker: Arc<TransactionTracker>,
+    read_only_handoff_prepared: bool,
+    #[cfg(feature = "test-seams")]
+    deferred_free_commit_io_fault: std::sync::atomic::AtomicBool,
 }
 
 impl ReadableDatabase for Database {
@@ -619,6 +675,7 @@ impl Database {
         // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
         // can cancel the compaction without requiring a full repair afterwards
         let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+        txn.reclaim_all_deferred_pages();
         if txn.list_persistent_savepoints()?.next().is_some() {
             return Err(CompactionError::PersistentSavepointExists);
         }
@@ -629,6 +686,7 @@ impl Database {
         txn.commit().map_err(|e| e.into_storage_error())?;
         // Repeat, just in case executing list_persistent_savepoints() created a new table
         let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+        txn.reclaim_all_deferred_pages();
         txn.set_two_phase_commit(true);
         txn.commit().map_err(|e| e.into_storage_error())?;
         // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
@@ -643,6 +701,7 @@ impl Database {
             let mut progress = false;
 
             let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+            txn.reclaim_all_deferred_pages();
             if txn.compact_pages()? {
                 progress = true;
                 txn.commit().map_err(|e| e.into_storage_error())?;
@@ -652,6 +711,7 @@ impl Database {
 
             // Double commit to free up the relocated pages for reuse
             let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+            txn.reclaim_all_deferred_pages();
             txn.set_two_phase_commit(true);
             // Also shrink the database file by the maximum amount
             txn.set_shrink_policy(ShrinkPolicy::Maximum);
@@ -660,6 +720,7 @@ impl Database {
             // TODO: this really shouldn't be necessary, but the data freed tree is a system table
             // and so free'ing up its pages causes more deletes from the system tree
             let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+            txn.reclaim_all_deferred_pages();
             txn.set_two_phase_commit(true);
             // Also shrink the database file by the maximum amount
             txn.set_shrink_policy(ShrinkPolicy::Maximum);
@@ -700,11 +761,23 @@ impl Database {
         Ok(progress)
     }
 
+    /// Observe actual user-table and catalog writes for this database instance only.
+    /// The guard restores the previous observer, including during unwinding.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn observe_table_writes_for_test(
+        &self,
+        observer: crate::TableWriteObserverForTest,
+    ) -> crate::TableWriteObservationGuardForTest {
+        crate::table_write_observer::install(
+            self.transaction_tracker.table_write_observer.clone(),
+            observer,
+        )
+    }
+
     #[doc(hidden)]
     pub fn has_live_read_transactions(&self) -> bool {
-        self.transaction_tracker
-            .oldest_live_read_transaction()
-            .is_some()
+        self.transaction_tracker.has_native_read_transactions()
     }
 
     #[cfg(feature = "test-seams")]
@@ -721,6 +794,152 @@ impl Database {
         let snapshot = write.storage_statistics_snapshot(read)?;
         write.abort()?;
         Ok(snapshot)
+    }
+
+    /// Inspect the registered roots and their deferred pages on demand.
+    /// The transaction aborts without publishing any mutation; this full
+    /// diagnostic walk is never part of cursor or writer admission.
+    #[doc(hidden)]
+    pub fn external_snapshot_retention_stats(
+        &self,
+    ) -> Result<crate::ExternalSnapshotRetentionStats> {
+        let write = self
+            .begin_write()
+            .map_err(|error| error.into_storage_error())?;
+        let stats = write.external_snapshot_retention_stats()?;
+        write.abort()?;
+        Ok(stats)
+    }
+
+    /// Count every durable deferred-free entry and extent, including empty
+    /// entries and later housekeeping work. This diagnostic neither reclaims
+    /// pages nor commits; the writer guard keeps both system roots stable.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn deferred_free_backlog_for_test(&self) -> Result<[(usize, usize); 2]> {
+        let write = self
+            .begin_write()
+            .map_err(|error| error.into_storage_error())?;
+        let system_tree = TableTree::new(
+            self.mem.get_system_root(),
+            PageHint::None,
+            Arc::new(TransactionGuard::fake()),
+            self.mem.clone(),
+        )?;
+        let mut counts = [(0, 0); 2];
+        for (index, definition) in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE]
+            .into_iter()
+            .enumerate()
+        {
+            let table_name = definition.name();
+            let Some(definition) = system_tree
+                .get_table::<TransactionIdWithPagination, PageList>(table_name, TableType::Normal)
+                .map_err(|error| {
+                    error.into_storage_error_or_corrupted("Deferred free table corrupted")
+                })?
+            else {
+                continue;
+            };
+            let InternalTableDefinition::Normal { table_root, .. } = definition else {
+                unreachable!()
+            };
+            let table: ReadOnlyTable<TransactionIdWithPagination, PageList> = ReadOnlyTable::new(
+                table_name.to_string(),
+                table_root,
+                PageHint::None,
+                Arc::new(TransactionGuard::fake()),
+                self.mem.clone(),
+            )?;
+            for entry in table.range::<TransactionIdWithPagination>(..)? {
+                let (_, pages) = entry?;
+                counts[index].0 += 1;
+                counts[index].1 += pages.value().len();
+            }
+        }
+        drop(system_tree);
+        write.abort()?;
+        Ok(counts)
+    }
+
+    /// Begin a read at one root currently supplied by the authenticated
+    /// external snapshot provider. This does not register another lifetime;
+    /// the provider's owner remains the sole authority for retention.
+    #[doc(hidden)]
+    pub fn begin_external_read(
+        &self,
+        snapshot: crate::StorageSnapshotIdentity,
+    ) -> Result<ReadTransaction, TransactionError> {
+        self.transaction_tracker
+            .refresh_external_snapshots(&self.mem)?;
+        self.begin_admitted_external_read(snapshot)
+    }
+
+    /// Begin an external read without waiting for another provider refresh.
+    /// A busy refresh returns an I/O error with `WouldBlock`. The provider
+    /// itself remains responsible for nonblocking coordination when required.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn begin_external_read_nonblocking(
+        &self,
+        snapshot: crate::StorageSnapshotIdentity,
+    ) -> Result<ReadTransaction, TransactionError> {
+        self.transaction_tracker
+            .try_refresh_external_snapshots(&self.mem)?;
+        self.begin_admitted_external_read(snapshot)
+    }
+
+    /// Whether nonblocking admission met an occupied provider-refresh mutex.
+    /// Provider I/O failures, including their own `WouldBlock`, are distinct.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn is_external_snapshot_refresh_busy(error: &TransactionError) -> bool {
+        matches!(error,
+            TransactionError::Storage(StorageError::Io(error))
+                if error.get_ref().is_some_and(|cause|
+                    cause.is::<crate::transaction_tracker::ExternalSnapshotRefreshBusy>())
+        )
+    }
+
+    fn begin_admitted_external_read(
+        &self,
+        snapshot: crate::StorageSnapshotIdentity,
+    ) -> Result<ReadTransaction, TransactionError> {
+        if !self.transaction_tracker.has_external_snapshot(snapshot) {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "external snapshot is no longer registered",
+            ))
+            .into());
+        }
+        ReadTransaction::new_external(self.mem.clone(), snapshot)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn with_external_snapshot_refresh_lock_for_test<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        self.transaction_tracker
+            .with_external_snapshot_refresh_lock_for_test(operation)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn external_snapshot_retained_pages_for_test(&self) -> Result<Vec<[u8; 8]>> {
+        let write = self
+            .begin_write()
+            .map_err(|error| error.into_storage_error())?;
+        let pages = write.external_snapshot_retained_pages_for_test()?;
+        write.abort()?;
+        Ok(pages)
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn external_snapshot_page_allocated_for_test(&self, page: [u8; 8]) -> bool {
+        self.mem
+            .is_allocated(crate::tree_store::PageNumber::from_le_bytes(page))
     }
 
     #[cfg_attr(not(debug_assertions), expect(dead_code))]
@@ -936,6 +1155,7 @@ impl Database {
         Ok([data_root, system_root])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         file: Box<dyn StorageBackend>,
         allow_initialize: bool,
@@ -943,6 +1163,8 @@ impl Database {
         region_size: Option<u64>,
         cache_size: usize,
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
+        external_snapshot_provider: Option<ExternalSnapshotProvider>,
+        deferred_free_budget: (usize, usize),
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
@@ -954,6 +1176,7 @@ impl Database {
             page_size,
             region_size,
             cache_size,
+            false,
             false,
         )?;
         let mut mem = Arc::new(mem);
@@ -989,8 +1212,20 @@ impl Database {
 
         let db = Database {
             mem,
-            transaction_tracker: Arc::new(TransactionTracker::new(next_transaction_id)),
+            transaction_tracker: Arc::new(TransactionTracker::new_with_external_snapshots(
+                next_transaction_id,
+                external_snapshot_provider,
+                deferred_free_budget,
+            )),
+            read_only_handoff_prepared: false,
+            #[cfg(feature = "test-seams")]
+            deferred_free_commit_io_fault: std::sync::atomic::AtomicBool::new(false),
         };
+
+        // Repair reconstructs current and deferred allocation state without
+        // reusing pages. Authenticate every external root before the first
+        // housekeeping transaction can reclaim or allocate anything.
+        db.transaction_tracker.refresh_external_snapshots(&db.mem)?;
 
         // Restore the tracker state for any persistent savepoints
         let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1080,12 +1315,21 @@ impl Database {
     /// write may be in progress at a time. If a write is in progress, this function will block
     /// until it completes.
     pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
+        if self.read_only_handoff_prepared {
+            debug_assert!(
+                self.mem.read_only_handoff_is_clean(),
+                "a quiesced writer must retain a clean committed header"
+            );
+            return Err(TransactionError::Storage(StorageError::DatabaseClosed));
+        }
         // Fail early if there has been an I/O error -- nothing can be committed in that case
         self.mem.check_io_errors()?;
         let guard = TransactionGuard::new_write(
             self.transaction_tracker.start_write_transaction(),
             self.transaction_tracker.clone(),
         );
+        self.transaction_tracker
+            .refresh_external_snapshots(&self.mem)?;
         WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
             .map_err(|e| e.into())
     }
@@ -1101,16 +1345,78 @@ impl Database {
 
         Ok(())
     }
+
+    /// Settle eligible deferred frees through ordinary bounded commits before
+    /// a caller closes an idle writer. Each commit retains the builder's
+    /// extent and entry limits; a live snapshot leaves its protected backlog
+    /// for a later writer instead of making shutdown wait for that reader.
+    #[doc(hidden)]
+    pub fn drain_deferred_frees(&self) -> Result<(), Error> {
+        loop {
+            let mut tx = self.begin_write()?;
+            if self
+                .transaction_tracker
+                .oldest_live_read_transaction()
+                .is_some()
+                || self.transaction_tracker.any_savepoint_exists()
+                || tx.list_persistent_savepoints()?.next().is_some()
+                || !tx.pending_free_pages()?
+            {
+                tx.abort()?;
+                return Ok(());
+            }
+            tx.set_shrink_policy(ShrinkPolicy::Maximum);
+            #[cfg(feature = "test-seams")]
+            if self
+                .deferred_free_commit_io_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                tx.abort()?;
+                return Err(Error::Io(io::Error::other(
+                    "injected deferred-free commit I/O failure",
+                )));
+            }
+            tx.commit()?;
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn fail_next_deferred_free_commit_for_test(&self) {
+        self.deferred_free_commit_io_fault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Finish writable housekeeping while the caller still owns its writer
+    /// lock, then allow read-only opens over the committed root during a
+    /// graceful drain. The caller must prevent all later writes. Drop releases
+    /// this handle without another housekeeping or header write.
+    pub fn prepare_read_only_handoff(&mut self) -> Result<(), Error> {
+        if !self.read_only_handoff_prepared {
+            self.ensure_allocator_state_table_and_trim()?;
+            self.mem.publish_read_only_handoff()?;
+            self.read_only_handoff_prepared = true;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
-        if !thread::panicking() && self.ensure_allocator_state_table_and_trim().is_err() {
+        if !thread::panicking()
+            && !self.read_only_handoff_prepared
+            && self.ensure_allocator_state_table_and_trim().is_err()
+        {
             #[cfg(feature = "logging")]
             warn!("Failed to write allocator state table. Repair may be required at restart.");
         }
 
-        if self.mem.close().is_err() {
+        let close = if self.read_only_handoff_prepared {
+            self.mem.close_after_read_only_handoff()
+        } else {
+            self.mem.close()
+        };
+        if close.is_err() {
             #[cfg(feature = "logging")]
             warn!("Failed to flush database file. Repair may be required at restart.");
         }
@@ -1151,6 +1457,7 @@ pub struct Builder {
     region_size: Option<u64>,
     cache_size: usize,
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
+    deferred_free_budget: (usize, usize),
 }
 
 impl Builder {
@@ -1170,6 +1477,7 @@ impl Builder {
             // TODO: Default should probably take into account the total system memory
             cache_size: 1024 * 1024 * 1024,
             repair_callback: Box::new(|_| {}),
+            deferred_free_budget: (usize::MAX, usize::MAX),
         }
     }
 
@@ -1199,6 +1507,20 @@ impl Builder {
     pub fn set_page_size(&mut self, size: usize) -> &mut Self {
         assert!(size.is_power_of_two());
         self.page_size = std::cmp::max(size, 512);
+        self
+    }
+
+    /// Bound deferred reclamation in each durable commit, including open and
+    /// close housekeeping. Remaining entries stay in the durable free trees.
+    /// The first limit counts allocated extents, each of which can span multiple
+    /// physical pages. The second counts free-list entries, including empty lists.
+    /// These counts do not bound bytes or physical pages reclaimed per commit.
+    /// Both trees receive a share; the older pending key receives the extra unit.
+    /// Explicit whole-file `Database::compact` still drains all pending frees.
+    #[cfg(any(test, feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn set_deferred_free_budget(&mut self, extents: usize, entries: usize) -> &mut Self {
+        self.deferred_free_budget = (extents, entries);
         self
     }
 
@@ -1234,6 +1556,8 @@ impl Builder {
             self.region_size,
             self.cache_size,
             &self.repair_callback,
+            None,
+            self.deferred_free_budget,
         )
     }
 
@@ -1248,6 +1572,48 @@ impl Builder {
             None,
             self.cache_size,
             &self.repair_callback,
+            None,
+            self.deferred_free_budget,
+        )
+    }
+
+    /// Open an existing database with the given backend.
+    ///
+    /// Unlike [`Self::create_with_backend`], this never initializes empty storage.
+    /// The caller must keep exclusive access to the backend for the database's lifetime.
+    pub fn open_with_backend(
+        &self,
+        backend: impl StorageBackend,
+    ) -> Result<Database, DatabaseError> {
+        Database::new(
+            Box::new(backend),
+            false,
+            self.page_size,
+            None,
+            self.cache_size,
+            &self.repair_callback,
+            None,
+            self.deferred_free_budget,
+        )
+    }
+
+    /// Open existing storage while consulting a complete authenticated set of
+    /// external snapshot roots before every writer allocation/reclaim boundary.
+    #[doc(hidden)]
+    pub fn open_with_backend_and_external_snapshots(
+        &self,
+        backend: impl StorageBackend,
+        provider: ExternalSnapshotProvider,
+    ) -> Result<Database, DatabaseError> {
+        Database::new(
+            Box::new(backend),
+            false,
+            self.page_size,
+            None,
+            self.cache_size,
+            &self.repair_callback,
+            Some(provider),
+            self.deferred_free_budget,
         )
     }
 
@@ -1270,6 +1636,36 @@ impl Builder {
         )
     }
 
+    /// Opens an existing read-only database through a caller-owned backend.
+    ///
+    /// The caller must provide any required coordination and keep the backend's
+    /// physical storage stable for the database lifetime.
+    #[doc(hidden)]
+    pub fn open_read_only_with_backend(
+        &self,
+        backend: impl StorageBackend,
+    ) -> Result<ReadOnlyDatabase, DatabaseError> {
+        ReadOnlyDatabase::new(Box::new(backend), self.page_size, None, self.cache_size)
+    }
+
+    /// Open a read-only backend for an externally registered, retained root.
+    /// The caller must preserve that root's pages and use `begin_external_read`.
+    /// No allocator state or recovery writes are required for this reader.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn open_read_only_external_with_backend(
+        &self,
+        backend: impl StorageBackend,
+    ) -> Result<ReadOnlyDatabase, DatabaseError> {
+        ReadOnlyDatabase::new_inner(
+            Box::new(backend),
+            self.page_size,
+            None,
+            self.cache_size,
+            true,
+        )
+    }
+
     /// Open an existing or create a new database in the given `file`.
     ///
     /// The file must be empty or contain a valid database.
@@ -1281,6 +1677,29 @@ impl Builder {
             self.region_size,
             self.cache_size,
             &self.repair_callback,
+            None,
+            self.deferred_free_budget,
+        )
+    }
+
+    /// Create storage with an authenticated external snapshot provider, so
+    /// later reader registrations are retained before allocation or reclaim.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn create_with_backend_and_external_snapshots(
+        &self,
+        backend: impl StorageBackend,
+        provider: ExternalSnapshotProvider,
+    ) -> Result<Database, DatabaseError> {
+        Database::new(
+            Box::new(backend),
+            true,
+            self.page_size,
+            self.region_size,
+            self.cache_size,
+            &self.repair_callback,
+            Some(provider),
+            self.deferred_free_budget,
         )
     }
 
@@ -1296,6 +1715,8 @@ impl Builder {
             self.region_size,
             self.cache_size,
             &self.repair_callback,
+            None,
+            self.deferred_free_budget,
         )
     }
 }
@@ -1307,16 +1728,213 @@ impl std::fmt::Debug for Database {
 }
 
 #[cfg(test)]
+#[path = "open_with_backend_region_override_tests.rs"]
+mod open_with_backend_region_override_tests;
+
+#[cfg(test)]
 mod test {
     use crate::backends::FileBackend;
     use crate::{
-        CommitError, Database, DatabaseError, Durability, ReadableTable, StorageBackend,
-        StorageError, TableDefinition, TransactionError,
+        CommitError, Database, DatabaseError, Durability, ReadableDatabase, ReadableTable,
+        StorageBackend, StorageError, TableDefinition, TransactionError,
     };
     use std::fs::File;
     use std::io::{ErrorKind, Read, Seek, SeekFrom};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(feature = "contextdb-internal")]
+    #[test]
+    fn nonblocking_external_read_refuses_before_refresh_release() {
+        let temp = crate::create_tempfile();
+        let calls = Arc::new(AtomicU64::new(0));
+        let roots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider_calls = Arc::clone(&calls);
+        let provider_roots = Arc::clone(&roots);
+        let provider = Arc::new(move || {
+            provider_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(provider_roots.lock().unwrap().clone())
+        });
+        let db = Database::builder()
+            .create_with_backend_and_external_snapshots(
+                FileBackend::new(temp.reopen().unwrap()).unwrap(),
+                provider,
+            )
+            .unwrap();
+        let read = db.begin_read().unwrap();
+        let snapshot = read.storage_snapshot_identity();
+        roots.lock().unwrap().push(snapshot);
+        let before = calls.load(Ordering::SeqCst);
+        db.with_external_snapshot_refresh_lock_for_test(|| {
+            drop(db.begin_read().expect("ordinary capture does not refresh"));
+            let error = db.begin_external_read_nonblocking(snapshot).err().unwrap();
+            assert!(Database::is_external_snapshot_refresh_busy(&error));
+            assert!(matches!(error,
+                TransactionError::Storage(StorageError::Io(error))
+                    if error.kind() == ErrorKind::WouldBlock
+                        && error.to_string().contains("external snapshot refresh")
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+        });
+        drop(db.begin_external_read_nonblocking(snapshot).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+        drop(db.begin_external_read(snapshot).unwrap());
+        let provider_error = TransactionError::Storage(StorageError::Io(std::io::Error::new(
+            ErrorKind::WouldBlock,
+            "provider coordination is unavailable",
+        )));
+        assert!(!Database::is_external_snapshot_refresh_busy(
+            &provider_error
+        ));
+    }
+
+    #[test]
+    fn prepared_read_only_handoff_keeps_reads_and_refuses_later_writes() {
+        let (file, path) = crate::create_tempfile().into_parts();
+        let lock_view = file
+            .try_clone()
+            .expect("retain lock descriptor for handoff");
+        let backend = FailingBackend::new(
+            FileBackend::new(file).expect("open handoff backend"),
+            u64::MAX,
+        );
+        let writes_remaining = Arc::clone(&backend.countdown);
+        let mut writer = Database::builder()
+            .create_with_backend(backend)
+            .expect("create writer");
+        let table: TableDefinition<u64, u64> = TableDefinition::new("handoff");
+        let tx = writer.begin_write().expect("begin fixture write");
+        tx.open_table(table)
+            .expect("open fixture table")
+            .insert(1, 7)
+            .expect("write fixture row");
+        tx.commit().expect("commit fixture row");
+
+        writer
+            .prepare_read_only_handoff()
+            .expect("publish committed read-only root");
+        assert!(matches!(
+            writer.begin_write(),
+            Err(TransactionError::Storage(StorageError::DatabaseClosed))
+        ));
+        lock_view
+            .lock_shared()
+            .expect("downgrade caller-owned writer lock for readers");
+        let reader = Database::builder()
+            .open_read_only_with_backend(
+                FileBackend::new_internal(
+                    File::open(&path).expect("open retained descriptor"),
+                    true,
+                )
+                .expect("construct retained read backend"),
+            )
+            .expect("open read-only while writer backend remains alive");
+        assert_eq!(
+            reader
+                .begin_read()
+                .expect("read committed root")
+                .open_table(table)
+                .expect("open committed table")
+                .get(1)
+                .expect("read committed row")
+                .expect("committed row exists")
+                .value(),
+            7
+        );
+        let writes_after_handoff = writes_remaining.load(Ordering::SeqCst);
+        drop(writer);
+        assert_eq!(
+            writes_remaining.load(Ordering::SeqCst),
+            writes_after_handoff,
+            "dropping a quiesced writer performs no backend writes"
+        );
+        assert_eq!(
+            reader
+                .begin_read()
+                .expect("retained reader remains valid")
+                .open_table(table)
+                .expect("open retained table")
+                .get(1)
+                .expect("read retained row")
+                .expect("retained row exists")
+                .value(),
+            7
+        );
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[test]
+    fn external_reader_keeps_its_root_when_writer_grows_after_header_read() {
+        const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("external_growth");
+        #[derive(Debug)]
+        struct GrowingBackend {
+            inner: std::sync::Mutex<File>,
+            writer: Arc<Database>,
+            grown: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl StorageBackend for GrowingBackend {
+            fn len(&self) -> std::io::Result<u64> {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .metadata()
+                    .map(|metadata| metadata.len())
+            }
+            fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+                {
+                    let mut file = self.inner.lock().unwrap();
+                    file.seek(SeekFrom::Start(offset))?;
+                    file.read_exact(out)?;
+                }
+                if offset == 0 && out.len() > 16 && !self.grown.swap(true, Ordering::SeqCst) {
+                    let before = self.len()?;
+                    let tx = self.writer.begin_write().unwrap();
+                    tx.open_table(TABLE)
+                        .unwrap()
+                        .insert(2, vec![9; 8 * 1024 * 1024].as_slice())
+                        .unwrap();
+                    tx.commit().unwrap();
+                    assert!(
+                        self.len()? > before,
+                        "writer must actually grow the file after the reader captured its header"
+                    );
+                }
+                Ok(())
+            }
+            fn set_len(&self, _: u64) -> std::io::Result<()> {
+                panic!("external reader cannot resize")
+            }
+            fn sync_data(&self) -> std::io::Result<()> {
+                panic!("external reader cannot sync")
+            }
+            fn write(&self, _: u64, _: &[u8]) -> std::io::Result<()> {
+                panic!("external reader cannot write")
+            }
+        }
+        let temp = crate::create_tempfile();
+        let writer = Arc::new(Database::create(temp.path()).unwrap());
+        let tx = writer.begin_write().unwrap();
+        tx.open_table(TABLE)
+            .unwrap()
+            .insert(1, b"original".as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        let pin = writer.begin_read().unwrap();
+        let root = pin.storage_snapshot_identity();
+        let grown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = Database::builder()
+            .open_read_only_external_with_backend(GrowingBackend {
+                inner: std::sync::Mutex::new(File::open(temp.path()).unwrap()),
+                writer,
+                grown: Arc::clone(&grown),
+            })
+            .unwrap();
+        assert!(grown.load(Ordering::SeqCst));
+        let read = reader.begin_external_read(root).unwrap();
+        let table = read.open_table(TABLE).unwrap();
+        assert_eq!(table.get(1).unwrap().unwrap().value(), b"original");
+        assert!(table.get(2).unwrap().is_none());
+    }
 
     #[derive(Debug)]
     struct FailingBackend {

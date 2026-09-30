@@ -1019,13 +1019,75 @@ async fn current_iroh_push_only_lost_refusal_stays_unconfirmed_without_resending
     let _permit = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let root = tempfile::tempdir().expect("temporary directory");
     let tenant = "push-only-refused-reply";
-    let hub = hub(root.path(), tenant).await;
-    let (db, client, transport) = edge_with_reply_loss(root.path(), &hub, tenant, false).await;
-    db.execute("ALTER TABLE notes SET SYNC PUSH ONLY", &HashMap::new())
-        .expect("declare push-only direction");
-    within(client.push())
+    let declaration = "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST";
+    let identity_path = root.path().join("hub.db.fabric-identity.key");
+    let endpoint = IrohServer::bind(&bind_spec(&identity_path))
         .await
-        .expect("confirm the declaration");
+        .expect("bind hub");
+    let hub_db = Arc::new(Database::open(root.path().join("hub.db")).expect("open hub database"));
+    hub_db
+        .execute(declaration, &HashMap::new())
+        .expect("declare hub push-only table");
+    let server = Arc::new(SyncServer::new(
+        hub_db.clone(),
+        &endpoint,
+        TenantId::from(tenant),
+    ));
+    let stop = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn({
+        let stop = stop.clone();
+        let server = server.clone();
+        async move { server.run_until(stop).await }
+    });
+    let hub = Hub {
+        db: hub_db,
+        ticket: endpoint.ticket(),
+        node_id: endpoint.node_id(),
+        server,
+        stop,
+        task,
+    };
+    let edge_identity_path = root.path().join("faulted-edge.db.fabric-identity.key");
+    let identity =
+        Arc::new(FabricIdentity::load_or_generate(&edge_identity_path).expect("edge identity"));
+    let db =
+        Arc::new(Database::open(root.path().join("faulted-edge.db")).expect("open edge database"));
+    db.execute(declaration, &HashMap::new())
+        .expect("declare edge push-only table");
+    for peer in [&hub.db, &db] {
+        let meta = peer.table_meta("notes").expect("declared notes table");
+        assert_eq!(
+            meta.sync_direction,
+            Some(contextdb_core::SyncDirection::Push)
+        );
+        assert_eq!(
+            meta.conflict_policy,
+            Some(contextdb_core::ConflictPolicy::KEEP_FIRST)
+        );
+    }
+    let transport = Arc::new(LoseOnePushReply {
+        inner: client_transport(&peer_dial_spec(&hub.ticket, &edge_identity_path)),
+        subject: push_subject(tenant),
+        armed: AtomicBool::new(false),
+        withhold_push_replies: AtomicBool::new(false),
+        before_delivery: false,
+        versions: std::sync::Mutex::new(Vec::new()),
+        dropped_reply: std::sync::Mutex::new(None),
+    });
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        db.clone(),
+        transport.clone(),
+        TenantId::from(tenant),
+        identity,
+    );
+    let bootstrap = within(client.push())
+        .await
+        .expect("push-only declaration bootstrap");
+    assert!(
+        bootstrap.conflicts.is_empty(),
+        "matching declaration bootstraps without conflict"
+    );
+    assert_eq!(hub.db.table_meta("notes"), db.table_meta("notes"));
     let id = Uuid::from_u128(0xDEAD_0002);
     insert(&hub.db, id, "hub winner");
     insert(&db, id, "refused source");
@@ -1069,9 +1131,24 @@ async fn current_iroh_push_only_lost_refusal_stays_unconfirmed_without_resending
         .expect("exact push-only refusal is recovered");
     let lost = transport.dropped_reply.lock().unwrap().clone().unwrap();
     let original: PushResponse = rmp_serde::from_slice(&decode(&lost).unwrap().payload).unwrap();
+    let result = original.result.expect("ordinary row refusal result");
+    assert_eq!(result.skipped_rows, 1);
+    assert_eq!(result.conflicts.len(), 1);
+    let diagnostic = &result.conflicts[0];
+    assert_eq!(diagnostic.table.as_deref(), Some("notes"));
+    assert_eq!(diagnostic.natural_key.column, "id");
+    assert_eq!(diagnostic.natural_key.value, Value::Uuid(id));
+    assert!(diagnostic.natural_key.rest.is_empty());
+    assert_eq!(diagnostic.mutation_kind.as_deref(), Some("edit"));
+    assert_eq!(diagnostic.reason.as_deref(), Some("keep_first_refused"));
+    assert_eq!(
+        diagnostic.winning_author_node_id.as_deref(),
+        Some(hub.node_id.as_str())
+    );
+    assert!(diagnostic.hub_acceptance_position.is_some());
     assert_eq!(
         contextdb_server::protocol::WireApplyResult::from(recovered),
-        original.result.unwrap()
+        result
     );
     assert_eq!(client.push_watermark(), frontier);
     assert_eq!(
@@ -1120,6 +1197,198 @@ async fn current_iroh_undelivered_push_stays_pending_then_gets_a_truthful_reply(
     assert_eq!(body(&hub.db, id).as_deref(), Some("pending"));
     client.shutdown().await;
     hub.stop().await;
+}
+
+/// A maintained-count declaration crosses sync, or holds back only its own
+/// table.
+///
+/// `MAINTAIN COUNT` is protocol-7 vocabulary: the receiver reads the
+/// declaration as SQL text and maintains the SAME counts the author declared,
+/// so a `COUNT(*)` the author answered in O(1) is answered in O(1) there too.
+/// A peer that cannot read the word is told which table and which capability
+/// and keeps syncing every other table, rather than meeting a parse error it
+/// would read as damage.
+#[cfg(feature = "test-seams")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
+    let _permit = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let root = tempfile::tempdir().expect("temporary directory");
+    let tenant = "maintained-count-capability";
+    let hub = hub(root.path(), tenant).await;
+    let (source, client, _transport) = edge_with_reply_loss(root.path(), &hub, tenant, false).await;
+    source
+        .execute(
+            "CREATE TABLE placements (id UUID PRIMARY KEY, owner TEXT NOT NULL)              SYNC TWO WAY",
+            &HashMap::new(),
+        )
+        .unwrap();
+    source
+        .execute(
+            "CREATE INDEX placements_by_owner ON placements (owner)",
+            &HashMap::new(),
+        )
+        .unwrap();
+    for n in 0..6u128 {
+        source
+            .execute(
+                "INSERT INTO placements (id, owner) VALUES ($id, $owner)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(Uuid::from_u128(0x9100 + n))),
+                    (
+                        "owner".to_string(),
+                        Value::Text(if n % 2 == 0 {
+                            "ada".into()
+                        } else {
+                            "bob".into()
+                        }),
+                    ),
+                ]),
+            )
+            .unwrap();
+    }
+    insert(&source, Uuid::from_u128(0xCAFE_9001), "ordinary");
+    // The table crosses first WITHOUT a declaration, so what follows proves
+    // the ALTER leg: a declaration added to a table the peer already has must
+    // reach it, not stop at the author.
+    within(client.push()).await.expect("first push");
+    assert_eq!(
+        hub.db
+            .table_meta("placements")
+            .expect("the table arrived")
+            .maintained_counts,
+        None
+    );
+
+    source
+        .execute(
+            "ALTER TABLE placements SET MAINTAIN COUNT (owner)",
+            &HashMap::new(),
+        )
+        .unwrap();
+    insert(&source, Uuid::from_u128(0xCAFE_9002), "ordinary-after");
+
+    // A peer that cannot read the vocabulary holds back that table only.
+    client.set_peer_vector_schema_support_for_test(false);
+    within(client.push())
+        .await
+        .expect("unaffected table keeps flowing");
+    assert_eq!(
+        hub.db
+            .table_meta("placements")
+            .expect("the table is still there, just not advanced")
+            .maintained_counts,
+        None,
+        "the declaration is held back with its table"
+    );
+    let held = client.schema_sync_holdbacks();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].table, "placements");
+    assert_eq!(held[0].node_to_upgrade, hub.node_id);
+    assert_eq!(
+        held[0].capability,
+        contextdb_engine::sync_types::SchemaSyncCapability::MaintainedIndexCounts
+    );
+    assert!(
+        held[0].to_string().contains("placements")
+            && held[0]
+                .to_string()
+                .contains("declared maintained index-prefix counts"),
+        "the message names the table and the capability: {}",
+        held[0]
+    );
+    assert_eq!(
+        body(&hub.db, Uuid::from_u128(0xCAFE_9002)).as_deref(),
+        Some("ordinary-after"),
+        "every other table keeps syncing"
+    );
+
+    // A peer that can read it reproduces the declaration and the counts.
+    client.set_peer_vector_schema_support_for_test(true);
+    within(client.push())
+        .await
+        .expect("capability gain recovers the held table");
+    assert!(client.schema_sync_holdbacks().is_empty());
+    let received = hub.db.table_meta("placements").expect("the table arrived");
+    assert_eq!(
+        received.maintained_counts,
+        Some(contextdb_core::MaintainedCounts::Lists(vec![vec![(
+            "owner".to_owned(),
+            contextdb_core::SortDirection::Asc
+        )]])),
+        "the receiver carries the declaration the author wrote"
+    );
+    // A writable handle counts the live postings over the same exact prefix
+    // range instead of reading the stored count: a stored maintained count is
+    // reachable only from a store read as a committed image, the direct-file
+    // read route (docs/query-language.md:928-931).
+    let sql = "SELECT COUNT(*) FROM placements WHERE owner = $owner";
+    let params = HashMap::from([("owner".to_string(), Value::Text("ada".into()))]);
+    let count = hub.db.execute(sql, &params).unwrap();
+    assert_eq!(count.rows[0][0], Value::Int64(3));
+    assert!(
+        matches!(
+            count.trace.maintained_count.as_deref(),
+            Some(
+                contextdb_engine::maintained_counts::MaintainedCountDisclosure::DeclaredNotServed { .. }
+            )
+        ),
+        "a writable handle documents the same exact count from the live postings, not the \
+         maintained count, per docs/query-language.md:928-931: {:?}",
+        count.trace.maintained_count
+    );
+
+    let edge_b_path = root.path().join("edge-b.db");
+    let (edge_b, edge_b_client) = edge(root.path(), "edge-b", &hub.ticket, tenant);
+    within(edge_b_client.pull_default())
+        .await
+        .expect("second edge pulls the declaration through the hub");
+    assert_eq!(
+        edge_b
+            .table_meta("placements")
+            .expect("second edge receives placements")
+            .maintained_counts,
+        received.maintained_counts,
+        "the hub relays the author's maintained-count declaration to another edge"
+    );
+    edge_b_client.shutdown().await;
+    drop(edge_b_client);
+    drop(edge_b);
+    let edge_b_read_only = contextdb_engine::ReadSession::open(&edge_b_path)
+        .expect("read the second edge's committed image after close");
+    let edge_b_count = edge_b_read_only.execute(sql, &params).unwrap();
+    assert_eq!(edge_b_count.rows[0][0], Value::Int64(3));
+    assert!(
+        matches!(
+            edge_b_count.trace.maintained_count.as_deref(),
+            Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
+        ),
+        "the second edge's committed image serves the received count, per \
+         docs/query-language.md:928-931: {:?}",
+        edge_b_count.trace.maintained_count
+    );
+
+    let hub_path = root.path().join("hub.db");
+    client.shutdown().await;
+    // Only a committed-image read of the hub reaches the stored count: while
+    // the writable handle above still owns the store, a session opened on the
+    // same path is routed to the live owner instead, which answers
+    // identically to the writable handle. Stopping the hub retires its last
+    // `Arc<Database>` holders (the writable handle and the sync server's own
+    // clone), which is what lets the next open take the direct-file route.
+    hub.stop().await;
+    let read_only =
+        contextdb_engine::ReadSession::open(&hub_path).expect("read the hub's committed image");
+    let read_only_count = read_only.execute(sql, &params).unwrap();
+    assert_eq!(read_only_count.rows[0][0], Value::Int64(3));
+    assert!(
+        matches!(
+            read_only_count.trace.maintained_count.as_deref(),
+            Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
+        ),
+        "a store read as a committed image serves the answer from the maintained count, per \
+         docs/query-language.md:928-931: {:?}",
+        read_only_count.trace.maintained_count
+    );
 }
 
 #[cfg(feature = "test-seams")]

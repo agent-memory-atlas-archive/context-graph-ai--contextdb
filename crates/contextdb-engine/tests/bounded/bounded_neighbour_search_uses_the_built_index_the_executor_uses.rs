@@ -1,22 +1,17 @@
 //! A bounded neighbour search takes the same route to the answer the
 //! executor takes.
 //!
-//! Once a vector column has enough rows, the store answers a neighbour search
-//! through its approximate index rather than by scoring every document, and
-//! it says so in the trace. That line is how an operator knows a search over
-//! a million documents is not quietly reading a million documents. A door
-//! that reports a different route is not describing the same work: either it
-//! really is scoring everything and the operator cannot see it, or it is not
-//! and the trace is fiction. Both are answers the operator cannot act on.
+//! Once a vector column has enough rows and maintenance has built its graph,
+//! an ordinary neighbour search uses that graph. A ranked policy must score
+//! every allowed stored vector before its final LIMIT, so it takes the exact
+//! route. Both doors must report the route they actually used.
 //!
-//! The executor's own trace is the oracle, and the oracle is checked first --
-//! each shape asserts that the EXECUTOR reports the approximate index before
-//! comparing, so a case cannot pass by both doors agreeing on a brute-force
-//! scan. Rows are compared in order, because these statements all ask for the
-//! nearest few and the order is the answer.
+//! The executor's own trace is the oracle, checked before the bounded route.
+//! Rows are compared in order because these statements ask for the nearest
+//! few and that order is part of the answer.
 
-use contextdb_core::Value;
 use contextdb_core::read_contract::ReadLimits;
+use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -50,7 +45,7 @@ fn roomy() -> ReadLimits {
 /// A thousand exactly is not enough -- the store still scores every document
 /// at that size -- so this sits above the point where the route changes.
 const DOCUMENTS: usize = 1_024;
-const MAX_BUILD_MAINTENANCE_CYCLES: usize = 64;
+const MAX_BUILD_MAINTENANCE_CYCLES: usize = 256;
 
 fn doc(ordinal: u128) -> Uuid {
     Uuid::from_u128(0x007E_0000_0000_0000_0000_0000_0000_0000 + ordinal)
@@ -150,11 +145,24 @@ fn ranked_documents() -> Database {
 /// once finite maintenance has made the route the executor is entitled to
 /// choose; the assertions below still reject a brute-force trace.
 fn publish_document_index(database: &Database) {
+    let index = VectorIndexRef::new("docs", "embedding");
     for _ in 0..MAX_BUILD_MAINTENANCE_CYCLES {
+        if database
+            .__debug_vector_hnsw_stats(index.clone())
+            .is_some_and(|stats| stats.point_count >= DOCUMENTS)
+        {
+            break;
+        }
         database
             .run_maintenance_cycle()
             .expect("one finite caller-driven maintenance cycle completes");
     }
+    assert!(
+        database
+            .__debug_vector_hnsw_stats(index)
+            .is_some_and(|stats| stats.point_count >= DOCUMENTS),
+        "caller-driven maintenance publishes every document into the graph"
+    );
 }
 
 fn insert_documents(database: &Database) {
@@ -226,15 +234,15 @@ fn both_doors_take_the_same_route(
     what: &str,
     sql: &str,
     sql_params: &HashMap<String, Value>,
+    expected_route: &str,
     disagreements: &mut Vec<String>,
 ) {
     let eager = database
         .execute(sql, sql_params)
         .unwrap_or_else(|error| panic!("the executor answers {what}: {error}"));
     assert!(
-        eager.trace.physical_plan.contains("HNSWSearch"),
-        "{what}: the executor answers this through the approximate index, which is what makes \
-         the case worth comparing: {:?}",
+        eager.trace.physical_plan.contains(expected_route),
+        "{what}: the executor must report the route this statement requires: {:?}",
         eager.trace.physical_plan
     );
     assert!(
@@ -282,6 +290,7 @@ fn a_bounded_neighbour_search_reports_the_route_the_executor_reports() {
         "a filtered search whose query vector is read from a stored row",
         FILTERED_PERSISTED,
         &source_params(),
+        "HNSWSearch",
         &mut disagreements,
     );
     both_doors_take_the_same_route(
@@ -289,6 +298,7 @@ fn a_bounded_neighbour_search_reports_the_route_the_executor_reports() {
         "the same filtered search written with the vector spelled out",
         FILTERED_LITERAL,
         &both_sources(),
+        "HNSWSearch",
         &mut disagreements,
     );
 
@@ -299,6 +309,7 @@ fn a_bounded_neighbour_search_reports_the_route_the_executor_reports() {
         "the same search again, with the graph already built",
         FILTERED_PERSISTED,
         &source_params(),
+        "HNSWSearch",
         &mut disagreements,
     );
 
@@ -307,6 +318,7 @@ fn a_bounded_neighbour_search_reports_the_route_the_executor_reports() {
         "a ranked search whose query vector is read from a stored row",
         RANKED_PERSISTED,
         &source_params(),
+        "VectorSearch",
         &mut disagreements,
     );
     both_doors_take_the_same_route(
@@ -314,6 +326,7 @@ fn a_bounded_neighbour_search_reports_the_route_the_executor_reports() {
         "the same ranked search written with the vector spelled out",
         RANKED_LITERAL,
         &query_params(),
+        "VectorSearch",
         &mut disagreements,
     );
 

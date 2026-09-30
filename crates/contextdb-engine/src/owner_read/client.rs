@@ -31,6 +31,11 @@ pub struct OwnerClient {
     cancellations: Arc<CancelCoordination>,
     /// What the owner said about itself when it accepted this reader.
     accepted_status: Option<contextdb_core::read_contract::OwnerReadStatus>,
+    /// A draining owner sends this terminal refusal before ending an idle
+    /// connection. Remember it so every later operation on the same selected
+    /// route receives the owner's typed answer instead of reclassifying the
+    /// now-closed carrier as an unexpected disconnect.
+    terminal_refusal: Option<contextdb_core::read_contract::ReadFailure>,
     #[cfg(feature = "test-seams")]
     response_frames: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     #[cfg(unix)]
@@ -87,6 +92,7 @@ impl OwnerClient {
             requests_sent: 0,
             cancellations: Arc::new(CancelCoordination::default()),
             accepted_status: None,
+            terminal_refusal: None,
             #[cfg(feature = "test-seams")]
             response_frames: None,
             stream,
@@ -256,6 +262,9 @@ impl OwnerClient {
                 contextdb_core::Error::ReadCancelled,
             ));
         }
+        if let Some(failure) = &self.terminal_refusal {
+            return Err(OwnerReadScaffoldError::Refused(failure.clone()));
+        }
         let deadline_ms = checked_deadline(self.clock.as_ref(), self.timeouts.response_ms)?;
         // The ordinal this request will carry, read before it is sent so the
         // interrupt below names the very request this call is about and never
@@ -397,6 +406,11 @@ impl OwnerClient {
                         return Ok(unpublished);
                     }
                     ResultReceiveOutcome::Failed(failure) => {
+                        if failure.kind()
+                            == contextdb_core::read_contract::ReadFailureKind::OwnerNotServing
+                        {
+                            self.terminal_refusal = Some(failure.clone());
+                        }
                         return Err(OwnerReadScaffoldError::Refused(failure));
                     }
                     ResultReceiveOutcome::EngineFailed(failure) => {
@@ -422,6 +436,11 @@ impl OwnerClient {
                     // exchange, so nothing is decided here.
                     LocalResponse::ResultChunk { .. } => continue,
                     LocalResponse::Failure { failure } => {
+                        if failure.kind()
+                            == contextdb_core::read_contract::ReadFailureKind::OwnerNotServing
+                        {
+                            self.terminal_refusal = Some(failure.clone());
+                        }
                         return Err(OwnerReadScaffoldError::Refused(failure));
                     }
                     LocalResponse::EngineFailure { failure } => {

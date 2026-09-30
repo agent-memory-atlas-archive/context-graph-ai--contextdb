@@ -1176,9 +1176,9 @@ fn f105_public_type_documentation_api_surface_check() {
         "VectorPartitionHnswDisclosure, VectorQuerySourceDisclosure, VectorSearchDisclosure,"
     ));
     assert!(lib.contains(
-        "VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchScopeShape,"
+        "VectorSearchLayerPresence, VectorSearchResidual, VectorSearchRoute, VectorSearchRouteEvidence,"
     ));
-    assert!(lib.contains("VectorSearchTailState,"));
+    assert!(lib.contains("VectorSearchScopeShape, VectorSearchTailState,"));
     assert!(database.contains("pub fn open("));
     assert!(database.contains("pub fn open_memory("));
     assert!(database.contains("pub fn execute("));

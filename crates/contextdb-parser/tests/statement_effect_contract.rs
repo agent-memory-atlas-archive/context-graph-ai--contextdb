@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 // Custody adds two writes and three metadata reads; vector inspection and the
 // maintenance cadence add two reads, and the cadence declaration adds a write.
-const STATEMENT_VARIANT_COUNT: usize = 35;
+const STATEMENT_VARIANT_COUNT: usize = 37;
 
 #[test]
 fn binary_memory_declaration_accepts_quoted_and_unquoted_sizes() {
@@ -69,6 +69,8 @@ fn statement_variant(statement: &Statement) -> &'static str {
         Statement::ShowDiskLimit => "SHOW DISK_LIMIT",
         Statement::SetMaintenancePollInterval(_) => "SET MAINTENANCE_POLL_INTERVAL",
         Statement::ShowMaintenancePollInterval => "SHOW MAINTENANCE_POLL_INTERVAL",
+        Statement::SetVectorServingCache(_) => "SET VECTOR_SERVING_CACHE",
+        Statement::ShowVectorServingCache => "SHOW VECTOR_SERVING_CACHE",
         Statement::ShowSyncConflictPolicy => "SHOW SYNC_CONFLICT_POLICY",
         Statement::ShowVectorIndexes => "SHOW VECTOR_INDEXES",
         Statement::ShowVectorPartitions { .. } => "SHOW VECTOR_PARTITIONS",
@@ -84,7 +86,7 @@ fn statement_variant(statement: &Statement) -> &'static str {
 }
 
 #[test]
-fn statement_effect_marks_only_the_ten_inspection_variants_as_reads() {
+fn statement_effect_marks_only_the_inspection_variants_as_reads() {
     let cases = [
         (
             "DISCARD",
@@ -180,6 +182,16 @@ fn statement_effect_marks_only_the_ten_inspection_variants_as_reads() {
         (
             "SHOW MAINTENANCE_POLL_INTERVAL",
             "SHOW MAINTENANCE_POLL_INTERVAL",
+            StatementEffect::Read,
+        ),
+        (
+            "SET VECTOR_SERVING_CACHE",
+            "SET VECTOR_SERVING_CACHE '64M'",
+            StatementEffect::Write,
+        ),
+        (
+            "SHOW VECTOR_SERVING_CACHE",
+            "SHOW VECTOR_SERVING_CACHE",
             StatementEffect::Read,
         ),
         (
@@ -282,12 +294,12 @@ fn statement_effect_marks_only_the_ten_inspection_variants_as_reads() {
         .filter(|(_, expected_effect, _)| *expected_effect == StatementEffect::Read)
         .count();
     assert_eq!(
-        declared_read_count, 10,
-        "exactly ten current Statement variants are declared reads"
+        declared_read_count, 11,
+        "exactly eleven current Statement variants are declared reads"
     );
     assert_eq!(
         parsed_cases.len() - declared_read_count,
-        25,
+        26,
         "every other current Statement variant is declared a write"
     );
 

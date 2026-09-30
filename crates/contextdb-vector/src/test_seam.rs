@@ -2,8 +2,9 @@
 //! Mirrors the shape of `contextdb-engine::ApplyPhasePause`.
 
 use crate::store::VectorStore;
-use contextdb_core::{RowId, VectorIndexRef, VectorPartitionKey, VectorQuantization};
+use contextdb_core::{VectorIndexRef, VectorPartitionKey, VectorQuantization};
 use parking_lot::{Condvar, Mutex};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,10 @@ static DORMANT_DECODE_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
 static DORMANT_DECODE_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
 static POST_LOAD_RECONCILIATION_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
 static POST_LOAD_RECONCILIATION_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static STALE_DORMANT_LOAD_ARMED: Cell<bool> = const { Cell::new(false) };
+    static STALE_DORMANT_LOAD_CONSUMED: Cell<bool> = const { Cell::new(false) };
+}
 
 fn arm(armed: &AtomicBool, consumed: &AtomicBool) {
     consumed.store(false, Ordering::SeqCst);
@@ -68,6 +73,30 @@ pub fn take_vector_post_load_reconciliation_failure_for_test() -> bool {
 #[doc(hidden)]
 pub fn vector_post_load_reconciliation_failure_consumed_for_test() -> bool {
     POST_LOAD_RECONCILIATION_FAILURE_CONSUMED.load(Ordering::SeqCst)
+}
+
+/// The next dormant generation load finds, once it has loaded, that the fresh
+/// tail moved while it was loading -- as when a writer publishes over it -- so
+/// it is discarded and loaded again.
+#[doc(hidden)]
+pub fn arm_vector_stale_dormant_load_for_test() {
+    STALE_DORMANT_LOAD_CONSUMED.set(false);
+    STALE_DORMANT_LOAD_ARMED.set(true);
+}
+
+#[doc(hidden)]
+pub fn take_vector_stale_dormant_load_for_test() -> bool {
+    if STALE_DORMANT_LOAD_ARMED.replace(false) {
+        STALE_DORMANT_LOAD_CONSUMED.set(true);
+        true
+    } else {
+        false
+    }
+}
+
+#[doc(hidden)]
+pub fn vector_stale_dormant_load_consumed_for_test() -> bool {
+    STALE_DORMANT_LOAD_CONSUMED.get()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -220,15 +249,12 @@ pub(crate) struct GraphCandidateCapRegistry {
 }
 
 impl GraphCandidateCapRegistry {
-    /// Shorten the candidate list an armed index's graph just produced. Only
-    /// the length changes: the allocation the caller already charged for is
-    /// kept, so memory accounting stays exactly what the search reported.
-    pub(crate) fn cap_graph_candidates(
+    /// How many graph candidates an armed index's partition may keep.
+    pub(crate) fn graph_candidate_cap(
         &self,
         index: &VectorIndexRef,
         partition: Option<&VectorPartitionKey>,
-        candidates: &mut Vec<(RowId, f32)>,
-    ) {
+    ) -> Option<usize> {
         let slot = {
             let slots = self.slots.lock();
             partition
@@ -239,9 +265,7 @@ impl GraphCandidateCapRegistry {
                 })
                 .or_else(|| slots.get(&(index.clone(), None)).cloned())
         };
-        if let Some(cap) = slot.and_then(|slot| slot.cap()) {
-            candidates.truncate(cap);
-        }
+        slot.and_then(|slot| slot.cap())
     }
 
     fn slot(

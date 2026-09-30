@@ -237,8 +237,47 @@ refused), `io` (disk, lock, budget, corrupt store), `usage` (fix the command lin
 input line the failing statement started on, when the CLI knows it — the message never repeats it.
 The engine's ~100 error variant names are deliberately not published; `message` carries the text.
 
-A scripted run continues to the next statement after an error, so one run reports all its errors —
-but the process never reports a run that hit an error as success.
+A scripted run continues after a refused statement, including a memory or disk refusal; later
+successful statements do not turn its exit status back into success.
+<!-- enforced by: read_cli_journeys_script_continuation::a_memory_refusal_is_followed_by_independent_work_and_recovery, read_cli_journeys_script_continuation::a_disk_refusal_is_followed_by_independent_work_and_recovery -->
+
+### Recover within the same session
+
+1. Read the error on stderr; an empty successful result is not a refusal.
+2. After a resource refusal, inspect `SHOW MEMORY_LIMIT` or `SHOW DISK_LIMIT`, then raise that
+   limit with `SET MEMORY_LIMIT '10M'` or `SET DISK_LIMIT '1G'` if appropriate for your workload.
+3. Retry the refused statement. Independent statements can run before recovery too. The script
+   still exits `1` because an earlier statement failed.
+<!-- enforced by: read_cli_journeys_script_continuation::a_refusal_is_distinguishable_from_a_successful_empty_result, read_cli_journeys_script_continuation::a_memory_refusal_is_followed_by_independent_work_and_recovery, read_cli_journeys_script_continuation::a_disk_refusal_is_followed_by_independent_work_and_recovery -->
+
+This small example isolates continuation without needing a machine-specific memory ceiling:
+
+```bash
+contextdb :memory: --json <<'SQL'
+SELECT * FROM missing;
+SELECT 1 + 1;
+SQL
+printf 'exit=%s\n' "$?"
+```
+
+Stdout:
+
+```text
+{"result":{"columns":["expr"],"rows":[{"expr":2}]}}
+exit=1
+```
+
+Stderr:
+
+```json
+{"error":{"class":"sql","line":1,"message":"table not found: missing"}}
+```
+<!-- enforced by: exit_code_contract::run_continues_after_an_error_and_still_exits_one -->
+
+For bounded reads, selecting an oversized stored value is refused before loading its body;
+opening the session does not itself require loading that value. A refused statement leaves no
+new charge behind. Reduce the requested data or use a sufficient declared read budget.
+<!-- enforced by: direct_file_image_memory_lifetime::one_oversized_durable_value_is_refused_before_its_source_buffer_is_allocated -->
 
 ## Exit codes — branch on these
 

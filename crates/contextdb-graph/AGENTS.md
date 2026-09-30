@@ -13,11 +13,13 @@ graph store — rows live in `contextdb-relational`, and this crate indexes
 
 Owns (`src/store.rs`) `GraphStore`: forward and reverse adjacency maps,
 received-schema publication (`PreparedGraphPublication`,
-`prepare_received_schema_publication` → `publish_prepared_received_schema`),
+`prepare_received_schema_publication` → `publish_prepared_received_schema`,
+`publish_prepared_received_edge_types` for an affected edge set),
 and apply of inserts/deletes. `src/mem.rs` owns `MemGraphExecutor`: the
 `GraphExecutor` implementation, bounded BFS (`MAX_VISITED` 100_000), DAG cycle
 refusal on insert (`register_dag_edge_types` then `insert_edge`), direction
-and edge-type filtering, and the parked-traversal continuation that survives
+and edge-type filtering, prepared DAG declaration publication
+(`PreparedDagEdgeTypes`), and the parked-traversal continuation that survives
 adjacency reclaim.
 
 Must not own: durability (the engine's `persistence.rs` writes redb; this crate
@@ -47,13 +49,14 @@ is memory only), the commit gate (the engine sequences prepare → durable commi
 | A parked traversal still emits every visible neighbour after reclaim | `tests/bounded_traversal_survives_adjacency_compaction.rs::a_parked_traversal_emits_every_visible_neighbour_when_all_the_entries_it_consumed_are_reclaimed`, `::a_parked_traversal_emits_every_visible_neighbour_when_a_consumed_entry_survives_the_reclaim` |
 | A million-entry traversal queue is released on a small stack | `tests/long_traversal_queue_drops_iteratively.rs::a_traversal_queue_holding_a_million_entries_is_released_on_a_small_stack` |
 | A `DAG`-declared edge type refuses a cycle insert, including a self-loop | `crates/contextdb-engine/tests/sql_surface/sql_surface_other.rs::dag_01_cycle_rejected_via_insert_sql`, `::dag_02_self_loop_rejected_via_insert_sql` |
+| A received ordinary edge-table drop removes its links, including after restart | `crates/contextdb-engine/tests/sync/a_received_drop_of_an_edge_table_takes_its_links.rs::a_received_drop_of_an_ordinary_edge_table_removes_its_links_now_and_after_a_restart`, `::an_authenticated_received_drop_of_an_ordinary_edge_table_removes_its_links` |
 
 ## Where a change lives
 
 | Change | Where it lands |
 |---|---|
-| Adjacency layout, received-schema publication | `src/store.rs` |
-| BFS, visited ceiling, DAG cycle check, direction/type filters | `src/mem.rs` |
+| Adjacency layout, whole-schema or affected-edge publication | `src/store.rs` |
+| BFS, visited ceiling, DAG cycle check and prepared declaration publication, direction/type filters | `src/mem.rs`; export public types from `src/lib.rs` |
 | `GRAPH_TABLE` grammar | Parser crate |
 | Plan shape for `GraphBfs` | Planner crate |
 | Anything that must survive restart | Engine `persistence.rs` — this crate only mirrors durable state |
