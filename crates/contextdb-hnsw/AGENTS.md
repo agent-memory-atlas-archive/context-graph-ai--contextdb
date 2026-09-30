@@ -42,6 +42,7 @@ the upgrade procedure and the upstream proposals that would let the fork shrink.
 | A graph with no points iterates to nothing instead of panicking | `src/hnsw.rs` → `tests::iterating_a_graph_with_no_points_yields_nothing`; `crates/contextdb-vector/tests/vector_tests.rs` → `a_durable_generation_with_no_live_vectors_loads_as_an_empty_graph` |
 | Owned graph bytes round-trip, and malformed bytes are an error, not a graph | `src/hnswio.rs` → `tests::streamed_owned_graph_preserves_payload_bytes_and_roundtrip`; `crates/contextdb-vector/src/hnsw.rs` → `tests::durable_generation_refuses_corruption_and_incompatible_column_definition` |
 | Allowed-set search finishes its greedy descent before level zero and charges only admitted nodes | `src/hnsw.rs` → `tests::allowed_search_finishes_greedy_descent_before_entering_level_zero`; `crates/contextdb-vector/src/hnsw.rs` → `tests::ordinary_allowed_search_excluded_history_adds_no_visit_or_distance_work` |
+| Every hunk in `upstream-0.3.4.patch` produces exactly the fork source lines it names | `crates/contextdb-core/tests/hnsw_fork_patch_matches_its_sources.rs` → `the_hnsw_fork_patch_produces_the_sources_it_names`; a fork change the patch omits entirely is unguarded — regenerate the patch with the MAINTENANCE.md command and compare |
 
 ## Where a change lives
 
